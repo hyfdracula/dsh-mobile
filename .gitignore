@@ -1,0 +1,19 @@
+﻿# 依赖与构建产物
+node_modules/
+oh_modules/
+build/
+.hvigor/
+.preview/
+temp/
+
+# 签名与本地环境
+*.p12
+*.cer
+*.p7b
+local.properties
+.idea/
+
+# 产物
+*.hap
+*.app
+*.log

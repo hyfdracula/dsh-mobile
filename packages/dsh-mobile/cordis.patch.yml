@@ -1,0 +1,15 @@
+# dsh-mobile bundle patch: one host-only row that starts an independent HTTP
+# gateway for a phone client. It shares no state, port or token with the
+# shipped console plugin, so both can run at once.
+#
+# Activate with:
+#   dsh plugin --profile desktop add link:<repo>/packages/dsh-mobile
+#
+# Deployment values (enabled, port, host, token, logFile) come from the
+# profile's own cordis.patch.yml, targeting this row id.
+- insert:
+    - id: mobile
+      name: '@deepseek-ai/dsh-mobile'
+      config:
+        port: 8901
+        host: '::'

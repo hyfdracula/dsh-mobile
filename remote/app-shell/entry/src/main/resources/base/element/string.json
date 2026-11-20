@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "DSH Mobile entry module"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "DSH Mobile"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "DSH Mobile"
+    }
+  ]
+}
