@@ -1,4 +1,4 @@
-﻿# 依赖与构建产物
+# 依赖与构建产物
 node_modules/
 oh_modules/
 build/
@@ -15,5 +15,6 @@ local.properties
 
 # 产物
 *.hap
+!release/*.hap
 *.app
 *.log
