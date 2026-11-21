@@ -31,6 +31,11 @@ export struct ShellPage {
   onReset: () => void = () => {};
   onSave: (b: string, t: string) => void = () => {};
   onSaveLan: (b: string, t: string, lan: string[]) => void = () => {};
+  /** 当前电脑名（多电脑切换时显示在设置 → 连接里） */
+  @Prop machineName: string = '';
+  onPickMachine: (id: string) => void = () => {};
+  onRemoveMachine: (id: string) => void = () => {};
+  onAddMachine: (wan: string, token: string, name: string) => void = () => {};
   onTheme: (m: string) => void = () => {};
   onWan: (v: boolean) => void = () => {};
   onAutoLan: (v: boolean) => void = () => {};
@@ -374,7 +379,7 @@ export struct ShellPage {
     Stack({ alignContent: Alignment.Bottom }) {
       HdsTabs({ controller: this.tc }) {
         TabContent() {
-          SessionList({ api: this.api })
+          SessionList({ api: this.api, machineName: this.machineName, onPickMachine: this.onPickMachine })
         }
         .tabBar(this.tabPill(0, '会话'))
 
@@ -395,6 +400,16 @@ export struct ShellPage {
             },
             onSave: (b: string, t: string) => {
               this.onSave(b, t);
+            },
+            machineName: this.machineName,
+            onPickMachine: (id: string) => {
+              this.onPickMachine(id);
+            },
+            onRemoveMachine: (id: string) => {
+              this.onRemoveMachine(id);
+            },
+            onAddMachine: (wan: string, token: string, name: string) => {
+              this.onAddMachine(wan, token, name);
             },
             onSaveLan: (b: string, t: string, lan: string[]) => {
               this.onSaveLan(b, t, lan);

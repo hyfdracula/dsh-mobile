@@ -125,19 +125,7 @@ export struct PcPage {
   // ---------- 头部（二级页统一：内容和设置一级页同一套，标题浮在渐变上） ----------
 
   /** 顶部同色渐变：内容滚上来时在标题下面淡出，替掉原来那块不透明标题栏 */
-  @Builder
-  topFade() {
-    Row()
-      .width('100%')
-      .height(78)
-      .linearGradient({
-        angle: 180,
-        colors: [[this.themeBg, 0.0], [this.themeBg, 0.58], ['#00' + this.themeBg.slice(1), 1.0]],
-      })
-      .hitTestBehavior(HitTestMode.None)
-  }
 
-  /** 二级页标题行：38 玻璃返回钮 + 标题，浮在渐变上，不占内容布局高度 */
   @Builder
   subHeader(title: string) {
     Row() {
@@ -514,7 +502,6 @@ export struct PcPage {
       .scrollBar(BarState.Off)
 
       // 同色渐变：滚上来的卡片在标题下面淡出，不再有硬边遮罩
-      this.topFade()
 
       // 浮动的玻璃返回钮 + 标题
       this.subHeader('电脑管理')

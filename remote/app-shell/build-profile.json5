@@ -1,37 +1,20 @@
-{
+﻿{
+  // 本仓库不保存任何签名材料：用 DevEco Studio 打开项目后，
+  // File -> Project Structure -> Signing Configs 勾选 "Automatically generate signature" 即可。
   "app": {
+    "signingConfigs": [],
     "products": [
       {
         "name": "default",
-        "compatibleSdkVersion": "26.0.0",
-        "targetSdkVersion": "26.0.0",
-        "runtimeOS": "HarmonyOS",
-        "buildOption": {
-          "strictMode": {
-            "caseSensitiveCheck": true,
-            "useNormalizedOHMUrl": true
-          }
-        }
+        "signingConfig": "default",
+        "compatibleSdkVersion": "6.0.0(20)",
+        "targetSdkVersion": "6.0.0(20)",
+        "runtimeOS": "HarmonyOS"
       }
     ],
-    "buildModeSet": [
-      { "name": "debug" },
-      { "name": "release" }
-    ],
-    // 本仓库不带任何签名材料：用 DevEco Studio 的「自动生成签名」或你自己的证书，
-    // 生成后这里会写入本机的 signingConfigs（该行已被 .gitignore 保护，勿提交）。
-    "signingConfigs": []
+    "buildModeSet": [ { "name": "debug" }, { "name": "release" } ]
   },
   "modules": [
-    {
-      "name": "entry",
-      "srcPath": "./entry",
-      "targets": [
-        {
-          "name": "default",
-          "applyToProducts": [ "default" ]
-        }
-      ]
-    }
+    { "name": "entry", "srcPath": "./entry", "targets": [ { "name": "default", "applyToProducts": ["default"] } ] }
   ]
 }

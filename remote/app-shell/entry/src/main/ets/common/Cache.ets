@@ -14,7 +14,7 @@ export interface ChatSnapshot {
 /** 每个会话一份，最多留这么多份；按最后访问时间淘汰。 */
 const KEEP: number = 60;
 /** 一份里最多存这么多条消息，够铺满首屏就行。 */
-const MAX_MSGS: number = 40;
+const MAX_MSGS: number = 200;
 
 function dirOf(): string {
   const ctx = getContext() as common.UIAbilityContext;
@@ -72,9 +72,11 @@ function prune(): void {
 export class ChatCache {
   /** 读不到 / 文件坏了都返回 null，调用方照常走网络。 */
   static read(id: string): ChatSnapshot | null {
+    const t0: number = Date.now();
     try {
       const p: string = pathOf(id);
       if (!fs.accessSync(p)) {
+        console.info('DSH_CACHE miss ' + id);
         return null;
       }
       const raw: string = fs.readTextSync(p);
@@ -85,6 +87,7 @@ export class ChatCache {
       if (s.messages === undefined || s.messages.length === 0) {
         return null;
       }
+      console.info('DSH_CACHE hit ' + id + ' msgs=' + String(s.messages.length) + ' in ' + String(Date.now() - t0) + 'ms');
       return s;
     } catch (e) {
       return null;

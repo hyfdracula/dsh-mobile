@@ -2,6 +2,7 @@ import curves from '@ohos.curves';
 import pasteboard from '@ohos.pasteboard';
 import { Api, PreviewRow, SessionRow } from '../common/Api';
 import { Tokens } from '../common/Tokens';
+import { Machines, Machine } from '../common/Machines';
 import { Marks } from '../common/Marks';
 import { Haptics } from '../common/Haptics';
 import { Mat } from '../common/Mat';
@@ -75,6 +76,7 @@ export struct SessionTile {
   @Prop count: number = 0;
   /** 归档视图里 ⋮ 菜单的第三项改成「恢复」，与左滑操作保持一致 */
   @Prop archivedView: boolean = false;
+
   onTap: () => void = () => {};
   onRename: () => void = () => {};
   onPin: () => void = () => {};
@@ -295,6 +297,22 @@ export struct SessionList {
   @State private rows: SessionRow[] = [];
   @State private previews: PreviewRow[] = [];
   @State private loading: boolean = true;
+  /** 换了电脑（设置 → 连接）或分叉出新会话时，列表整份重读 */
+  @StorageLink('listDirty') @Watch('onListDirty') listDirty: number = 0;
+
+  private onListDirty(): void {
+    if (this.loading) {
+      return;
+    }
+    this.load();
+  }
+
+  /** 首页「换电脑」：当前电脑名与弹层开关（machineName 由 Index 传下来） */
+  @Prop machineName: string = '';
+  onPickMachine: (id: string) => void = () => {};
+  @StorageLink('machinesVer') machinesVer: number = 0;
+  @State private devOn: boolean = false;
+
   @State private err: string = '';
   @State private q: string = '';
   @State private searching: boolean = false;
@@ -1118,6 +1136,112 @@ export struct SessionList {
   }
 
   /** 列表页顶部整块：工作区胶囊 + 搜索 + 统计。整块是浮层，列表从它底下滚过去。 */
+  /** 「192.168.1.3:8901」这种名字只留主机部分，胶囊里不占地方 */
+  private devShort(): string {
+    let n: string = this.machineName !== '' ? this.machineName : Machines.displayName();
+    n = n.replace('http://', '').replace('https://', '');
+    const cut: number = n.indexOf('/');
+    if (cut > 0) {
+      n = n.substring(0, cut);
+    }
+    // 去掉端口：胶囊里只留主机，够认得出来
+    const colon: number = n.lastIndexOf(':');
+    if (colon > 0 && n.indexOf(']') < colon) {
+      n = n.substring(0, colon);
+    }
+    return n;
+  }
+
+  @Builder
+  devSheet() {
+    Column() {
+      Text('切换电脑')
+        .fontSize(17)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.fg)
+        .width('100%')
+        .padding({ left: 20, right: 20, top: 6, bottom: 10 })
+
+      List({ space: 8 }) {
+        ForEach(Machines.list(), (m: Machine) => {
+          ListItem() {
+            Row() {
+              Column() {
+                Text(m.name !== '' ? m.name : m.id)
+                  .fontSize(15)
+                  .fontColor(Tokens.fg)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width('100%')
+                Text(m.wan)
+                  .fontSize(11)
+                  .fontColor(Tokens.dim2)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width('100%')
+                  .margin({ top: 2 })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+
+              if (Machines.activeId() === m.id) {
+                Text('当前')
+                  .fontSize(11)
+                  .fontColor(Tokens.accent)
+                  .backgroundColor(Tokens.accentSoft)
+                  .borderRadius(999)
+                  .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+              }
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+            .backgroundColor(Tokens.surface2)
+            .borderRadius(14)
+            .alignItems(VerticalAlign.Center)
+            .onClick(() => {
+              Haptics.tap();
+              this.devOn = false;
+              if (Machines.activeId() !== m.id) {
+                this.onPickMachine(m.id);
+              }
+            })
+          }
+        }, (m: Machine) => m.id + '@' + String(m.at))
+      }
+      .layoutWeight(1)
+      .scrollBar(BarState.Off)
+      .padding({ left: 16, right: 16 })
+
+      Text('在 设置 → 电脑 里可以添加、删除电脑。')
+        .fontSize(11)
+        .fontColor(Tokens.dim2)
+        .width('100%')
+        .padding({ left: 20, right: 20, top: 10, bottom: 18 })
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .backgroundColor(Tokens.surface)
+  }
+
+  /** 下拉刷新区域：整块下移到摄像头开孔以下（默认位置在 0，会被挖孔挡住） */
+  @Builder
+  refreshArea() {
+    Row({ space: 8 }) {
+      LoadingProgress()
+        .width(20)
+        .height(20)
+        .color(Tokens.dim2)
+      Text(this.refreshing ? '正在刷新' : '松开刷新')
+        .fontSize(11.5)
+        .fontColor(Tokens.dim2)
+    }
+    .width('100%')
+    // Refresh 给指示器的高度就是下拉距离，超过就被裁掉；所以用位移把它整体推到挖孔下方。
+    // 横向排（转圈 + 文字）比竖排矮，位移后不会被裁掉文字。
+    .translate({ y: 92 })
+    .justifyContent(FlexAlign.Center)
+  }
+
   @Builder
   headerBlock() {
     Column() {
@@ -1196,6 +1320,39 @@ export struct SessionList {
           .bindMenu(this.archivedView ? this.archivedMenu() : this.wsMenu())
 
           Blank()
+
+          // 换电脑：圆形电脑图标，紧挨着已归档按钮（不占地方，也不用写地址）
+          Stack() {
+            Image($r('app.media.ic_pc'))
+              .width(19)
+              .height(19)
+              .fillColor(this.machinesVer > 0 ? Tokens.accent : Tokens.fg)
+              .objectFit(ImageFit.Contain)
+          }
+          .width(42)
+          .height(42)
+          .borderRadius(21)
+          .margin({ right: 10 })
+          .backgroundColor(Tokens.glassStrong)
+          .border({ width: 1, color: Tokens.pillEdge })
+          .shadow({ radius: 12, color: Tokens.accentGlow, offsetY: 2 })
+          .systemMaterial(Mat.whiteOn(this.matOn()))
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+          .accessibilityText('切换电脑')
+          .onClick(() => {
+            Haptics.tap();
+            this.devOn = true;
+          })
+          .bindSheet($$this.devOn, this.devSheet(), {
+            height: '42%',
+            dragBar: true,
+            showClose: true,
+            backgroundColor: Tokens.surface,
+            maskColor: '#33000000',
+            onDisappear: () => {
+              this.devOn = false;
+            }
+          })
 
           // 已归档：点一下直接进归档视图，再点一下回列表（不再有二级菜单）
           Stack() {
@@ -1346,7 +1503,7 @@ export struct SessionList {
           .width('100%')
           .padding({ top: 40 })
         } else {
-          Refresh({ refreshing: $$this.refreshing, offset: 220 }) {
+          Refresh({ refreshing: $$this.refreshing, builder: this.refreshArea() }) {
           List({ space: 8, scroller: this.scroller }) {
             ListItem() {
               Row().width('100%').height(85)

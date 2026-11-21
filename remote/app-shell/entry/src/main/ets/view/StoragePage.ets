@@ -143,19 +143,7 @@ export struct StoragePage {
   }
 
   /** 顶部同色渐变：内容滚上来时在标题下面淡出，替掉原来那块不透明标题栏 */
-  @Builder
-  topFade() {
-    Row()
-      .width('100%')
-      .height(78)
-      .linearGradient({
-        angle: 180,
-        colors: [[this.themeBg, 0.0], [this.themeBg, 0.58], ['#00' + this.themeBg.slice(1), 1.0]],
-      })
-      .hitTestBehavior(HitTestMode.None)
-  }
 
-  /** 二级页标题行：38 玻璃返回钮 + 标题 + 右侧同款刷新钮，浮在渐变上 */
   @Builder
   pageHeader() {
     Row() {
@@ -388,8 +376,16 @@ export struct StoragePage {
       .height('100%')
       .scrollBar(BarState.Off)
 
-      // 同色渐变：滚上来的卡片在标题下面淡出，不再有硬边遮罩
-      this.topFade()
+      // 同色渐变：滚上来的卡片在标题下面淡出，不再有硬边遮罩。
+      // 高度和会话列表页保持一致（96），三处页面看起来是同一套。
+      Row()
+        .width('100%')
+        .height(96)
+        .linearGradient({
+          angle: 180,
+          colors: [[this.themeBg, 0.0], [this.themeBg, 0.55], ['#00' + this.themeBg.slice(1), 1.0]]
+        })
+        .hitTestBehavior(HitTestMode.None)
 
       // 浮动的玻璃返回钮 + 标题 + 刷新钮
       this.pageHeader()

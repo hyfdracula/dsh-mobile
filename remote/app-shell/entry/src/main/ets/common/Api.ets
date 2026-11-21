@@ -361,8 +361,8 @@ export class Api {
       try {
         // 探针要带令牌：/health 是免鉴权的，只探它会在换了令牌后误判局域网可用，
         // 随后每个业务请求都 401。所以用 /api/info 探，200 才算这个入口真能用。
-        const r = await this.rawGet(this.lanBase + '/api/info', 1500, true);
-        if (r.code === 200) {
+        const r = await this.rawGet(this.lanBase + '/api/info', 800, true);
+        if (r.code === 200 || r.code === 401 || r.code === 403) {
           this.chosen = this.lanBase;
           this.lanDownUntil = 0;
           console.info('DSH_BASE lan ' + this.lanBase);
@@ -380,6 +380,35 @@ export class Api {
   }
 
   /**
+   * 立刻重新选一次入口。回前台、换电脑、点「重新连接」时调，
+   * 免得用户在同一个 Wi-Fi 下还要等一轮后台探活才换回局域网。
+   */
+  async poke(): Promise<void> {
+    // 配置还没读进来（onPageShow 可能早于 loadCfg）时什么都别定，否则 chosen 会被设成空串
+    if (this.wanBase === '') {
+      return;
+    }
+    this.chosen = '';
+    this.lanDownUntil = 0;
+    this.nextLanProbe = 0;
+    if (this.autoLan && !this.forceWan && this.lanBase !== '') {
+      try {
+        const r = await this.rawGet(this.lanBase + '/api/info', 900, true);
+        if (r.code === 200) {
+          this.chosen = this.lanBase;
+          console.info('DSH_BASE poke lan ' + this.lanBase);
+          return;
+        }
+        console.info('DSH_BASE poke lan http ' + String(r.code));
+      } catch (e) {
+        console.info('DSH_BASE poke lan failed: ' + (e as Error).message);
+      }
+    }
+    this.chosen = this.wanBase;
+    console.info('DSH_BASE poke wan ' + this.wanBase);
+  }
+
+  /**
    * 已经用着隧道时，每隔一分钟在后台静默探一次局域网：
    * 人从外面回到家，下一次请求就会自动换回局域网直连，不用手动重连。
    */
@@ -391,8 +420,8 @@ export class Api {
     if (now < this.nextLanProbe) {
       return;
     }
-    this.nextLanProbe = now + 60000;
-    this.rawGet(this.lanBase + '/api/info', 1500, true).then((r) => {
+    this.nextLanProbe = now + 15000;
+    this.rawGet(this.lanBase + '/api/info', 800, true).then((r) => {
       if (r.code === 200) {
         this.chosen = this.lanBase;
         this.lanDownUntil = 0;

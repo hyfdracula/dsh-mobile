@@ -14,6 +14,8 @@ import { Pairing, PairClaim, PairLink } from '../common/Pairing';
 export struct PairPage {
   api: Api = new Api('', '');
   defaultBase: string = '';
+  /** 从「设置 → 连接」直接进来时的落点：code / scan / guide；空串按向导从头走 */
+  @Prop entry: string = '';
   onExit: () => void = () => {};
   onPaired: (base: string, token: string, host: string, lan: string[]) => void = () => {};
   @State private step: number = 1;
@@ -28,6 +30,15 @@ export struct PairPage {
   aboutToAppear(): void {
     // 手动输入留空：预填会让用户先删一遍，反而更容易输错
     this.manual = '';
+    if (this.entry === 'code' || this.entry === 'scan') {
+      this.step = 2;
+    }
+    if (this.entry === 'scan') {
+      // 扫码是系统半模态，等这一页真正上屏再拉起来
+      setTimeout(() => {
+        this.scan();
+      }, 260);
+    }
   }
 
   private async doClaim(base: string, code: string): Promise<void> {

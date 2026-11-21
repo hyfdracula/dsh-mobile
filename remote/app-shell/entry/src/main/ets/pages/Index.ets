@@ -14,6 +14,7 @@ import { PresetsPage } from '../view/PresetsPage';
 import { PairPage } from '../view/PairPage';
 import { ShellPage } from '../view/ShellPage';
 import { Haptics } from '../common/Haptics';
+import { Machines } from '../common/Machines';
 import { NavFx } from '../common/NavFx';
 
 // 首次启动没有内置地址与令牌：先在「配对这台电脑」里扫码或输 6 位码，
@@ -37,6 +38,8 @@ struct Index {
   @State private forceWan: boolean = false;
   /** 设置 → 连接 里的「自动切换局域网」开关，默认开 */
   @State private autoLan: boolean = true;
+  /** 当前连着的电脑名字（多台电脑共用同一套界面，切换时整体换地址与令牌）。 */
+  @State private machineName: string = '';
   @State private haptics: boolean = true;
   @State private hdsOn: boolean = true;
   @StorageLink('themeRev') themeRev: number = 0;
@@ -52,6 +55,8 @@ struct Index {
   onPageShow(): void {
     AppStorage.setOrCreate('notifyProbe', Date.now());
     this.startPresence();
+    // 回到前台先重选一次入口：从外面回到家、或切了 Wi-Fi，这一步就能立刻换回局域网
+    void this.api.poke();
     AppStorage.setOrCreate('fgProbe', Date.now());
   }
 
@@ -151,7 +156,8 @@ struct Index {
     try {
       const p = await preferences.getPreferences(getContext(this), PREF_STORE);
       let b = await p.get('base', DEFAULT_BASE) as string;
-      const t = await p.get('token', DEFAULT_TOKEN) as string;
+      let t = await p.get('token', DEFAULT_TOKEN) as string;
+      let t0FromMachine: string = '';
       const th = await p.get('theme', THEME_AUTO) as string;
       const fw = await p.get('forceWan', '0') as string;
       const al = await p.get('autoLan', '') as string;
@@ -185,12 +191,26 @@ struct Index {
         b = lanSaved;
         console.info('DSH_CFG base from lan -> ' + b);
       }
+      // 多电脑：有机器列表时以「当前这台」为准，单机配置只在第一次迁移时用
+      const cur = Machines.active();
+      if (cur !== null) {
+        b = cur.wan;
+        t0FromMachine = cur.token;
+        lanSaved = cur.lan.length > 0 ? cur.lan[0] : '';
+        console.info('DSH_MACH restore ' + cur.name + ' ' + cur.wan);
+      } else if (b !== '' && t !== '') {
+        Machines.upsert(b, t, lanSaved !== '' ? [lanSaved] : [], '', true);
+      }
+      if (b !== '' && t0FromMachine !== '') {
+        t = t0FromMachine;
+      }
       if (b !== '' && t !== '') {
         this.wanBase = b;
         this.token = t;
         this.api.rebase(b, t, lanSaved);
         this.api.setForceWan(this.forceWan);
         this.api.setAutoLan(this.autoLan);
+        this.machineName = Machines.displayName();
         console.info('DSH_CFG loaded base=' + b + ' forceWan=' + this.forceWan + ' autoLan=' + this.autoLan + ' lan=' + (lanSaved !== '' ? lanSaved : '-'));
       }
       if (th !== this.themeMode) {
@@ -202,7 +222,7 @@ struct Index {
     }
   }
 
-  private async saveCfg(b: string, t: string, lan: string[] = []): Promise<void> {
+  private async saveCfg(b: string, t: string, lan: string[] = [], name: string = ''): Promise<void> {
     // 先切内存里的连接再落盘：claim 已经把一次性配对码消费掉了，
     // 若存储失败就什么都不做，用户看到「配对成功」却还连着旧电脑。
     // 公网地址与局域网地址必须分开存：配对是在局域网里做的，电脑报回来的
@@ -221,6 +241,8 @@ struct Index {
     this.wanBase = wan;
     this.token = t;
     this.api.rebase(wan, t, lanOne);
+    this.machineName = Machines.upsert(wan, t, lanOne !== '' ? [lanOne] : [], name, true).name;
+    AppStorage.setOrCreate('listDirty', Date.now());
     this.api.setForceWan(this.forceWan);
     this.api.setAutoLan(this.autoLan);
     try {
@@ -232,6 +254,42 @@ struct Index {
       console.info('DSH_CFG saved base=' + wan + ' lan=' + (lanOne !== '' ? lanOne : '-'));
     } catch (e) {
       console.error('DSH_CFG save failed :: ' + (e as Error).message);
+    }
+  }
+
+  /** 切到另一台已配对的电脑：地址、令牌、当前名一起换。 */
+  private async switchMachine(id: string): Promise<void> {
+    const m = Machines.activate(id);
+    if (m === null) {
+      return;
+    }
+    this.wanBase = m.wan;
+    this.token = m.token;
+    this.machineName = m.name;
+    this.api.rebase(m.wan, m.token, m.lan.length > 0 ? m.lan[0] : '');
+    this.api.setForceWan(this.forceWan);
+    this.api.setAutoLan(this.autoLan);
+    try {
+      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      await p.put('base', m.wan);
+      await p.put('token', m.token);
+      await p.put('lan', m.lan.length > 0 ? m.lan[0] : '');
+      await p.flush();
+    } catch (e) {
+      console.error('DSH_MACH switch save fail :: ' + (e as Error).message);
+    }
+    console.info('DSH_MACH switch ' + m.name + ' ' + m.wan);
+    AppStorage.setOrCreate('listDirty', Date.now());
+  }
+
+  /** 忘掉一台电脑；删的是当前这台时自动切到剩下的第一台。 */
+  private async removeMachine(id: string): Promise<void> {
+    Machines.remove(id);
+    const cur = Machines.active();
+    if (cur !== null) {
+      await this.switchMachine(cur.id);
+    } else {
+      this.machineName = '';
     }
   }
 
@@ -446,6 +504,16 @@ struct Index {
             onSave: (b: string, t: string) => {
               this.saveCfg(b, t, []);
             },
+            machineName: this.machineName,
+            onPickMachine: (id: string) => {
+              this.switchMachine(id);
+            },
+            onRemoveMachine: (id: string) => {
+              this.removeMachine(id);
+            },
+            onAddMachine: (wan: string, token: string, name: string) => {
+              this.saveCfg(wan, token, [], name);
+            },
             onSaveLan: (b: string, t: string, lan: string[]) => {
               this.saveCfg(b, t, lan);
             },
@@ -475,7 +543,7 @@ struct Index {
             onExit: () => {
             },
             onPaired: (b: string, t: string, host: string, lan: string[]) => {
-              this.saveCfg(b, t, lan);
+              this.saveCfg(b, t, lan, host);
             }
           })
             .width('100%')

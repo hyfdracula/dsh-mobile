@@ -1,13 +1,16 @@
-﻿import curves from '@ohos.curves';
+import curves from '@ohos.curves';
 import notificationManager from '@ohos.notificationManager';
 import { bundleManager, common, Want } from '@kit.AbilityKit';
-import { Api, ApiInfo } from '../common/Api';
+import pasteboard from '@ohos.pasteboard';
+import { Api, ApiInfo, SessionRow } from '../common/Api';
 import { Tokens } from '../common/Tokens';
 import { PairPage } from './PairPage';
 import { PcPage } from './PcPage';
 import { StoragePage } from './StoragePage';
 import { Notifier } from '../common/Notifier';
+import { Machines, Machine } from '../common/Machines';
 import { Haptics } from '../common/Haptics';
+import { promptAction } from '@kit.ArkUI';
 
 /** @Builder 按引用传参：整体传对象才会随状态刷新。 */
 interface ThemeOpt {
@@ -43,16 +46,95 @@ const THEMES: ThemeOpt[] = [
 ];
 
 const NAV_ROWS: NavRow[] = [
-  { id: 'pc', icon: '⌂', name: '电脑管理', hint: '', color: '#2F6BFF' },
+  { id: 'connect', icon: '⌂', name: '电脑', hint: '', color: '#2F6BFF' },
   { id: 'appearance', icon: '◐', name: '外观', hint: '', color: '#8E6BFF' },
   { id: 'notify', icon: '◔', name: '通知', hint: '', color: '#F2A23C' },
-  { id: 'storage', icon: '◫', name: '存储空间', hint: '', color: '#2EC27E' },
-  { id: 'connect', icon: '⇄', name: '连接', hint: '', color: '#4FA8FF' }
+  { id: 'storage', icon: '◫', name: '存储空间', hint: '', color: '#2EC27E' }
 ];
 
 /**
  * 设置：一级是分组列表，二级是各分组详情（返回箭头回到一级）。
  */
+/**
+ * 已配对的电脑列表。
+ * 单独做成组件：它挂在 NavDestination 的二级页里，而二级页的内容不会因为
+ * 父级 @State 变化重新构建，所以「当前这台」的高亮必须由组件自己的
+ * @StorageLink 驱动，切换后才会立刻变。
+ */
+@Component
+struct MachineList {
+  @StorageLink('machinesVer') ver: number = 0;
+  onPick: (id: string) => void = () => {};
+  onRemove: (id: string) => void = () => {};
+
+  @Builder
+  row(m: Machine) {
+    Row() {
+      Column() {
+        Row() {
+          Text(m.name)
+            .fontSize(13.5)
+            .fontColor(Tokens.fg)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+          if (m.id === Machines.activeId()) {
+            Text('当前')
+              .fontSize(9.5)
+              .fontColor(Tokens.accent)
+              .backgroundColor(Tokens.accentSoft)
+              .borderRadius(999)
+              .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+              .margin({ left: 6 })
+          }
+        }
+        .width('100%')
+        Text(m.wan)
+          .fontSize(10.5)
+          .fontColor(Tokens.dim2)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+          .margin({ top: 2 })
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      if (Machines.list().length > 1) {
+        Text('×')
+          .fontSize(17)
+          .fontColor(Tokens.dim2)
+          .width(34)
+          .height(34)
+          .textAlign(TextAlign.Center)
+          .borderRadius(999)
+          .onClick(() => {
+            Haptics.tap();
+            this.onRemove(m.id);
+          })
+      }
+    }
+    .width('100%')
+    .padding({ left: 12, right: 8, top: 10, bottom: 10 })
+    .borderRadius(Tokens.rGroup)
+    .backgroundColor(m.id === Machines.activeId() ? Tokens.accentSoft : Tokens.surface2)
+    .margin({ bottom: 8 })
+    .onClick(() => {
+      Haptics.tap();
+      this.onPick(m.id);
+    })
+  }
+
+  build() {
+    Column() {
+      ForEach(Machines.list(), (m: Machine) => {
+        this.row(m)
+      }, (m: Machine) => m.id + '@' + m.at)
+    }
+    .width('100%')
+  }
+}
+
 @Component
 export struct SettingsPage {
   api: Api = new Api('', '');
@@ -61,6 +143,19 @@ export struct SettingsPage {
   onSave: (b: string, t: string) => void = () => {};
   /** 配对成功回调：除了地址与令牌，还要带上电脑自己报的局域网地址 */
   onSaveLan: (b: string, t: string, lan: string[]) => void = () => {};
+  @Prop machineName: string = '';
+  /** 电脑列表变化时刷新（Machines 里每次写入都会 bump 这个值） */
+  @StorageLink('machinesVer') machinesVer: number = 0;
+  /** 从连接页进入配对页时的落点：code / scan / guide */
+  @State private pairEntry: string = '';
+  /** 「手动添加」小表单：另一台电脑的地址 + 令牌 */
+  @State private addOn: boolean = false;
+  @State private addBase: string = '';
+  @State private addToken: string = '';
+  @State private addName: string = '';
+  onPickMachine: (id: string) => void = () => {};
+  onRemoveMachine: (id: string) => void = () => {};
+  onAddMachine: (wan: string, token: string, name: string) => void = () => {};
   themeMode: string = 'auto';
   systemDark: boolean = true;
   onTheme: (m: string) => void = () => {};
@@ -88,11 +183,15 @@ export struct SettingsPage {
   @State private saved: string = '';
   /** 系统通知是否已开（这个页面要能一眼看见并一键去开） */
   @State private notifyOn: boolean = false;
+  /** 复制成功的临时提示。 */
+  @State private copyTip: string = '';
   /** 版本号取自应用包信息（AppScope/app.json5 的 versionName），与 GitHub Release 保持一致。 */
   @State private verText: string = 'DSH Mobile';
   /** 谁来回答模型的提问：'phone' 手机为主/ 'desktop' 电脑为主（存在电脑上） */
   @State private answerMode: string = 'phone';
   @State private answerBusy: boolean = false;
+  /** 这台电脑的会话数（-1 表示还没取到） */
+  @State private devCount: number = -1;
   /** 应用回到前台时 Index 会 bump 这个值，用来重新读通知开关 */
   @StorageLink('notifyProbe') @Watch('onNotifyProbe') notifyProbe: number = 0;
   /** 隧道教程是否展开 */
@@ -185,6 +284,54 @@ export struct SettingsPage {
     .alignItems(VerticalAlign.Center)
   }
 
+  /** 二级页顶部同色渐变：滚上来的内容在浮动标题下面淡出，不留硬边。 */
+  /** 悬浮标题行：父级已经留好状态栏高度，这里不再加外边距。 */
+  @Builder
+  floatingHeader(title: string) {
+    Row() {
+      Stack() {
+        Image($r('app.media.ic_back'))
+          .width(20)
+          .height(20)
+          .fillColor(Tokens.fg)
+          .objectFit(ImageFit.Contain)
+      }
+      .width(38)
+      .height(38)
+      .borderRadius(999)
+      .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#8CFFFFFF')
+      .backdropBlur(22)
+      .border({ width: 1, color: Tokens.isDark ? '#40FFFFFF' : '#D9FFFFFF' })
+      .shadow({ radius: 14, color: Tokens.isDark ? '#40000000' : '#26000000', offsetY: 4 })
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+      .onClick(() => {
+        Haptics.tap();
+        this.closeSub();
+      })
+      Text(title)
+        .fontSize(20)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.fg)
+        .margin({ left: 12 })
+      Blank()
+    }
+    .width('100%')
+    .height(56)
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  subFade() {
+    Row()
+      .width('100%')
+      .height(96)
+      .linearGradient({
+        angle: 180,
+        colors: [[this.themeBg, 0.0], [this.themeBg, 0.58], ['#00' + this.themeBg.slice(1), 1.0]]
+      })
+      .hitTestBehavior(HitTestMode.None)
+  }
+
   @Builder
   subHeader(title: string) {
     Row() {
@@ -238,6 +385,15 @@ export struct SettingsPage {
         Haptics.tap();
         this.setAnswerMode(mode);
       })
+  }
+
+  private async loadDeviceCount(): Promise<void> {
+    try {
+      const rows: SessionRow[] = await this.api.sessions();
+      this.devCount = rows.length;
+    } catch (e) {
+      this.devCount = -1;
+    }
   }
 
   private async loadAnswerMode(): Promise<void> {
@@ -323,6 +479,7 @@ export struct SettingsPage {
     .onClick(() => {
       if (r.id === 'connect') {
         this.loadAnswerMode();
+        this.loadDeviceCount();
       }
       this.subStack.pushPathByName(r.id, null);
     })
@@ -464,10 +621,256 @@ export struct SettingsPage {
 
   // ---------- 二级：连接 ----------
 
+  /** 「电脑」区：已经配对的几台，点一行就切过去；右边 × 忘了它。 */
+  @Builder
+  machineBlock() {
+    Text('电脑')
+      .fontSize(10.5)
+      .fontColor(Tokens.dim2)
+      .letterSpacing(1.6)
+      .margin({ left: 6, top: 18, bottom: 8 })
+    Column() {
+      MachineList({
+        onPick: (id: string) => {
+          this.onPickMachine(id);
+          promptAction.showToast({ message: '已切换电脑', duration: 1600 });
+        },
+        onRemove: (id: string) => {
+          this.onRemoveMachine(id);
+        }
+      })
+    }
+    .width('100%')
+
+    Row() {
+      this.addMachineChip('配对码', 'code')
+      this.addMachineChip('扫一扫', 'scan')
+      this.addMachineChip('新手引导', 'guide')
+      this.addMachineChip('手动添加', 'manual')
+    }
+    .width('100%')
+    .margin({ top: 2, bottom: 4 })
+    .bindSheet($$this.addOn, this.addMachineSheet(), {
+      height: '58%',
+      dragBar: true,
+      showClose: true,
+      backgroundColor: Tokens.surface,
+      maskColor: '#33000000',
+      onDisappear: () => {
+        this.addOn = false;
+      }
+    })
+  }
+
+  @Builder
+  addMachineChip(label: string, entry: string) {
+    Text(label)
+      .fontSize(12.5)
+      .fontColor(Tokens.accent)
+      .backgroundColor(Tokens.accentSoft)
+      .borderRadius(999)
+      .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+      .margin({ right: 8 })
+      .onClick(() => {
+        Haptics.tap();
+        if (entry === 'manual') {
+          this.addBase = '';
+          this.addToken = '';
+          this.addName = '';
+          this.addOn = true;
+          return;
+        }
+        this.pairEntry = entry;
+        this.subStack.pushPathByName('pair', null);
+      })
+  }
+
+  @Builder
+  addMachineSheet() {
+    Column() {
+      Text('添加电脑')
+        .fontSize(17)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Tokens.fg)
+      Text('填这台电脑的地址和令牌；同一台电脑不用重复加')
+        .fontSize(11)
+        .fontColor(Tokens.dim2)
+        .margin({ top: 4, bottom: 14 })
+
+      TextInput({ text: this.addName, placeholder: '名字（可留空）' })
+        .height(44)
+        .fontSize(13.5)
+        .borderRadius(Tokens.rInput)
+        .backgroundColor(Tokens.surface2)
+        .margin({ bottom: 10 })
+        .onChange((v: string) => {
+          this.addName = v;
+        })
+      TextInput({ text: this.addBase, placeholder: 'https://dsh.example.com 或 192.168.1.3:8901' })
+        .height(44)
+        .fontSize(13.5)
+        .borderRadius(Tokens.rInput)
+        .backgroundColor(Tokens.surface2)
+        .margin({ bottom: 10 })
+        .onChange((v: string) => {
+          this.addBase = v;
+        })
+      TextInput({ text: this.addToken, placeholder: '访问令牌' })
+        .type(InputType.Password)
+        .height(44)
+        .fontSize(13.5)
+        .borderRadius(Tokens.rInput)
+        .backgroundColor(Tokens.surface2)
+        .onChange((v: string) => {
+          this.addToken = v;
+        })
+
+      Row() {
+        Text('取消')
+          .fontSize(14)
+          .fontColor(Tokens.fg)
+          .layoutWeight(1)
+          .height(46)
+          .textAlign(TextAlign.Center)
+          .borderRadius(Tokens.rInput)
+          .backgroundColor(Tokens.surface2)
+          .onClick(() => {
+            this.addOn = false;
+          })
+        Text('添加并切换')
+          .fontSize(14)
+          .fontColor(Tokens.accentInk)
+          .layoutWeight(1)
+          .height(46)
+          .textAlign(TextAlign.Center)
+          .borderRadius(Tokens.rInput)
+          .backgroundColor(Tokens.accent)
+          .margin({ left: 10 })
+          .onClick(() => {
+            const b: string = this.addBase.trim();
+            const t: string = this.addToken.trim();
+            if (b === '' || t === '') {
+              promptAction.showToast({ message: '地址和令牌都要填', duration: 1600 });
+              return;
+            }
+            Haptics.tap();
+            this.addOn = false;
+            this.onAddMachine(b, t, this.addName.trim());
+            promptAction.showToast({ message: '已添加并切换', duration: 1600 });
+          })
+      }
+      .width('100%')
+      .margin({ top: 16 })
+    }
+    .width('100%')
+    .padding({ left: 18, right: 18, top: 18, bottom: 18 })
+  }
+
+  @Builder
+  /** 「这台电脑」：名称/地址/插件版本/会话数 + 重连 + 移除。 */
+  @Builder
+  deviceBlock() {
+    Text('这台电脑')
+      .fontSize(10.5)
+      .fontColor(Tokens.dim2)
+      .letterSpacing(1.6)
+      .margin({ left: 6, top: 18, bottom: 8 })
+    Column() {
+      this.devRow('名称', this.machineName !== '' ? this.machineName : '—', false)
+      Divider().color(Tokens.lineSoft).margin({ left: 16 })
+      this.devRow('地址', this.base, true)
+      Divider().color(Tokens.lineSoft).margin({ left: 16 })
+      this.devRow('连接插件', this.info !== null ? this.info.version : '—', false)
+      Divider().color(Tokens.lineSoft).margin({ left: 16 })
+      this.devRow('会话', this.devCount >= 0 ? (String(this.devCount) + ' 个') : '—', false)
+      Divider().color(Tokens.lineSoft).margin({ left: 16 })
+
+      Row() {
+        Text('重新连接')
+          .fontSize(14)
+          .fontColor(Tokens.accent)
+          .layoutWeight(1)
+        Text('›')
+          .fontSize(18)
+          .fontColor(Tokens.dim2)
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 15, bottom: 15 })
+      .alignItems(VerticalAlign.Center)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+      .onClick(() => {
+        Haptics.tap();
+        this.load();
+        this.loadDeviceCount();
+      })
+
+      Divider().color(Tokens.lineSoft).margin({ left: 16 })
+
+      Row() {
+        Text('移除此电脑')
+          .fontSize(14)
+          .fontColor(Tokens.err)
+          .layoutWeight(1)
+        Text('›')
+          .fontSize(18)
+          .fontColor(Tokens.dim2)
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 15, bottom: 15 })
+      .alignItems(VerticalAlign.Center)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+      .onClick(() => {
+        Haptics.tap();
+        AlertDialog.show({
+          title: '移除此电脑',
+          message: '会清掉这台手机和它的配对信息，回到配对向导。电脑端不受影响。',
+          primaryButton: {
+            value: '取消',
+            action: () => {}
+          },
+          secondaryButton: {
+            value: '移除',
+            fontColor: Tokens.err,
+            action: () => {
+              this.closeSub();
+              this.onReset();
+            }
+          }
+        });
+      })
+    }
+    .width('100%')
+    .backgroundColor(Tokens.surface)
+    .borderRadius(Tokens.rGroup)
+    .clip(true)
+  }
+
+  @Builder
+  devRow(label: string, value: string, mono: boolean) {
+    Row() {
+      Text(label)
+        .fontSize(13)
+        .fontColor(Tokens.dim)
+        .width(84)
+      Text(value)
+        .fontSize(13)
+        .fontColor(Tokens.fg)
+        .fontFamily(mono ? 'monospace' : 'sans-serif')
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .textAlign(TextAlign.End)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 13, bottom: 13 })
+    .alignItems(VerticalAlign.Center)
+  }
+
   @Builder
   connectSub() {
     Column() {
-      this.subHeader('连接')
+
+      this.machineBlock()
 
       Text('公网地址')
         .fontSize(10.5)
@@ -603,6 +1006,7 @@ export struct SettingsPage {
         this.tunnelGuide()
       }
 
+      this.deviceBlock()
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
@@ -614,34 +1018,61 @@ export struct SettingsPage {
    * Cloudflare Tunnel 教程：给「出了家门还想用」的那一步。
    * 命令都写全路径，照着粘就行；只在第一次要配，之后 cloudflared 自己开机起。
    */
+  /**
+   * Cloudflare Tunnel 教程：给「出了家门还想用」的那一步。
+   * 命令都在 Cloudflare 官方文档里能对上（winget 包名、tunnel login/create/route/run、
+   * service install），config.yml 用 %USERPROFILE%\.cloudflared\config.yml 这一份。
+   */
   @Builder
   tunnelGuide() {
     Column() {
-      Text('电脑上装一个 Cloudflare 隧道，手机在 4G/5G 下也能连回来。')
-        .fontSize(11.5)
-        .fontColor(Tokens.dim2)
-        .lineHeight(18)
-        .width('100%')
+      Row() {
+        Text('电脑上装一个 Cloudflare 隧道，手机在 4G/5G 下也能连回来。')
+          .fontSize(11.5)
+          .fontColor(Tokens.dim2)
+          .lineHeight(18)
+          .layoutWeight(1)
+        Text(this.copyTip === '已复制全部命令' ? '已复制' : '复制全部')
+          .fontSize(11)
+          .fontColor(Tokens.accent)
+          .backgroundColor(Tokens.accentSoft)
+          .borderRadius(999)
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          .onClick(() => {
+            this.copyText(this.tunnelScript(), '已复制全部命令');
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Top)
 
-      this.guideStep('1', '装 cloudflared（Windows）', 'winget install --id Cloudflare.cloudflared')
-      this.guideStep('2', '登录并建隧道', 'cloudflared tunnel login\ncloudflared tunnel create dsh')
-      this.guideStep('3', '把域名指到本机 8901',
-        'cloudflared tunnel route dns dsh dsh.你的域名.com')
-      this.guideStep('4', '写配置 ~/.cloudflared/config.yml',
-        'tunnel: dsh\ncredentials-file: C:\\Users\\你\\.cloudflared\\<隧道id>.json\ningress:\n  - hostname: dsh.你的域名.com\n    service: http://127.0.0.1:8901\n  - service: http_status:404')
-      this.guideStep('5', '常驻', 'cloudflared service install')
+      this.guideStep('1', '装 cloudflared（Windows，管理员 PowerShell）',
+        'winget install --id Cloudflare.cloudflared\ncloudflared --version')
+      this.guideStep('2', '登录 Cloudflare（浏览器里选域名授权）', 'cloudflared tunnel login')
+      this.guideStep('3', '建隧道，记下它的 UUID', 'cloudflared tunnel create dsh\ncloudflared tunnel list')
+      this.guideStep('4', '把域名指到隧道', 'cloudflared tunnel route dns dsh dsh.你的域名.com')
+      this.guideStep('5', '写配置文件 %USERPROFILE%\\.cloudflared\\config.yml',
+        'tunnel: <第 3 步的 UUID>\ncredentials-file: C:\\Users\\你\\.cloudflared\\<第 3 步的 UUID>.json\ningress:\n  - hostname: dsh.你的域名.com\n    service: http://127.0.0.1:8901\n  - service: http_status:404')
+      this.guideStep('6', '先在窗口里手动跑一次，确认能打开', 'cloudflared tunnel run dsh')
+      this.guideStep('7', '确认没问题再装成服务（开机自启）', 'cloudflared service install\nsc query cloudflared')
 
       Column() {
-        Text('然后回到本页')
+        Text('回到这个 App')
           .fontSize(11.5)
           .fontWeight(FontWeight.Medium)
           .fontColor(Tokens.fg)
-        Text('把上面拿到的 https://dsh.你的域名.com 填进「隧道域名」，访问令牌填电脑端插件面板上那串；' +
-          '在外面时打开「只用公网隧道」。电脑端的插件面板里要允许远程访问。')
+        Text('把 https://dsh.你的域名.com 填进上面「地址」，令牌填电脑端插件面板上那串；' +
+          '电脑端面板要允许远程访问。在家连同一个 Wi-Fi 时会自动走局域网，出门走隧道。')
           .fontSize(11)
           .fontColor(Tokens.dim2)
           .lineHeight(17)
           .margin({ top: 4 })
+        Text('第 7 步服务读不到配置时，用管理员 PowerShell 换成：' +
+          'cloudflared service install --config "C:\\Users\\你\\.cloudflared\\config.yml"')
+          .fontSize(10.5)
+          .fontColor(Tokens.dim2)
+          .lineHeight(16)
+          .margin({ top: 6 })
       }
       .alignItems(HorizontalAlign.Start)
       .width('100%')
@@ -651,11 +1082,51 @@ export struct SettingsPage {
       .margin({ top: 10 })
     }
     .width('100%')
-    .padding({ left: 16, right: 16, bottom: 16 })
+    .padding({ left: 16, right: 16, top: 14, bottom: 16 })
     .backgroundColor(Tokens.surface)
     .borderRadius(Tokens.rGroup)
     .alignItems(HorizontalAlign.Start)
     .margin({ top: 8 })
+  }
+
+  /** 一整套命令，供「复制全部」用（占位符保持原样，粘到终端后逐项替换）。 */
+  private tunnelScript(): string {
+    return 'winget install --id Cloudflare.cloudflared\n' +
+      'cloudflared --version\n' +
+      'cloudflared tunnel login\n' +
+      'cloudflared tunnel create dsh\n' +
+      'cloudflared tunnel list\n' +
+      'cloudflared tunnel route dns dsh dsh.你的域名.com\n' +
+      '# 下面这段写进 %USERPROFILE%\\.cloudflared\\config.yml，<UUID> 换成第 3 步的隧道 ID\n' +
+      'tunnel: <UUID>\n' +
+      'credentials-file: C:\\Users\\你\\.cloudflared\\<UUID>.json\n' +
+      'ingress:\n' +
+      '  - hostname: dsh.你的域名.com\n' +
+      '    service: http://127.0.0.1:8901\n' +
+      '  - service: http_status:404\n' +
+      'cloudflared tunnel run dsh\n' +
+      'cloudflared service install\n' +
+      'sc query cloudflared';
+  }
+
+  private copyText(text: string, tip: string): void {
+    if (text === '') {
+      return;
+    }
+    try {
+      const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
+      pasteboard.getSystemPasteboard().setData(data).then(() => {
+        this.copyTip = tip;
+        setTimeout(() => {
+          this.copyTip = '';
+        }, 1600);
+      }).catch(() => {
+        this.copyTip = '复制失败';
+      });
+    } catch (e) {
+      console.info('DSH_COPY failed ' + JSON.stringify(e));
+      this.copyTip = '复制失败';
+    }
   }
 
   @Builder
@@ -681,17 +1152,43 @@ export struct SettingsPage {
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      Text(cmd)
-        .fontSize(10.5)
-        .fontColor(Tokens.dim)
-        .fontFamily('monospace')
-        .lineHeight(16)
-        .width('100%')
-        .padding(10)
-        .margin({ top: 6 })
-        .backgroundColor(Tokens.surface2)
-        .borderRadius(10)
-        .copyOption(CopyOptions.LocalDevice)
+      Row() {
+        Column() {
+          ForEach(cmd.split('\n'), (line: string, idx: number) => {
+            Text(line)
+              .fontSize(10.5)
+              .fontColor(Tokens.dim)
+              .fontFamily('monospace')
+              .lineHeight(16)
+              .width('100%')
+          }, (line: string, idx: number) => String(idx) + line)
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Row() {
+          Image($r('app.media.ic_copy'))
+            .width(13)
+            .height(13)
+            .fillColor(Tokens.accent)
+        }
+        .width(24)
+        .height(24)
+        .borderRadius(7)
+        .backgroundColor(Tokens.surface3)
+        .justifyContent(FlexAlign.Center)
+        .margin({ left: 6 })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+        .onClick(() => {
+          this.copyText(cmd, '已复制');
+        })
+      }
+      .width('100%')
+      .padding(10)
+      .margin({ top: 6 })
+      .backgroundColor(Tokens.surface2)
+      .borderRadius(10)
+      .alignItems(VerticalAlign.Top)
     }
     .alignItems(HorizontalAlign.Start)
     .width('100%')
@@ -831,15 +1328,10 @@ export struct SettingsPage {
       Column() {
         Row() {
           Column() {
-            Text('会话跑完提醒我')
+            Text('会话结束通知')
               .fontSize(15)
               .fontColor(Tokens.fg)
               .width('100%')
-            Text(this.notifyOn ? '系统通知已开，跑完会弹横幅' : '现在没开，手机不会弹横幅')
-              .fontSize(11.5)
-              .fontColor(this.notifyOn ? Tokens.dim : Tokens.err)
-              .width('100%')
-              .margin({ top: 4 })
           }
           .layoutWeight(1)
           .alignItems(HorizontalAlign.Start)
@@ -926,12 +1418,6 @@ export struct SettingsPage {
       .borderRadius(Tokens.rGroup)
       .clip(true)
       .margin({ top: 10 })
-
-      Text('点下面那行去系统里打开「允许通知」。')
-        .fontSize(11.5)
-        .fontColor(Tokens.dim2)
-        .width('100%')
-        .margin({ top: 10, left: 2 })
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
@@ -974,18 +1460,46 @@ export struct SettingsPage {
   subDest(name: string) {
     NavDestination() {
       Column() {
-        List() {
-          ListItem() {
-            Column() {
-              this.subBody(name)
+        // 存储空间 / 电脑管理自带滚动容器，外面再套一层 List 会把它们的高度压塌，
+        // 表现成页面下半截出现一块白板（用户报的「很大的遮罩」）。这两页直接铺进去。
+        if (name === 'storage' || name === 'pc') {
+          this.subBody(name)
+        } else if (name === 'connect') {
+          // 连接页和「存储空间」同一套：内容滚到标题下面淡出，标题+返回一直悬浮
+          Stack({ alignContent: Alignment.Top }) {
+            List() {
+              ListItem() {
+                Column() {
+                  this.subBody(name)
+                }
+                .width('100%')
+                .padding({ bottom: 110 })
+                .alignItems(HorizontalAlign.Start)
+              }
             }
-            .width('100%')
-            .padding({ bottom: 110 })
-            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+            .scrollBar(BarState.Off)
+            .padding({ top: 56 })
+
+            this.subFade()
+            this.floatingHeader('电脑')
           }
+          .width('100%')
+          .height('100%')
+        } else {
+          List() {
+            ListItem() {
+              Column() {
+                this.subBody(name)
+              }
+              .width('100%')
+              .padding({ bottom: 110 })
+              .alignItems(HorizontalAlign.Start)
+            }
+          }
+          .layoutWeight(1)
+          .scrollBar(BarState.Off)
         }
-        .layoutWeight(1)
-        .scrollBar(BarState.Off)
       }
       .width('100%')
       .height('100%')
@@ -997,6 +1511,11 @@ export struct SettingsPage {
     .backgroundColor(this.themeBg)
     .onShown(() => {
       this.sub = name;
+      // 二级页出现时刷一次：题目回答者偏好、这台电脑的会话数都靠网络，得等页面真正显示再取
+      if (name === 'connect') {
+        this.loadAnswerMode();
+        this.loadDeviceCount();
+      }
     })
     .onHidden(() => {
       this.sub = '';
@@ -1022,6 +1541,7 @@ export struct SettingsPage {
       PairPage({
         api: this.api,
         defaultBase: this.defaultLan,
+        entry: this.pairEntry,
         onExit: () => {
           this.closeSub();
         },
