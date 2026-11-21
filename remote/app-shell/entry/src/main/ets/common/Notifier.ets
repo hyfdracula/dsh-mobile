@@ -1,4 +1,4 @@
-﻿import notificationManager from '@ohos.notificationManager';
+import notificationManager from '@ohos.notificationManager';
 import wantAgent from '@ohos.app.ability.wantAgent';
 import { BusinessError } from '@ohos.base';
 
@@ -24,7 +24,7 @@ export class Notifier {
       console.info('DSH_NOTIFY enable failed :: ' + (e as BusinessError).message);
     }
     try {
-      // OTHER_TYPES 只落通知中心、不弹横幅；完成提醒要能一眼看到，用高优先级通道
+      // SOCIAL_COMMUNICATION 的默认等级就是 LEVEL_HIGH（横幅），不用再自建 slot 对象
       await notificationManager.addSlot(notificationManager.SlotType.SOCIAL_COMMUNICATION);
     } catch (e) {
       console.info('DSH_NOTIFY slot failed :: ' + (e as BusinessError).message);
@@ -53,6 +53,7 @@ export class Notifier {
     const req: notificationManager.NotificationRequest = {
       id: id,
       notificationSlotType: notificationManager.SlotType.SOCIAL_COMMUNICATION,
+      badgeNumber: 1,
       content: {
         notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
         normal: {

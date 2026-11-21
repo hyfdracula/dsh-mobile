@@ -28,4 +28,42 @@ export class Mat {
     }
     return Mat.cache as uiMaterial.Material;
   }
+
+  private static whiteCache: uiMaterial.Material | undefined = undefined;
+
+  /** 白色光晕版本：不带品牌蓝，点按只泛白光。 */
+  static white(): uiMaterial.Material {
+    if (Mat.whiteCache === undefined) {
+      let m: uiMaterial.Material = uiMaterial.Material.empty;
+      try {
+        if (uiMaterial.isImmersiveMaterialSupported()) {
+          m = new uiMaterial.ImmersiveMaterial({
+            style: uiMaterial.ImmersiveStyle.THIN,
+            interactive: true,
+            lightEffect: { color: '#FFFFFF' }
+          });
+        }
+      } catch (e) {
+        console.info('DSH_MAT white build failed: ' + JSON.stringify(e));
+      }
+      Mat.whiteCache = m;
+    }
+    return Mat.whiteCache as uiMaterial.Material;
+  }
+
+  /** 设置里的「沉浸光感」开关：关掉时返回空材质，控件退回普通底色。 */
+  static bySwitch(enabled: boolean): uiMaterial.Material {
+    if (!enabled) {
+      return uiMaterial.Material.empty;
+    }
+    return Mat.bar();
+  }
+
+  /** 只要白光、不要品牌蓝的开关版本。 */
+  static whiteOn(enabled: boolean): uiMaterial.Material {
+    if (!enabled) {
+      return uiMaterial.Material.empty;
+    }
+    return Mat.white();
+  }
 }

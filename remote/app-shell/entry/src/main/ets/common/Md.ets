@@ -14,6 +14,8 @@ export interface MdSeg {
 
 export interface MdBlock {
   kind: string;
+  /** 有序列表的序号（1 起）；其余块为 0 */
+  ord: number;
   text: string;
   segs: MdSeg[];
   head: string[];
@@ -77,7 +79,8 @@ function cells(line: string): string[] {
 }
 
 function blank(): MdBlock {
-  return { kind: 'p', text: '', segs: [], head: [], rows: [], lang: '' };
+  return { ord: 0,
+  kind: 'p', text: '', segs: [], head: [], rows: [], lang: '' };
 }
 
 export function parseMd(src: string): MdBlock[] {
@@ -230,12 +233,14 @@ export function parseMd(src: string): MdBlock[] {
       continue;
     }
 
-    // 有序列表按圆点处理
+    // 有序列表：保留 1. 2. 3. 的序号，不要退化成圆点
     if (/^\s*\d+[.)]\s+/.test(line)) {
       flushPara();
+      const numRaw: string = (line.trim().match(/^\d+/) ?? ['0'])[0];
       const text: string = line.replace(/^\s*\d+[.)]\s+/, '');
       const b: MdBlock = blank();
-      b.kind = 'bullet';
+      b.kind = 'ordered';
+      b.ord = Number(numRaw);
       b.text = text;
       b.segs = inlineSegs(text);
       out.push(b);

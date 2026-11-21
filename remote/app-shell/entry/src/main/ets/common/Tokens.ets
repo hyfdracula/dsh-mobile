@@ -33,10 +33,18 @@ export class Tokens {
   static glass: string = '#E6171B24';
   static glassStrong: string = '#E6171B24';
   static glassLine: string = '#33FFFFFF';
+  /** 胶囊/圆钮的高亮描边：深色用白光，浅色用淡墨，两种底色下都能看出「一圈边」。 */
+  static pillEdge: string = '#4DFFFFFF';
   /** 顶部斜向高光，模拟玻璃表面反光 */
   static glassTop: string = '#5CFFFFFF';
   static glassBar: string = '#E6171B24';
   static glassFloat: string = '#331B2030';
+  /** 更淡的一层玻璃：悬浮按钮用，几乎全透 */
+  static glassFaint: string = '#1FFFFFFF';
+  /** 半模态面板的玻璃底：带透明度，配合系统 blur 能看到身后的内容 */
+  static sheetGlass: string = '#E9FFFFFF';
+  /** 半模态的暖金玻璃（浅色）：带暖黄调的半透明底，靠系统 blur 出玻璃感 */
+  static sheetWarm: string = '#B8FFF6E4';
   /** 选中胶囊：半透明蓝玻璃，不要用实色 accentSoft，否则压掉模糊 */
   static accentGlass: string = '#1A3B6EF6';
   static chip: string = '#1F2A3A';
@@ -53,6 +61,9 @@ export class Tokens {
 
   // 圆角
   static readonly rGroup: number = 22;
+
+  /** 当前是否深色。静态标记，applyDark() 每次切换时更新，供运行时需要分支的绘制用。 */
+  static isDark: boolean = true;
   static readonly rCard: number = 20;
   static readonly rInput: number = 28;
   static readonly rPill: number = 999;
@@ -68,6 +79,7 @@ export class Tokens {
 
   /** 切换调色板：true 深色，false 浅色。 */
   static applyDark(dark: boolean): void {
+    Tokens.isDark = dark;
     if (dark) {
       Tokens.bg = '#0A0C10';
       Tokens.bgTop = '#101521';
@@ -85,6 +97,8 @@ export class Tokens {
       Tokens.accentInk = '#FFFFFF';
       Tokens.accentGlow = '#335B8CFF';
       Tokens.accentSoft = '#1A3B6EF6';
+      Tokens.sheetGlass = '#E61B2027';
+      Tokens.sheetWarm = '#9E171B22';
       Tokens.ok = '#3DDC97';
       Tokens.err = '#FF5C5C';
       Tokens.glass = '#E6171B24';
@@ -93,13 +107,14 @@ export class Tokens {
       Tokens.glassTop = '#5CFFFFFF';
       Tokens.glassBar = '#E6171B24';
     Tokens.glassFloat = '#331B2030';
+    Tokens.glassFaint = '#1FFFFFFF';
       Tokens.accentGlass = '#1A3B6EF6';
       Tokens.chip = '#1F2A3A';
       Tokens.shadow = '#4D000000';
       Tokens.tile = ['#2B4A8F', '#2F6B5E', '#6A4A2B', '#5A3B72', '#7A3446', '#2F5A7A'];
     } else {
-      Tokens.bg = '#EEF1F7';
-      Tokens.bgTop = '#E3E9F5';
+      Tokens.bg = '#E9EDF4';
+      Tokens.bgTop = '#DCE4F2';
       Tokens.bgEl = '#F7F9FC';
       Tokens.surface = '#FFFFFF';
       Tokens.surface2 = '#F3F6FB';
@@ -117,11 +132,14 @@ export class Tokens {
       Tokens.ok = '#0F9D63';
       Tokens.err = '#DC3545';
       Tokens.glass = '#D9FFFFFF';
+      Tokens.sheetWarm = '#B8FFF6E4';
       Tokens.glassStrong = '#D9FFFFFF';
       Tokens.glassLine = '#E6FFFFFF';
+  Tokens.pillEdge = '#1F000000';
       Tokens.glassTop = '#FFFFFFFF';
       Tokens.glassBar = '#D9FFFFFF';
     Tokens.glassFloat = '#D9FFFFFF';
+    Tokens.glassFaint = '#8CFFFFFF';
       Tokens.accentGlass = '#262F6BFF';
       Tokens.chip = '#EAF0FB';
       Tokens.shadow = '#1F2F4A80';
@@ -129,3 +147,4 @@ export class Tokens {
     }
   }
 }
+

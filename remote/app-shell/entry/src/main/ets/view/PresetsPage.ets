@@ -102,13 +102,39 @@ export struct PresetsPage {
     }
   }
 
+  /** 一行预设/权限：选中的那行用蓝色描边+浅蓝底+实心勾，必须一眼看得出。 */
   @Builder
   row(title: string, sub: string, active: boolean, onTap: () => void) {
     Row() {
+      // 左侧圆点：选中是实心蓝底白勾，未选是空心圈
+      Stack() {
+        if (active) {
+          Circle()
+            .width(20)
+            .height(20)
+            .fill(Tokens.accentStrong)
+          Text('✓')
+            .fontSize(12)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#FFFFFF')
+        } else {
+          Circle()
+            .width(20)
+            .height(20)
+            .fill(Color.Transparent)
+            .stroke(Tokens.line)
+            .strokeWidth(1.5)
+        }
+      }
+      .width(20)
+      .height(20)
+      .margin({ right: 12 })
+
       Column() {
         Text(title)
           .fontSize(14.5)
-          .fontColor(Tokens.fg)
+          .fontWeight(active ? FontWeight.Medium : FontWeight.Normal)
+          .fontColor(active ? Tokens.accent : Tokens.fg)
         if (sub !== '') {
           Text(sub)
             .fontSize(11.5)
@@ -124,16 +150,18 @@ export struct PresetsPage {
       if (active) {
         Text('当前')
           .fontSize(11)
-          .fontColor(Tokens.accent)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#FFFFFF')
           .borderRadius(999)
-          .border({ width: 1, color: Tokens.accent })
-          .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+          .backgroundColor(Tokens.accentStrong)
+          .padding({ left: 9, right: 9, top: 3, bottom: 3 })
       }
     }
     .width('100%')
-    .padding({ top: 12, bottom: 12, left: 14, right: 14 })
-    .borderRadius(12)
-    .backgroundColor(active ? Tokens.surface3 : Tokens.surface)
+    .padding({ top: 12, bottom: 12, left: 12, right: 12 })
+    .borderRadius(14)
+    .backgroundColor(active ? Tokens.accentSoft : Tokens.surface)
+    .border({ width: active ? 1.5 : 1, color: active ? Tokens.accent : Tokens.lineSoft })
     .margin({ bottom: 8 })
     .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
     .onClick(onTap)

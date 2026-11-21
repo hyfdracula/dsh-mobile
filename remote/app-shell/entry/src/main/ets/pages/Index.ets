@@ -1,4 +1,4 @@
-import preferences from '@ohos.data.preferences';
+﻿import preferences from '@ohos.data.preferences';
 import ConfigurationConstant from '@ohos.app.ability.ConfigurationConstant';
 import common from '@ohos.app.ability.common';
 import { Configuration } from '@ohos.app.ability.Configuration';
@@ -28,15 +28,62 @@ const PREF_STORE: string = 'dsh_mobile_cfg';
 @Component
 struct Index {
   @Provide('stack') stack: NavPathStack = new NavPathStack();
+  /** 全屏看图的地址：聊天页写，这里负责铺满整屏盖住标题栏 */
+  @StorageLink('bigImg') bigImg: string = '';
   @State private wanBase: string = DEFAULT_BASE;
   @State private token: string = DEFAULT_TOKEN;
   @State private api: Api = new Api(DEFAULT_BASE, DEFAULT_TOKEN, LAN_BASE);
   @State private themeMode: string = THEME_AUTO;
   @State private forceWan: boolean = false;
+  /** 设置 → 连接 里的「自动切换局域网」开关，默认开 */
+  @State private autoLan: boolean = true;
   @State private haptics: boolean = true;
+  @State private hdsOn: boolean = true;
   @StorageLink('themeRev') themeRev: number = 0;
   /** 每次重建导航栈自增，40ms 延迟里若已变化就放弃回填 */
   private navRev: number = 0;
+  /** 在线心跳定时器，-1 表示没在跑 */
+  private presenceTimer: number = -1;
+
+  /**
+   * 从系统设置返回时会走这里：发一个信号让「通知」页重新读一次开关，
+   * 否则用户在系统里打开了通知，回到应用还显示「现在没开」。
+   */
+  onPageShow(): void {
+    AppStorage.setOrCreate('notifyProbe', Date.now());
+    this.startPresence();
+    AppStorage.setOrCreate('fgProbe', Date.now());
+  }
+
+  onPageHide(): void {
+    this.stopPresence(true);
+  }
+
+  /**
+   * 在线心跳：电脑端据此决定 ask_user_question 卡片归谁。
+   *
+   * 在前台每 3 秒一次；电脑端 15 秒没收到就算离线，恢复成桌面回答。
+   * 退到后台立刻发 online:false，不等超时。
+   */
+  private startPresence(): void {
+    if (this.presenceTimer >= 0) {
+      return;
+    }
+    void this.api.presence(true);
+    this.presenceTimer = setInterval(() => {
+      void this.api.presence(true);
+    }, 3000);
+  }
+
+  private stopPresence(say: boolean): void {
+    if (this.presenceTimer >= 0) {
+      clearInterval(this.presenceTimer);
+      this.presenceTimer = -1;
+    }
+    if (say) {
+      void this.api.presence(false);
+    }
+  }
 
   aboutToAppear(): void {
     AppStorage.setOrCreate('settingsSub', '');
@@ -107,27 +154,44 @@ struct Index {
       const t = await p.get('token', DEFAULT_TOKEN) as string;
       const th = await p.get('theme', THEME_AUTO) as string;
       const fw = await p.get('forceWan', '0') as string;
+      const al = await p.get('autoLan', '') as string;
       const hp = await p.get('haptics', '1') as string;
-      const sm = await p.get('sendMode', 'queue') as string;
+      const hd = await p.get('hdsOn', '1') as string;
+      // 隐源光感现已不再提供开关，历史上被关掉的用户一律回到开启态，避免永久无法恢复
+      this.hdsOn = true;
       const lan = await p.get('lan', '') as string;
-      AppStorage.setOrCreate('sendMode', sm === 'steer' ? 'steer' : 'queue');
+      // 「忙碌时发送」的偏好已废弃：运行中一律排队，由输入区按钮单独决定插队
+      AppStorage.setOrCreate('sendMode', 'queue');
       this.haptics = hp === '1';
       Haptics.enabled = this.haptics;
+      this.hdsOn = hd !== '0';
+      AppStorage.setOrCreate('hdsOn', true);
       this.forceWan = fw === '1';
+      // 老用户只有 forceWan，没有 autoLan：用它推出默认值
+      this.autoLan = al === '' ? (fw !== '1') : al === '1';
       // 旧版本把局域网地址写进了 base（配对时电脑报回来的就是它），
       // 人离开家就再也连不上：这里把它降级成局域网候选，公网地址回退到默认隧道。
       let lanSaved: string = lan;
+      if (b === '' && lanSaved === '' && DEFAULT_BASE !== '') {
+        b = DEFAULT_BASE;
+      }
       if (this.isLanUrl(b)) {
         lanSaved = lanSaved !== '' ? lanSaved : b;
-        b = DEFAULT_BASE;
+        b = DEFAULT_BASE !== '' ? DEFAULT_BASE : '';
         console.info('DSH_CFG migrate lan-in-base -> ' + lanSaved);
+      }
+      // 没有公网隧道时（开源版默认），局域网地址就是唯一可用地址
+      if (b === '' && lanSaved !== '') {
+        b = lanSaved;
+        console.info('DSH_CFG base from lan -> ' + b);
       }
       if (b !== '' && t !== '') {
         this.wanBase = b;
         this.token = t;
         this.api.rebase(b, t, lanSaved);
         this.api.setForceWan(this.forceWan);
-        console.info('DSH_CFG loaded base=' + b + ' forceWan=' + this.forceWan + ' lan=' + (lanSaved !== '' ? lanSaved : '-'));
+        this.api.setAutoLan(this.autoLan);
+        console.info('DSH_CFG loaded base=' + b + ' forceWan=' + this.forceWan + ' autoLan=' + this.autoLan + ' lan=' + (lanSaved !== '' ? lanSaved : '-'));
       }
       if (th !== this.themeMode) {
         this.themeMode = th;
@@ -149,10 +213,16 @@ struct Index {
       lanOne = lanOne !== '' ? lanOne : b;
       wan = this.isLanUrl(this.wanBase) || this.wanBase === '' ? DEFAULT_BASE : this.wanBase;
     }
+    // 开源版没有默认公网隧道：配对只给出局域网地址时，它就当 base 存下来，
+    // 否则重启后 base 为空，应用会退回配对向导（token 还在也没用）。
+    if (wan === '' && lanOne !== '') {
+      wan = lanOne;
+    }
     this.wanBase = wan;
     this.token = t;
     this.api.rebase(wan, t, lanOne);
     this.api.setForceWan(this.forceWan);
+    this.api.setAutoLan(this.autoLan);
     try {
       const p = await preferences.getPreferences(getContext(this), PREF_STORE);
       await p.put('base', wan);
@@ -162,6 +232,28 @@ struct Index {
       console.info('DSH_CFG saved base=' + wan + ' lan=' + (lanOne !== '' ? lanOne : '-'));
     } catch (e) {
       console.error('DSH_CFG save failed :: ' + (e as Error).message);
+    }
+  }
+
+  private async saveAutoLan(v: boolean): Promise<void> {
+    this.autoLan = v;
+    this.api.setAutoLan(v);
+    // 关掉自动切换就等于强制走隧道；重新打开时要把这个状态清掉，否则还是只走隧道
+    if (!v) {
+      this.forceWan = true;
+      this.api.setForceWan(true);
+    } else {
+      this.forceWan = false;
+      this.api.setForceWan(false);
+    }
+    console.info('DSH_CFG autoLan=' + v);
+    try {
+      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      await p.put('autoLan', v ? '1' : '0');
+      await p.put('forceWan', v ? '0' : '1');
+      await p.flush();
+    } catch (e) {
+      console.error('DSH_CFG autoLan save failed :: ' + (e as Error).message);
     }
   }
 
@@ -234,6 +326,21 @@ struct Index {
       await p.flush();
     } catch (e) {
       console.error('DSH_HAP save failed :: ' + (e as Error).message);
+    }
+  }
+
+  /** 沉浸光感开关：关掉后所有系统材质退回普通底色，并立即重建界面。 */
+  private async saveHds(v: boolean): Promise<void> {
+    this.hdsOn = v;
+    AppStorage.setOrCreate('hdsOn', v);
+    if (v) Haptics.soft();
+    console.info('DSH_HDS switch=' + v);
+    try {
+      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      await p.put('hdsOn', v ? '1' : '0');
+      await p.flush();
+    } catch (e) {
+      console.error('DSH_HDS save failed :: ' + (e as Error).message);
     }
   }
 
@@ -319,6 +426,7 @@ struct Index {
   }
 
   build() {
+    Stack({ alignContent: Alignment.Center }) {
     Navigation(this.stack) {
       Stack() {
         ForEach([this.themeRev], (rev: number) => {
@@ -329,6 +437,7 @@ struct Index {
             themeMode: this.themeMode,
             systemDark: this.systemDark(),
             forceWan: this.forceWan,
+          autoLan: this.autoLan,
             haptics: this.haptics,
             defaultLan: LAN_BASE,
             onReset: () => {
@@ -343,11 +452,17 @@ struct Index {
             onTheme: (m: string) => {
               this.saveTheme(m);
             },
-            onWan: (v: boolean) => {
+            onAutoLan: (v: boolean) => {
+            this.saveAutoLan(v);
+          },
+          onWan: (v: boolean) => {
               this.saveWan(v);
             },
             onHaptics: (v: boolean) => {
               this.saveHaptics(v);
+            },
+            onHds: (v: boolean) => {
+              this.saveHds(v);
             }
           })
         }, (rev: number) => 'shell-' + rev)
@@ -372,14 +487,33 @@ struct Index {
       .height('100%')
     }
     .navDestination(this.pageMap)
-    .customNavContentTransition((from: NavContentInfo, to: NavContentInfo,
-        operation: NavigationOperation): NavigationAnimatedTransition | undefined => {
-      return this.navTransition(from, to, operation);
-    })
+    // 页面转场交给系统：原生推入（新页右侧滑入、旧页视差左移+压暗、左缘右滑跟手返回）
     .mode(NavigationMode.Stack)
     .hideTitleBar(true)
     .hideToolBar(true)
     .backgroundColor(this.themeMode === '' ? Tokens.bg : Tokens.bg)
+    .width('100%')
+    .height('100%')
+
+    // 全屏看图：挂在 Navigation 外面，才能盖住状态栏和标题栏
+    if (this.bigImg !== '') {
+      Stack({ alignContent: Alignment.Center }) {
+        Row()
+          .width('100%')
+          .height('100%')
+          .backgroundColor('#F2000000')
+        Image(this.bigImg)
+          .width('100%')
+          .objectFit(ImageFit.Contain)
+      }
+      .width('100%')
+      .height('100%')
+      .onClick(() => {
+        this.bigImg = '';
+      })
+      .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
+    }
+    }
     .width('100%')
     .height('100%')
   }

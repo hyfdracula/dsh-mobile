@@ -20,6 +20,9 @@
       },
       {
         "name": "ohos.permission.VIBRATE"
+      },
+      {
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
       }
     ],
     "deliveryWithInstall": true,

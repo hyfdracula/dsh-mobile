@@ -1,13 +1,10 @@
-﻿import preferences from '@ohos.data.preferences';
+import preferences from '@ohos.data.preferences';
 import { Api, ApiInfo, SessionRow } from '../common/Api';
 import { Tokens } from '../common/Tokens';
 import { Haptics } from '../common/Haptics';
 import { Pairing } from '../common/Pairing';
 
 const PREF_STORE: string = 'dsh_mobile_cfg';
-
-/** 「忙碌时发送」两个档位：排队等这一轮跑完，或插话替掉当前轮。 */
-const SEND_MODES: string[] = ['queue', 'steer'];
 
 interface KVRow {
   k: string;
@@ -16,7 +13,7 @@ interface KVRow {
 
 /**
  * 电脑管理：一台电脑的连接实况 + 与它相关的几个开关。
- * 结构对齐桌面端控制台的设备页（设备卡 / 连接 / 设置 / 版本与标识 / 高级）。
+ * 结构对齐桌面端控制台的设备页（设备卡 / 连接 / 版本与标识 / 高级）。
  */
 @Component
 export struct PcPage {
@@ -35,10 +32,11 @@ export struct PcPage {
   @State private loading: boolean = true;
   @State private err: string = '';
   @State private label: string = '';
-  @State private sendMode: string = 'queue';
   @State private renaming: boolean = false;
   @State private nameEdit: string = '';
   @State private confirmRemove: boolean = false;
+  /** 主题底色：顶部渐变要和页面底色同色，切换主题时跟着走 */
+  @StorageLink('themeBg') themeBg: string = Tokens.bg;
 
   aboutToAppear(): void {
     this.loadPrefs();
@@ -49,10 +47,7 @@ export struct PcPage {
     try {
       const p = await preferences.getPreferences(getContext(this), PREF_STORE);
       const name = await p.get('deviceName', '') as string;
-      const mode = await p.get('sendMode', 'queue') as string;
       this.label = name;
-      this.sendMode = mode === 'steer' ? 'steer' : 'queue';
-      AppStorage.setOrCreate('sendMode', this.sendMode);
     } catch (e) {
       console.error('DSH_PC pref load failed :: ' + (e as Error).message);
     }
@@ -119,13 +114,6 @@ export struct PcPage {
     return (this.lan ? '局域网' : '公网') + ' · ' + this.ms + 'ms';
   }
 
-  private async setSendMode(v: string): Promise<void> {
-    this.sendMode = v;
-    AppStorage.setOrCreate('sendMode', v);
-    Haptics.tap();
-    await this.savePref('sendMode', v);
-  }
-
   private async commitName(): Promise<void> {
     const v = this.nameEdit.trim();
     this.label = v;
@@ -134,38 +122,60 @@ export struct PcPage {
     await this.savePref('deviceName', v);
   }
 
-  // ---------- 通用件 ----------
+  // ---------- 头部（二级页统一：内容和设置一级页同一套，标题浮在渐变上） ----------
 
+  /** 顶部同色渐变：内容滚上来时在标题下面淡出，替掉原来那块不透明标题栏 */
   @Builder
-  backRow(title: string) {
+  topFade() {
+    Row()
+      .width('100%')
+      .height(78)
+      .linearGradient({
+        angle: 180,
+        colors: [[this.themeBg, 0.0], [this.themeBg, 0.58], ['#00' + this.themeBg.slice(1), 1.0]],
+      })
+      .hitTestBehavior(HitTestMode.None)
+  }
+
+  /** 二级页标题行：38 玻璃返回钮 + 标题，浮在渐变上，不占内容布局高度 */
+  @Builder
+  subHeader(title: string) {
     Row() {
-      Text('‹')
-        .fontSize(26)
-        .fontColor(Tokens.fg)
-        .width(40)
-        .textAlign(TextAlign.Start)
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-        .onClick(() => {
-          Haptics.soft();
-          this.onExit();
-        })
-      Column() {
-        Text('设置')
-          .fontSize(11)
-          .fontColor(Tokens.dim2)
-        Text(title)
-          .fontSize(19)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Tokens.fg)
-          .margin({ top: 1 })
+      Stack() {
+        Image($r('app.media.ic_back'))
+          .width(20)
+          .height(20)
+          .fillColor(Tokens.fg)
+          .objectFit(ImageFit.Contain)
       }
-      .alignItems(HorizontalAlign.Start)
+      .width(38)
+      .height(38)
+      .borderRadius(999)
+      .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#8CFFFFFF')
+      .backdropBlur(22)
+      .border({ width: 1, color: Tokens.isDark ? '#40FFFFFF' : '#D9FFFFFF' })
+      .shadow({ radius: 14, color: Tokens.isDark ? '#40000000' : '#26000000', offsetY: 4 })
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+      .onClick(() => {
+        Haptics.tap();
+        this.onExit();
+      })
+      Text(title)
+        .fontSize(20)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.fg)
+        .margin({ left: 12 })
       Blank()
     }
     .width('100%')
-    .height(52)
-    .margin({ bottom: 10 })
+    .height(48)
+    // 父级 NavDestination 已经有 16/54 的留白，这里只补一点上边距，
+    // 标题才能和设置页其它二级页（通知/外观/连接）停在同一条水平线上
+    .margin({ top: 4 })
+    .alignItems(VerticalAlign.Center)
   }
+
+  // ---------- 通用件 ----------
 
   @Builder
   group(title: string) {
@@ -294,8 +304,6 @@ export struct PcPage {
     this.group('连接')
     Column() {
       this.row('ip', false)
-      this.row('wan', false)
-      this.row('lan', false)
       this.row('count', false)
       Row() {
         Text('重新连接')
@@ -322,55 +330,11 @@ export struct PcPage {
   }
 
   @Builder
-  sendGroup() {
-    this.group('设置')
-    Column() {
-      Row() {
-        Column() {
-          Text('忙碌时发送')
-            .fontSize(13.5)
-            .fontColor(Tokens.fg)
-          Text(this.sendMode === 'steer' ? '插话：替掉正在跑的这一轮' : '排队：等这一轮跑完再发')
-            .fontSize(10.5)
-            .fontColor(Tokens.dim2)
-            .margin({ top: 3 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        Row() {
-          ForEach(SEND_MODES, (m: string) => {
-            Text(m === 'queue' ? '排队' : '插话')
-              .fontSize(11.5)
-              .fontColor(this.sendMode === m ? Tokens.accentInk : Tokens.dim)
-              .backgroundColor(this.sendMode === m ? Tokens.accent : Tokens.surface3)
-              .borderRadius(Tokens.rPill)
-              .padding({ left: 13, right: 13, top: 7, bottom: 7 })
-              .margin({ left: 6 })
-              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-              .onClick(() => {
-                this.setSendMode(m);
-              })
-          }, (m: string) => m)
-        }
-      }
-      .width('100%')
-      .padding({ left: 16, right: 16, top: 13, bottom: 13 })
-      .alignItems(VerticalAlign.Center)
-    }
-    .width('100%')
-    .backgroundColor(Tokens.surface)
-    .borderRadius(Tokens.rGroup)
-    .clip(true)
-  }
-
-  @Builder
   versionGroup() {
-    this.group('版本与标识')
+    this.group('版本')
     Column() {
       this.row('host', false)
-      this.row('plugin', false)
-      this.row('inst', false)
-      this.row('port', true)
+      this.row('plugin', true)
     }
     .width('100%')
     .backgroundColor(Tokens.surface)
@@ -517,31 +481,43 @@ export struct PcPage {
   }
 
   build() {
-    Stack() {
-      Column() {
-        this.backRow('电脑管理')
-        this.deviceCard()
-        if (this.err !== '') {
-          Text(this.err)
-            .fontSize(11)
-            .fontColor(Tokens.err)
-            .width('100%')
-            .margin({ top: 8, left: 4 })
-            .lineHeight(16)
+    Stack({ alignContent: Alignment.Top }) {
+      // 内容在最底层：顶部留出浮动标题行的高度，底部留出底部导航的高度
+      List() {
+        ListItem() {
+          Column() {
+            this.deviceCard()
+            if (this.err !== '') {
+              Text(this.err)
+                .fontSize(11)
+                .fontColor(Tokens.err)
+                .width('100%')
+                .margin({ top: 8, left: 4 })
+                .lineHeight(16)
+            }
+            this.connGroup()
+            this.versionGroup()
+            this.advGroup()
+            Text('这台电脑的配对码与二维码在电脑端「设置 → 手机连接」里。')
+              .fontSize(10.5)
+              .fontColor(Tokens.dim2)
+              .margin({ top: 16, left: 4 })
+              .lineHeight(16)
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+          .padding({ top: 66, bottom: 120 })
         }
-        this.connGroup()
-        this.sendGroup()
-        this.versionGroup()
-        this.advGroup()
-        Text('这台电脑的配对码与二维码在电脑端「设置 → 手机连接」里。')
-          .fontSize(10.5)
-          .fontColor(Tokens.dim2)
-          .margin({ top: 16, left: 4 })
-          .lineHeight(16)
       }
       .width('100%')
-      .alignItems(HorizontalAlign.Start)
-      .padding({ bottom: 120 })
+      .height('100%')
+      .scrollBar(BarState.Off)
+
+      // 同色渐变：滚上来的卡片在标题下面淡出，不再有硬边遮罩
+      this.topFade()
+
+      // 浮动的玻璃返回钮 + 标题
+      this.subHeader('电脑管理')
 
       if (this.renaming || this.confirmRemove) {
         Column() {
@@ -563,6 +539,7 @@ export struct PcPage {
       }
     }
     .width('100%')
-    .alignContent(Alignment.Top)
+    .height('100%')
+    .backgroundColor(this.themeBg)
   }
 }

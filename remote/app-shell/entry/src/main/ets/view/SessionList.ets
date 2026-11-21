@@ -1,8 +1,11 @@
-﻿import curves from '@ohos.curves';
+import curves from '@ohos.curves';
 import pasteboard from '@ohos.pasteboard';
 import { Api, PreviewRow, SessionRow } from '../common/Api';
 import { Tokens } from '../common/Tokens';
+import { Marks } from '../common/Marks';
 import { Haptics } from '../common/Haptics';
+import { Mat } from '../common/Mat';
+import { BlurStrategy, HdsNavDestination, HdsNavigationTitleBarOptions, HdsNavigationBackgroundStyle, HdsNavigationTitleBarStyle, HdsNavigation, ScrollEffectOptions, TitleBarContentOptions, TitleBarStyleOptions, hdsMaterial } from '@kit.UIDesignKit';
 import { ChatParam } from '../common/Types';
 
 function ago(ms: number): string {
@@ -62,7 +65,7 @@ function plainPreview(text: string): string {
     .trim();
 }
 
-/** 单个会话卡片：标题 + 摘要 + 时间 + 回复数 + ⋮ */
+/** 单个会话卡片：点按进入会话，右侧 ⋮ 呼出菜单，不参与多选 */
 @Component
 export struct SessionTile {
   // 必须是 @Prop：普通成员不会因为父级换了新数据而重绘，
@@ -70,38 +73,123 @@ export struct SessionTile {
   @Prop row: SessionRow = { id: '', title: '', updatedAt: 0, cwd: '', running: false };
   @Prop preview: string = '';
   @Prop count: number = 0;
-  @Prop selMode: boolean = false;
-  @Prop selected: boolean = false;
+  /** 归档视图里 ⋮ 菜单的第三项改成「恢复」，与左滑操作保持一致 */
+  @Prop archivedView: boolean = false;
   onTap: () => void = () => {};
-  onMore: () => void = () => {};
   onRename: () => void = () => {};
   onPin: () => void = () => {};
-  onMulti: () => void = () => {};
   onArchive: () => void = () => {};
-  onCopy: () => void = () => {};
+  onCopyId: () => void = () => {};
+  onFork: () => void = () => {};
   @StorageLink('themeDark') themeDark: boolean = true;
+  // 状态标记（done / interrupted）存在 Marks 里，靠这个版本号触发重绘
+  @StorageLink('marksVer') marksVer: number = 0;
+  /** 系统点击反馈由 clickEffect 负责，卡片自己不再维护按压态 */
   @State private pressed: boolean = false;
+  /** 点 ⋮ 时先把这一行存进来，菜单 builder 就不用带参数绑定了 */
+  @State private menuRow: SessionRow = { id: '', title: '', updatedAt: 0, cwd: '', running: false };
+  /** 点 ⋮ 的时刻：万一这次点击继续冒泡，别让卡片把它当成「进入会话」 */
+  private menuAt: number = 0;
 
-  /** 右侧 ⋮ 的菜单 */
+  /** 卡片状态：asking 黄、running 蓝、中断 红、完成 绿、其余无色。 */
+  private glowKind(): string {
+    // 在等你回答时这一轮仍算 running，但用户看到的应该是「该我了」的黄色，所以 asking 优先于 running。
+    if (this.row.asking === true) {
+      return 'asking';
+    }
+    if (this.row.running === true) {
+      return 'running';
+    }
+    const m: string = Marks.get(this.row.id);
+    if (m === 'interrupted') {
+      return 'interrupted';
+    }
+    if (m === 'done') {
+      return 'done';
+    }
+    return '';
+  }
+
+  private glowBg(): string {
+    const k: string = this.glowKind();
+    // 底色跟着主题走：原生卡片是不透明的，状态只用淡淡的色相标出来
+    const dark: boolean = Tokens.isDark;
+    if (k === 'running') {
+      return dark ? '#182235' : '#EAF2FF';
+    }
+    if (k === 'asking') {
+      return dark ? '#2A2418' : '#FFF6E5';
+    }
+    if (k === 'interrupted') {
+      return dark ? '#2A1A1A' : '#FFEDED';
+    }
+    if (k === 'done') {
+      return dark ? '#152A20' : '#EAF9F0';
+    }
+    return dark ? Tokens.surface : '#FFFFFF';
+  }
+
+  private glowEdge(): string {
+    const k: string = this.glowKind();
+    if (k === 'running') {
+      return '#803B82F6';
+    }
+    if (k === 'asking') {
+      return '#80F5A623';
+    }
+    if (k === 'interrupted') {
+      return '#80FF3B30';
+    }
+    if (k === 'done') {
+      return '#8034C759';
+    }
+    return Tokens.isDark ? Tokens.lineSoft : '#E8EAF0';
+  }
+
+  private glowShadow(): string {
+    const k: string = this.glowKind();
+    if (k === 'running') {
+      return '#4D3B82F6';
+    }
+    if (k === 'asking') {
+      return '#4DF5A623';
+    }
+    if (k === 'interrupted') {
+      return '#4DFF3B30';
+    }
+    if (k === 'done') {
+      return '#4D34C759';
+    }
+    return Tokens.accentGlow;
+  }
+
+  private hasGlow(): boolean {
+    return this.glowKind() !== '';
+  }
+
+  /**
+   * 菜单针对哪一行：点 ⋮ 时已经把 row 写进 menuRow；
+   * 若菜单先于点击回调构建，则回退到卡片自己的 row，两者永远是同一行。
+   */
+  private menuSource(): SessionRow {
+    return this.menuRow.id === '' ? this.row : this.menuRow;
+  }
+
+  /** 卡片右侧 ⋮ 呼出的菜单：重命名 / 置顶 / 归档 / 复制 ID / 分叉 */
   @Builder
-  tileMenu() {
+  tileMenuBuilder() {
     Menu() {
-      MenuItem({ content: '多选' })
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-        .onClick(() => {
-          this.onMulti();
-        })
       MenuItem({ content: '重命名' })
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
         .onClick(() => {
           this.onRename();
         })
-      MenuItem({ content: this.row.pinned === true ? '取消置顶' : '置顶' })
+      MenuItem({ content: this.menuSource().pinned === true ? '取消置顶' : '置顶' })
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
         .onClick(() => {
           this.onPin();
         })
-      MenuItem({ content: '归档' })
+      MenuItem({ content: this.archivedView ? '恢复' : '归档' })
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
         .onClick(() => {
           this.onArchive();
@@ -109,25 +197,18 @@ export struct SessionTile {
       MenuItem({ content: '复制会话 ID' })
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
         .onClick(() => {
-          this.onCopy();
+          this.onCopyId();
+        })
+      MenuItem({ content: '分叉会话' })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+        .onClick(() => {
+          this.onFork();
         })
     }
   }
 
   build() {
     Row() {
-      if (this.selMode) {
-        Text(this.selected ? 'OK' : '')
-          .width(24)
-          .height(24)
-          .fontSize(14)
-          .fontColor('#FFFFFF')
-          .textAlign(TextAlign.Center)
-          .borderRadius(12)
-          .backgroundColor(this.selected ? Tokens.accent : Tokens.chip)
-          .border({ width: 1, color: this.selected ? Tokens.accent : Tokens.glassLine })
-          .margin({ right: 10 })
-      }
       Column() {
         Row() {
           Text(this.row.title === '' ? '(untitled)' : this.row.title)
@@ -144,29 +225,10 @@ export struct SessionTile {
               .padding({ left: 6, right: 6, top: 1, bottom: 1 })
               .backgroundColor(Tokens.accentSoft)
               .borderRadius(999)
-              .margin({ left: 6 })
-          }
-          if (this.row.running === true) {
-            Text('运行中')
-              .fontSize(10)
-              .fontColor(Tokens.ok)
-              .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-              .backgroundColor('#1A3DDC97')
-              .borderRadius(999)
-              .margin({ left: 6 })
+              .margin({ left: 8 })
           }
         }
         .width('100%')
-
-        if (this.preview !== '') {
-          Text(this.preview)
-            .fontSize(13)
-            .fontColor(Tokens.dim)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .margin({ top: 5 })
-            .width('100%')
-        }
 
         Row() {
           Text(ago(this.row.updatedAt))
@@ -176,51 +238,51 @@ export struct SessionTile {
             .fontSize(11.5)
             .fontColor(Tokens.dim2)
             .margin({ left: 10 })
-          Blank()
-          if (this.count > 0) {
-            Text(String(this.count))
-              .fontSize(11.5)
-              .fontColor(Tokens.dim2)
-          }
         }
         .width('100%')
         .margin({ top: 6 })
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
-
+      // 右侧 ⋮：点开菜单前先把本行存进 @State，菜单 builder 无参
       Text('⋮')
-        .width(34)
-        .height(34)
-        .borderRadius(17)
+        .fontSize(18)
+        .fontColor(Tokens.dim)
+        .width(32)
+        .height(32)
         .textAlign(TextAlign.Center)
-        .fontSize(17)
-        .fontColor(Tokens.dim2)
-        .bindMenu(this.tileMenu())
+        .borderRadius(16)
+        .margin({ left: 4 })
+        .accessibilityText('会话菜单')
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+        .onClick(() => {
+          this.menuAt = Date.now();
+          this.menuRow = this.row;
+        })
+        .bindMenu(this.tileMenuBuilder())
     }
+    .alignItems(VerticalAlign.Center)
     .width('100%')
     .padding({ left: 12, right: 8, top: 12, bottom: 12 })
     .borderRadius(Tokens.rCard)
-    .backgroundColor(this.pressed ? Tokens.surface2 : Tokens.glassStrong)
-    .border({ width: 1, color: Tokens.glassLine })
-    .scale({ x: this.pressed ? 0.972 : 1, y: this.pressed ? 0.972 : 1 })
+    .backgroundColor(this.glowBg())
+    .border({
+      width: this.hasGlow() ? 1.2 : 1,
+      color: this.glowEdge()
+    })
+    // 原生观感：不自己画按压缩放/弹簧，交给 ListItem 的系统点击反馈；
+    // 状态色仍靠一圈细边表示，但不加阴影，避免像「浮起来的自绘卡片」。
     .shadow({
-      radius: this.pressed ? 10 : 0,
-      color: Tokens.accentGlow,
-      offsetY: 2
+      radius: this.hasGlow() ? 10 : 0,
+      color: this.glowShadow(),
+      offsetY: 0
     })
-    .animation({ duration: 300, curve: curves.springCurve(0.66, 0.9, 220, 16) })
-    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
     .onClick(() => {
-      this.pressed = false;
-      this.onTap();
-    })
-    .onTouch((e: TouchEvent) => {
-      if (e.type === TouchType.Down) {
-        this.pressed = true;
-      } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
-        this.pressed = false;
+      // 刚点过 ⋮ 就不要再进会话
+      if (Date.now() - this.menuAt < 350) {
+        return;
       }
+      this.onTap();
     })
   }
 }
@@ -236,38 +298,96 @@ export struct SessionList {
   @State private err: string = '';
   @State private q: string = '';
   @State private searching: boolean = false;
+  /** 搜索胶囊横向展开进度：点搜索时先置 0.12 再置 1，靠隐式动画从按钮处流水般铺开。 */
+  @State private searchGrow: number = 1;
   @State private ws: string = '';
   @State private enter: boolean = false;
   @State private creating: boolean = false;
   @State private toast: string = '';
   @State private refreshing: boolean = false;
   @State private scrollY: number = 0;
-  @State private selMode: boolean = false;
-  @State private selIds: string[] = [];
   // 重命名弹窗盖住底部 Tab：置位时让 ShellPage 把 Tab 栏收掉
   @State @Watch('syncSheet') private renameOn: boolean = false;
+  // 新建工作区：填一个名字和父目录，宿主机接受不存在的新目录会自动建出来
+  @State @Watch('syncSheet') private wsNewOn: boolean = false;
+  @State private wsNewName: string = '';
+  @State private wsNewDir: string = '';
 
   private syncSheet(): void {
-    AppStorage.setOrCreate('sheetOpen', this.renameOn);
+    AppStorage.setOrCreate('sheetOpen', this.renameOn || this.wsNewOn);
   }
+  /** true 时列表只显示已归档的会话 */
+  /** 交给 HDS 标题栏的 bindToScrollable，用来驱动滚动模糊 */
+  private scroller: Scroller = new Scroller();
+  @State private archivedView: boolean = false;
+  /** 折叠起来的日期分组（置顶那组永远展开，不参与折叠） */
+  @State private folded: string[] = [];
   @State private renameId: string = '';
   @State private renameText: string = '';
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
+  /** 上次列表的指纹：轮询时只有真的变了才替换数据，避免无谓重绘 */
+  private rowSig: string = '';
+  private poll: number = 0;
 
   aboutToAppear(): void {
     console.info('DSH_LIST aboutToAppear');
     this.load();
+    // 列表要能自己更新：会话在跑/跑完/等你回答都会改变卡片颜色，不能只在进页面时读一次
+    this.poll = setInterval(() => {
+      this.pollRows();
+    }, 8000);
     setTimeout(() => {
       this.enter = true;
     }, 40);
+  }
+
+  aboutToDisappear(): void {
+    if (this.poll !== 0) {
+      clearInterval(this.poll);
+      this.poll = 0;
+    }
+  }
+
+  private sigOf(rows: SessionRow[]): string {
+    const parts: string[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const r: SessionRow = rows[i];
+      parts.push(r.id + ':' + r.updatedAt + ':' + (r.running ? '1' : '0') + ':' + (r.asking === true ? '1' : '0'));
+    }
+    return parts.join(',');
+  }
+
+  /** 静默轮询：状态变了才换数据，切到别的页面时也不打扰用户。 */
+  private async pollRows(): Promise<void> {
+    if (this.loading || this.renameOn || this.creating) {
+      return;
+    }
+    try {
+      const rows = await this.api.sessions();
+      const want = this.archivedView;
+      const live = rows.filter((r: SessionRow) => (r.archived === true) === want);
+      const sorted = live.sort((a: SessionRow, b: SessionRow) => b.updatedAt - a.updatedAt);
+      const sig: string = this.sigOf(sorted);
+      if (sig === this.rowSig) {
+        return;
+      }
+      this.rowSig = sig;
+      this.rows = sorted;
+      console.info('DSH_LIST poll rows=' + sorted.length);
+      this.loadPreviews();
+    } catch (e) {
+      // 轮询失败不打断界面
+    }
   }
 
   private async load(): Promise<void> {
     try {
       this.err = '';
       const rows = await this.api.sessions();
-      const live = rows.filter((r: SessionRow) => r.archived !== true);
+      const want = this.archivedView;
+      const live = rows.filter((r: SessionRow) => (r.archived === true) === want);
       this.rows = live.sort((a: SessionRow, b: SessionRow) => b.updatedAt - a.updatedAt);
+      this.rowSig = this.sigOf(this.rows);
       console.info('DSH_LIST rows=' + this.rows.length);
       this.loadPreviews();
     } catch (e) {
@@ -343,6 +463,7 @@ export struct SessionList {
   private rowKey(r: SessionRow): string {
     // 摘要/条数是异步后到的，同样得进 key，否则卡片会一直空着（见 §六.20）
     return r.id + '|' + r.title + '|' + r.updatedAt + '|' + (r.running ? '1' : '0')
+      + '|' + (r.asking === true ? '1' : '0') + '|' + Marks.get(r.id)
       + '|' + (r.pinned === true ? '1' : '0')
       + '|' + this.countOf(r.id) + '|' + (this.previewOf(r.id) === '' ? '0' : '1');
   }
@@ -352,13 +473,16 @@ export struct SessionList {
     const out: RowModel[] = [];
     let lastDay = '';
     // 置顶的排最前，单独成组
-    const pinned = this.rows.filter((r: SessionRow) => r.pinned === true);
-    const rest = this.rows.filter((r: SessionRow) => r.pinned !== true);
-    if (pinned.length > 0) {
-      out.push({ kind: 'head', label: '置顶', key: 'h-pin', row: pinned[0] });
-      pinned.forEach((r: SessionRow) => {
-        if (this.ws !== '' && wsOf(r.cwd) !== this.ws) return;
-        if (kw !== '' && (r.title === '' ? '(untitled)' : r.title).toLowerCase().indexOf(kw) < 0) return;
+    const pinned = this.archivedView ? [] : this.rows.filter((r: SessionRow) => r.pinned === true);
+    const rest = this.archivedView ? this.rows : this.rows.filter((r: SessionRow) => r.pinned !== true);
+    const pinnedShown: SessionRow[] = pinned.filter((r: SessionRow) => {
+      if (this.ws !== '' && wsOf(r.cwd) !== this.ws) return false;
+      if (kw !== '' && (r.title === '' ? '(untitled)' : r.title).toLowerCase().indexOf(kw) < 0) return false;
+      return true;
+    });
+    if (pinnedShown.length > 0) {
+      out.push({ kind: 'head', label: '置顶', key: 'h-pin', row: pinnedShown[0] });
+      pinnedShown.forEach((r: SessionRow) => {
         out.push({ kind: 'row', label: '', key: this.rowKey(r), row: r });
       });
     }
@@ -368,14 +492,32 @@ export struct SessionList {
         const t = (r.title === '' ? '(untitled)' : r.title).toLowerCase();
         if (t.indexOf(kw) < 0) return;
       }
+      // 归档视图不按日期分堆：就按宿主给的顺序一条条排下来
+      if (this.archivedView) {
+        out.push({ kind: 'row', label: '', key: this.rowKey(r), row: r });
+        return;
+      }
       const d = dayKey(r.updatedAt);
       if (d !== lastDay) {
         lastDay = d;
-        out.push({ kind: 'head', label: d, key: 'h-' + d, row: r });
+        out.push({ kind: 'head', label: d, key: 'h-' + d + (this.isFolded(d) ? '-c' : '-o'), row: r });
       }
+      // 折叠的分组只留标题，卡片全部收起来
+      if (this.isFolded(d)) return;
       out.push({ kind: 'row', label: '', key: this.rowKey(r), row: r });
     });
     return out;
+  }
+
+  private isFolded(label: string): boolean {
+    return this.folded.indexOf(label) >= 0;
+  }
+
+  private toggleFold(label: string): void {
+    Haptics.tap();
+    this.folded = this.isFolded(label)
+      ? this.folded.filter((s: string) => s !== label)
+      : this.folded.concat([label]);
   }
 
   private flash(msg: string): void {
@@ -383,6 +525,143 @@ export struct SessionList {
     setTimeout(() => {
       this.toast = '';
     }, 2200);
+  }
+
+  /** 建会话时可选的工作区：当前筛选的、最近用过的，去重保序。 */
+  private wsChoices(): string[] {
+    const out: string[] = [];
+    const push = (p: string): void => {
+      const one: string = this.tidyPath(p);
+      if (one !== '' && out.indexOf(one) < 0) out.push(one);
+    };
+    if (this.ws !== '') push(this.baseDir());
+    for (let i = 0; i < this.rows.length && out.length < 8; i++) {
+      if (this.rows[i].archived !== true) push(this.rows[i].cwd);
+    }
+    return out;
+  }
+
+  private async newSessionIn(dir: string): Promise<void> {
+    if (this.creating) return;
+    this.creating = true;
+    try {
+      const cwd: string = dir !== '' ? dir : (this.rows.length > 0 ? this.rows[0].cwd : '');
+      const id = await this.api.createSession(cwd);
+      const p: ChatParam = { id: id, title: '新会话' };
+      this.stack.pushPathByName('chat', p);
+      this.flash('已在该工作区新建会话');
+    } catch (e) {
+      this.flash('新建失败：' + (e as Error).message);
+    } finally {
+      this.creating = false;
+    }
+  }
+
+  @State private wsPickOn: boolean = false;
+
+  @Builder
+  wsPickBody() {
+    Column() {
+      Row() {
+        Text('新建会话')
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Tokens.fg)
+        Blank()
+        Text('×')
+          .fontSize(19)
+          .fontColor(Tokens.dim)
+          .textAlign(TextAlign.Center)
+          .width(38)
+          .height(38)
+          .borderRadius(999)
+          .onClick(() => {
+            this.wsPickOn = false;
+          })
+      }
+      .width('100%')
+      .height(56)
+
+      Text('选一个工作区')
+        .fontSize(11.5)
+        .fontColor(Tokens.dim2)
+        .width('100%')
+
+      List({ space: 8 }) {
+        ForEach(this.wsChoices(), (d: string) => {
+          ListItem() {
+            Row({ space: 10 }) {
+              Text('▥')
+                .fontSize(13)
+                .fontColor(Tokens.accent)
+                .width(30)
+                .height(30)
+                .textAlign(TextAlign.Center)
+                .borderRadius(9)
+                .backgroundColor(Tokens.accentSoft)
+              Text(this.wsLabel(d))
+                .fontSize(14)
+                .fontColor(Tokens.fg)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+              Text('›')
+                .fontSize(15)
+                .fontColor(Tokens.dim2)
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+            .borderRadius(14)
+            .backgroundColor(Tokens.surface)
+            .onClick(() => {
+              this.wsPickOn = false;
+              void this.newSessionIn(d);
+            })
+          }
+        }, (d: string) => d)
+
+        ListItem() {
+          Row({ space: 10 }) {
+            Text('+')
+              .fontSize(15)
+              .fontColor(Tokens.accent)
+              .width(30)
+              .height(30)
+              .textAlign(TextAlign.Center)
+              .borderRadius(9)
+              .backgroundColor(Tokens.accentSoft)
+            Text('另建一个工作区…')
+              .fontSize(14)
+              .fontColor(Tokens.fg)
+              .layoutWeight(1)
+          }
+          .width('100%')
+          .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+          .borderRadius(14)
+          .backgroundColor(Tokens.surface)
+          .onClick(() => {
+            this.wsPickOn = false;
+            this.openWsNew();
+          })
+        }
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .margin({ top: 10 })
+      .scrollBar(BarState.Off)
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 20, right: 20, top: 6, bottom: 16 })
+    .alignItems(HorizontalAlign.Start)
+  }
+
+    /** 只显示路径末尾两段，太长了菜单里看不清 */
+  private wsLabel(d: string): string {
+    const parts: string[] = d.split('\\');
+    if (parts.length <= 1) return d;
+    if (parts.length === 2) return parts[1];
+    return parts[parts.length - 2] + '\\' + parts[parts.length - 1];
   }
 
   private async newSession(): Promise<void> {
@@ -408,7 +687,7 @@ export struct SessionList {
       await this.api.pin(r.id, want);
       this.rows = this.rows.map((x: SessionRow) => {
         if (x.id !== r.id) return x;
-        const y: SessionRow = { id: x.id, title: x.title, updatedAt: x.updatedAt, cwd: x.cwd, running: x.running, archived: x.archived, pinned: want, agents: x.agents, model: x.model };
+        const y: SessionRow = { id: x.id, title: x.title, updatedAt: x.updatedAt, cwd: x.cwd, running: x.running, asking: x.asking, archived: x.archived, pinned: want, agents: x.agents, model: x.model };
         return y;
       });
       this.flash(want ? '已置顶' : '已取消置顶');
@@ -428,44 +707,43 @@ export struct SessionList {
     }
   }
 
-  /** 多选：进入/退出 */
-  private toggleSelMode(): void {
-    this.selMode = !this.selMode;
-    if (!this.selMode) this.selIds = [];
-  }
-
-  private isSelected(id: string): boolean {
-    return this.selIds.indexOf(id) >= 0;
-  }
-
-  private toggleSel(id: string): void {
-    if (this.isSelected(id)) {
-      this.selIds = this.selIds.filter((x: string) => x !== id);
-    } else {
-      this.selIds = this.selIds.concat([id]);
+  private async doUnarchive(r: SessionRow): Promise<void> {
+    Haptics.soft();
+    try {
+      await this.api.unarchive(r.id);
+      this.rows = this.rows.filter((x: SessionRow) => x.id !== r.id);
+      this.flash('已恢复「' + (r.title === '' ? '(untitled)' : r.title) + '」');
+    } catch (e) {
+      this.flash('恢复失败：' + (e as Error).message);
     }
   }
 
-  /** 批量归档选中的会话 */
-  private async archiveSelected(): Promise<void> {
-    const ids: string[] = this.selIds;
-    if (ids.length === 0) {
-      this.flash('先选几个会话');
+  /** 分叉会话：宿主按最近一个已完成轮次的边界复制出一个新会话（Api.fork 的 atSeq 省略） */
+  private async doFork(r: SessionRow): Promise<void> {
+    Haptics.soft();
+    try {
+      const id: string = await this.api.fork(r.id);
+      if (id === '') {
+        this.flash('分叉失败');
+        return;
+      }
+      Haptics.tap();
+      this.flash('已分叉「' + (r.title === '' ? '(untitled)' : r.title) + '」');
+      // 新会话要出现在列表里，重新拉一遍
+      this.load();
+    } catch (e) {
+      this.flash('分叉失败：' + (e as Error).message);
+    }
+  }
+
+  /** 从「已归档对话」退回正常列表：清掉归档标记、重拉一次 */
+  private exitArchived(): void {
+    if (!this.archivedView) {
       return;
     }
-    let ok = 0;
-    for (let i = 0; i < ids.length; i++) {
-      try {
-        await this.api.archive(ids[i]);
-        ok++;
-      } catch (e) {
-        console.error('DSH_ARCH fail ' + ids[i] + ' :: ' + (e as Error).message);
-      }
-    }
-    this.rows = this.rows.filter((x: SessionRow) => ids.indexOf(x.id) < 0);
-    this.flash('已归档 ' + ok + ' 个');
-    this.selMode = false;
-    this.selIds = [];
+    this.archivedView = false;
+    this.loading = true;
+    this.load();
   }
 
   /** 重命名弹层 */
@@ -485,7 +763,7 @@ export struct SessionList {
       await this.api.rename(this.renameId, title);
       this.rows = this.rows.map((x: SessionRow) => {
         if (x.id !== this.renameId) return x;
-        const next: SessionRow = { id: x.id, title: title, updatedAt: x.updatedAt, cwd: x.cwd, running: x.running };
+        const next: SessionRow = { id: x.id, title: title, updatedAt: x.updatedAt, cwd: x.cwd, running: x.running, asking: x.asking };
         next.pinned = x.pinned;
         next.archived = x.archived;
         return next;
@@ -520,18 +798,117 @@ export struct SessionList {
             this.ws = o.id;
           })
       }, (o: WsOpt) => 'ws-' + o.id)
+      // 新工作区就是宿主机上的一层新目录：建一个会话指向它，列表里自然多一项
+      MenuItem({ content: '＋ 新建工作区' })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+        .onClick(() => {
+          Haptics.tap();
+          this.openWsNew();
+        })
     }
   }
 
-  /** 左滑露出的操作：置顶 / 归档 */
+  /** 新建工作区弹层 */
+  private openWsNew(): void {
+    this.wsNewName = '';
+    this.wsNewDir = this.baseDir();
+    this.wsNewOn = true;
+  }
+
+  /**
+   * 新工作区默认建在哪：优先当前筛选的那个工作区目录本身，
+   * 其次最近一条未归档会话的目录，最后才退到 Documents。
+   */
+  private baseDir(): string {
+    const live: SessionRow[] = this.rows.filter((r: SessionRow) => r.archived !== true && r.cwd !== undefined && r.cwd !== '');
+    for (const r of live) {
+      const p: string = this.tidyPath(r.cwd);
+      if (this.ws !== '' && wsOf(p) === this.ws) return p;
+    }
+    for (const r of live) {
+      const p: string = this.tidyPath(r.cwd);
+      if (p !== '') return p;
+    }
+    return 'C:\\Users\\19161\\Documents';
+  }
+
+  /** 宿主里可能存着带重复分隔符的路径（历史会话），显示与拼接前先压成单个 */
+  private tidyPath(p: string): string {
+    let out: string = p.replace(/\\\\/g, '\\');
+    while (out.indexOf('\\\\') >= 0) {
+      out = out.replace(/\\\\/g, '\\');
+    }
+    return out;
+  }
+
+  /** 父目录 + 名字拼成宿主机上的路径；名字不许带分隔符 */
+  private wsPath(): string {
+    const name: string = this.wsNewName.trim().replace(/[\\/:*?"<>|]/g, '');
+    let dir: string = this.tidyPath(this.wsNewDir.trim());
+    if (dir === '') dir = 'C:\\Users\\19161\\Documents';
+    while (dir.length > 1 && (dir.endsWith('\\') || dir.endsWith('/'))) {
+      dir = dir.substring(0, dir.length - 1);
+    }
+    if (name === '') return '';
+    return dir + '\\' + name;
+  }
+
+  private async doCreateWs(): Promise<void> {
+    const path: string = this.wsPath();
+    if (path === '') {
+      this.flash('工作区名字不能为空');
+      return;
+    }
+    Haptics.tap();
+    try {
+      const id: string = await this.api.createSession(path);
+      this.wsNewOn = false;
+      this.ws = wsOf(path);
+      this.flash('已新建工作区「' + wsOf(path) + '」');
+      await this.load();
+      if (id !== '') {
+        const p: ChatParam = { id: id, title: '新会话' };
+        this.stack.pushPathByName('chat', p);
+      }
+    } catch (e) {
+      this.flash('新建工作区失败：' + (e as Error).message);
+    }
+  }
+
+  /** 已归档视图里，工作区胶囊换成「已归档对话」，点开第一条就是返回 */
+  @Builder
+  archivedMenu() {
+    Menu() {
+      MenuItem({ content: '返回会话列表' })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+        .onClick(() => {
+          Haptics.tap();
+          this.exitArchived();
+        })
+      MenuItem({ content: '全部工作区' })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+        .onClick(() => {
+          Haptics.tap();
+          this.ws = '';
+          this.exitArchived();
+        })
+    }
+  }
+
+  /** 分组标题不参与左滑，用空动作占位 */
+  @Builder
+  noSwipe() {
+  }
+
+  /** 左滑露出的操作：置顶 / 归档，高度与会话卡片对齐 */
   @Builder
   swipeActions(r: SessionRow) {
     Row() {
       Text(r.pinned === true ? '取消置顶' : '置顶')
         .fontSize(12.5)
         .fontColor('#FFFFFF')
-        .width(64)
-        .height(52)
+        .width(58)
+        .height(58)
         .textAlign(TextAlign.Center)
         .borderRadius(14)
         .backgroundColor(Tokens.accentStrong)
@@ -539,24 +916,30 @@ export struct SessionList {
         .onClick(() => {
           this.doPin(r);
         })
-      Text('归档')
+      Text(this.archivedView ? '恢复' : '归档')
         .fontSize(12.5)
         .fontColor('#FFFFFF')
-        .width(64)
-        .height(52)
+        .width(58)
+        .height(58)
         .textAlign(TextAlign.Center)
         .borderRadius(14)
-        .backgroundColor(Tokens.dim)
+        .backgroundColor(this.archivedView ? Tokens.accentStrong : Tokens.err)
         .margin({ left: 8 })
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
         .onClick(() => {
-          this.doArchive(r);
+          if (this.archivedView) {
+            this.doUnarchive(r);
+          } else {
+            this.doArchive(r);
+          }
         })
     }
-    .padding({ left: 8, right: 8 })
+    .height(60)
+    .alignItems(VerticalAlign.Center)
+    .padding({ left: 8, right: 0 })
   }
 
-  /** 右侧 ⋮ 菜单 */
+  /** 长按卡片弹出的上下文菜单（不含多选、不含分叉） */
   @Builder
   rowMenu(r: SessionRow) {
     Menu() {
@@ -569,12 +952,6 @@ export struct SessionList {
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
         .onClick(() => {
           this.doPin(r);
-        })
-      MenuItem({ content: '多选' })
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-        .onClick(() => {
-          if (!this.selMode) this.toggleSelMode();
-          this.toggleSel(r.id);
         })
       MenuItem({ content: '归档' })
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
@@ -656,45 +1033,95 @@ export struct SessionList {
     })
   }
 
+  @Builder
+  wsNewSheet() {
+    Column() {
+      Blank()
+      Column() {
+        Text('新建工作区')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.fg)
+          .margin({ bottom: 14 })
+        TextInput({ text: this.wsNewName, placeholder: '工作区名字，例如 my-project' })
+          .fontSize(14)
+          .fontColor(Tokens.fg)
+          .placeholderColor(Tokens.dim2)
+          .backgroundColor(Tokens.surface2)
+          .borderRadius(14)
+          .height(46)
+          .onChange((v: string) => {
+            this.wsNewName = v;
+          })
+        TextInput({ text: this.wsNewDir, placeholder: '放在哪个目录下' })
+          .fontSize(12.5)
+          .fontColor(Tokens.dim)
+          .placeholderColor(Tokens.dim2)
+          .backgroundColor(Tokens.surface2)
+          .borderRadius(14)
+          .height(46)
+          .margin({ top: 10 })
+          .onChange((v: string) => {
+            this.wsNewDir = v;
+          })
+        // 建完实际落在这台电脑的哪个目录，先给用户看一眼
+        Text(this.wsPath() === '' ? '会在电脑上新建这个目录' : this.wsPath())
+          .fontSize(11.5)
+          .fontColor(Tokens.dim2)
+          .width('100%')
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ top: 8, left: 2 })
+        Row() {
+          Text('取消')
+            .fontSize(15)
+            .fontColor(Tokens.dim)
+            .layoutWeight(1)
+            .textAlign(TextAlign.Center)
+            .height(46)
+            .borderRadius(14)
+            .backgroundColor(Tokens.surface2)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+            .onClick(() => {
+              this.wsNewOn = false;
+            })
+          Text(this.creating ? '创建中…' : '创建')
+            .fontSize(15)
+            .fontColor(Tokens.accentInk)
+            .layoutWeight(1)
+            .textAlign(TextAlign.Center)
+            .height(46)
+            .borderRadius(14)
+            .backgroundColor(this.wsPath() === '' ? Tokens.surface3 : Tokens.accent)
+            .margin({ left: 10 })
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+            .onClick(() => {
+              this.doCreateWs();
+            })
+        }
+        .width('100%')
+        .margin({ top: 14 })
+      }
+      .width('100%')
+      .padding(18)
+      .backgroundColor(Tokens.surface)
+      .borderRadius({ topLeft: 26, topRight: 26 })
+      .border({ width: 1, color: Tokens.glassLine })
+      .margin({ bottom: 104 })
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#66000000')
+    .onClick(() => {
+      this.wsNewOn = false;
+    })
+  }
+
   /** 列表页顶部整块：工作区胶囊 + 搜索 + 统计。整块是浮层，列表从它底下滚过去。 */
   @Builder
   headerBlock() {
     Column() {
         // 顶部：工作区胶囊 + 搜索
-        if (this.selMode) {
-          Row() {
-            Text('已选 ' + this.selIds.length)
-              .fontSize(15)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(Tokens.fg)
-            Blank()
-            Text('取消')
-              .fontSize(14)
-              .fontColor(Tokens.dim)
-              .padding({ left: 14, right: 14, top: 8, bottom: 8 })
-              .backgroundColor(Tokens.glassStrong)
-              .border({ width: 1, color: Tokens.glassLine })
-              .borderRadius(999)
-              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-              .onClick(() => {
-                this.selMode = false;
-                this.selIds = [];
-              })
-            Text('归档选中')
-              .fontSize(14)
-              .fontColor(Tokens.accentInk)
-              .padding({ left: 14, right: 14, top: 8, bottom: 8 })
-              .backgroundColor(this.selIds.length > 0 ? Tokens.accent : Tokens.chip)
-              .borderRadius(999)
-              .margin({ left: 10 })
-              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-              .onClick(() => {
-                this.archiveSelected();
-              })
-          }
-          .width('100%')
-          .padding({ left: 16, right: 16, top: 34, bottom: 6 })
-        } else {
         if (this.searching) {
           // 搜索气泡：点开后整条顶栏收成一颗输入胶囊，退出时缩回去
           Row() {
@@ -722,24 +1149,30 @@ export struct SessionList {
               .onClick(() => {
                 Haptics.tap();
                 this.q = '';
-                this.searching = false;
+                this.searchGrow = 0.12;
+                setTimeout(() => {
+                  this.searching = false;
+                  this.searchGrow = 1;
+                }, 200);
               })
           }
           .width('100%')
           .height(46)
-          .margin({ left: 16, right: 16, top: 34 })
+          .margin({ left: 0, right: 0, top: 0 })
           .backgroundColor(Tokens.glassFloat)
           .backdropBlur(18)
           .borderRadius(23)
-          .border({ width: 1, color: Tokens.glassLine })
+          .border({ width: 1, color: Tokens.pillEdge })
           .shadow({ radius: 20, color: Tokens.shadow, offsetY: 6 })
-          .transition(TransitionEffect.OPACITY
-            .combine(TransitionEffect.scale({ x: 0.86, y: 0.86 }))
-            .animation({ duration: 300, curve: curves.springCurve(0.62, 0.86, 220, 16) }))
+          .systemMaterial(Mat.whiteOn(this.matOn()))
+          // 流水式展开：只横向缩放、高度不动，原点钉在右侧搜索按钮的 x 上，没有回弹
+          .scale({ x: this.searchGrow, y: 1, centerX: 370, centerY: '50%' })
+          .opacity(this.searchGrow <= 0.12 ? 0 : 1)
+          .animation({ duration: 440, curve: curves.cubicBezierCurve(0.16, 0.9, 0.26, 1.0) })
         } else {
         Row() {
           Row() {
-            Text(this.ws === '' ? '全部工作区' : this.ws)
+            Text(this.archivedView ? '已归档对话' : (this.ws === '' ? '全部工作区' : this.ws))
               .fontSize(15)
               .fontWeight(FontWeight.Medium)
               .fontColor(Tokens.fg)
@@ -752,13 +1185,45 @@ export struct SessionList {
               .fillColor(Tokens.dim2)
               .objectFit(ImageFit.Contain)
           }
-          .padding({ left: 15, right: 15, top: 10, bottom: 10 })
+          .padding({ left: 15, right: 15 })
+          .height(42)
           .backgroundColor(Tokens.glassBar)
-          .border({ width: 1, color: Tokens.glassLine })
+          .border({ width: 1, color: Tokens.pillEdge })
           .borderRadius(999)
-          .bindMenu(this.wsMenu())
+          .constraintSize({ minWidth: 120, minHeight: 42 })
+          .shadow({ radius: 12, color: Tokens.accentGlow, offsetY: 2 })
+          .systemMaterial(Mat.whiteOn(this.matOn()))
+          .bindMenu(this.archivedView ? this.archivedMenu() : this.wsMenu())
 
           Blank()
+
+          // 已归档：点一下直接进归档视图，再点一下回列表（不再有二级菜单）
+          Stack() {
+            Image($r('app.media.ic_archive'))
+              .width(19)
+              .height(19)
+              .fillColor(this.archivedView ? Tokens.accent : Tokens.fg)
+              .objectFit(ImageFit.Contain)
+          }
+          .width(42)
+          .height(42)
+          .borderRadius(21)
+          .backgroundColor(Tokens.glassStrong)
+          .border({ width: 1, color: Tokens.pillEdge })
+          .shadow({ radius: 12, color: Tokens.accentGlow, offsetY: 2 })
+          .systemMaterial(Mat.whiteOn(this.matOn()))
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+          .accessibilityText(this.archivedView ? '返回会话列表' : '已归档对话')
+          .onClick(() => {
+            Haptics.tap();
+            if (this.archivedView) {
+              this.exitArchived();
+              return;
+            }
+            this.archivedView = true;
+            this.loading = true;
+            this.load();
+          })
 
           Stack() {
             Image($r('app.media.ic_search'))
@@ -771,70 +1236,94 @@ export struct SessionList {
           .height(42)
           .borderRadius(21)
           .backgroundColor(Tokens.glassStrong)
-          .border({ width: 1, color: Tokens.glassLine })
+          .border({ width: 1, color: Tokens.pillEdge })
+          .shadow({ radius: 12, color: Tokens.accentGlow, offsetY: 2 })
+          .margin({ left: 10 })
+          .systemMaterial(Mat.whiteOn(this.matOn()))
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
           .onClick(() => {
             Haptics.tap();
+            this.searchGrow = 0.12;
             this.searching = true;
+            setTimeout(() => {
+              this.searchGrow = 1;
+            }, 40);
           })
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: 34, bottom: 6 })
+        .height(42)
+        .padding({ left: 16, right: 16 })
+        // 非搜索态淡出，和搜索胶囊的展开错开一点，看得到「让位」
+        .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
         }
-        }
-
-        // 统计细条（随滚动淡出）
-        Row() {
-          Text(this.rows.length + ' 会话')
-            .fontSize(11.5)
-            .fontColor(Tokens.dim2)
-          Text(' · ')
-            .fontSize(11.5)
-            .fontColor(Tokens.dim2)
-          Text(this.runningCount() + ' 运行中')
-            .fontSize(11.5)
-            .fontColor(this.runningCount() > 0 ? Tokens.ok : Tokens.dim2)
-          Text(' · ')
-            .fontSize(11.5)
-            .fontColor(Tokens.dim2)
-          Text(this.weekCount() + ' 本周')
-            .fontSize(11.5)
-            .fontColor(Tokens.dim2)
-          Blank()
-          if (this.toast !== '') {
-            Text(this.toast)
-              .fontSize(11)
-              .fontColor(Tokens.accent)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-        }
-        .width('100%')
-        .padding({ left: 18, right: 16, bottom: 6 })
-        .opacity(1 - Math.min(this.scrollY / 140, 1) * 0.85)
-        .translate({ y: -Math.min(this.scrollY / 140, 1) * 8 })
-        .animation({ duration: 160, curve: Curve.EaseOut })
     }
     .width('100%')
-    .padding({ top: 6 })
-    .backgroundColor('#' + 'E6' + this.themeBg.slice(1))
-    .backdropBlur(18)
+    .padding({ top: 45 })
+  }
+
+  /** HDS 标题栏：容器本身不画底板（用户要求控件直接浮在列表上），材质只挂在三个控件上 */
+  private listTitle(): HdsNavigationTitleBarOptions {
+    const stack: CustomBuilder = (): void => {
+      this.headerBlock();
+    };
+    const content: TitleBarContentOptions = { stackBuilder: stack };
+    const style: TitleBarStyleOptions = {};
+    // 同样不要整条底板
+    const bgStyle: HdsNavigationBackgroundStyle = {};
+    bgStyle.backgroundColor = Color.Transparent;
+    bgStyle.blurRadius = 0;
+    // 标题栏下面那条泛白/泛灰的整块遮罩就是它：额外遮罩高度清零
+    bgStyle.maskExtraHeight = 0;
+    const origStyle: HdsNavigationTitleBarStyle = {};
+    origStyle.backgroundStyle = bgStyle;
+    style.originalStyle = origStyle;
+    // 标题栏自带的模糊带：彻底关掉，让内容直接从胶囊后面穿过
+    style.blurStrategy = BlurStrategy.DISABLE;
+    // 关键：HDS 标题栏默认开启滚动特效（COMMON_BLUR + 默认底色），滚动后会画出一条
+    // 半透明遮罩带。scrollEffectStyle 未设时用的是系统默认样式，所以必须显式关掉。
+    const eff: ScrollEffectOptions = {};
+    eff.enableScrollEffect = false;
+    style.scrollEffectOpts = eff;
+    // 双保险：即使系统仍走滚动样式，也用同一套透明底色
+    style.scrollEffectStyle = origStyle;
+    const opts: HdsNavigationTitleBarOptions = { content: content, style: style };
+    return opts;
+  }
+
+  /** 沉浸光感是否生效：设备支持 + 设置里的开关开着 */
+  private matOn(): boolean {
+    const v: boolean | undefined = AppStorage.get<boolean>('hdsOn');
+    if (v === false) {
+      return false;
+    }
+    return this.hdsOn();
+  }
+
+  private hdsOn(): boolean {
+    try {
+      return hdsMaterial.getSystemMaterialTypes().indexOf(hdsMaterial.MaterialType.IMMERSIVE) >= 0;
+    } catch (e) {
+      console.warn('DSH_HDS list probe failed: ' + (e as Error).message);
+      return false;
+    }
   }
 
   build() {
+    HdsNavDestination() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
         // 头部（工作区/搜索/统计）改成浮层，见 headerBlock()
 
         if (this.loading) {
-          Row() {
+          Row({ space: 8 }) {
+            LoadingProgress().width(20).height(20).color(Tokens.accent)
             Text('读取会话…')
               .fontSize(12.5)
               .fontColor(Tokens.dim2)
           }
           .width('100%')
           .justifyContent(FlexAlign.Center)
-          .padding({ top: 150 })
+          .padding({ top: this.searching ? 92 : 150 })
         } else if (this.err !== '') {
           Column() {
             Text('读取失败')
@@ -857,39 +1346,51 @@ export struct SessionList {
           .width('100%')
           .padding({ top: 40 })
         } else {
-          Refresh({ refreshing: $$this.refreshing }) {
-          List({ space: 8 }) {
+          Refresh({ refreshing: $$this.refreshing, offset: 220 }) {
+          List({ space: 8, scroller: this.scroller }) {
             ListItem() {
-              Row().width('100%').height(118)
+              Row().width('100%').height(85)
             }
-            ForEach(this.models(), (m: RowModel, idx: number) => {              ListItem() {
-                if (m.kind === 'head') {
+            ForEach(this.models(), (m: RowModel, idx: number) => {
+              if (m.kind === 'head') {
+                ListItem() {
                   Row() {
                     Text(m.label)
                       .fontSize(11.5)
                       .fontColor(Tokens.dim2)
                       .letterSpacing(1.2)
+                    Blank()
+                    // 日期分组可折叠：两笔的箭头，展开朝下，收起转成朝右
+                    if (m.label !== '置顶') {
+                      Path()
+                        .commands('M0 0 L5 5 L10 0')
+                        .stroke(Tokens.dim2)
+                        .strokeWidth(1.6)
+                        .strokeLineCap(LineCapStyle.Round)
+                        .fill(Color.Transparent)
+                        .width(11)
+                        .height(6)
+                        .rotate({ angle: this.isFolded(m.label) ? -90 : 0 })
+                        .animation({ duration: 180, curve: Curve.EaseInOut })
+                    }
                   }
                   .width('100%')
-                  .padding({ left: 6, top: 10, bottom: 2 })
-                } else {
+                  .padding({ left: 6, right: 6, top: 10, bottom: 2 })
+                  .onClick(() => {
+                    if (m.label !== '置顶') this.toggleFold(m.label);
+                  })
+                }
+              } else {
+                ListItem() {
                   SessionTile({
                     row: m.row,
                     preview: this.previewOf(m.row.id),
                     count: this.countOf(m.row.id),
-                    selMode: this.selMode,
-                    selected: this.isSelected(m.row.id),
+                    archivedView: this.archivedView,
                     onTap: () => {
-                      if (this.selMode) {
-                        this.toggleSel(m.row.id);
-                        return;
-                      }
                       Haptics.tap();
                       const p: ChatParam = { id: m.row.id, title: m.row.title };
                       this.stack.pushPathByName('chat', p);
-                    },
-                    onMore: () => {
-                      this.doPin(m.row);
                     },
                     onRename: () => {
                       this.openRename(m.row);
@@ -897,29 +1398,25 @@ export struct SessionList {
                     onPin: () => {
                       this.doPin(m.row);
                     },
-                    onMulti: () => {
-                      if (!this.selMode) this.toggleSelMode();
-                      this.toggleSel(m.row.id);
-                    },
                     onArchive: () => {
-                      this.doArchive(m.row);
+                      if (this.archivedView) {
+                        this.doUnarchive(m.row);
+                      } else {
+                        this.doArchive(m.row);
+                      }
                     },
-                    onCopy: () => {
+                    onCopyId: () => {
                       this.copyId(m.row);
+                    },
+                    onFork: () => {
+                      this.doFork(m.row);
                     }
                   })
                   .bindContextMenu(this.rowMenu(m.row), ResponseType.LongPress)
                 }
-              }
-              .swipeAction({ end: this.swipeActions(m.row), edgeEffect: SwipeEdgeEffect.Spring })
-              .opacity(this.enter ? 1 : 0)
-              .translate({ x: this.enter ? 0 : 14 })
-              .animation({
-                duration: 300,
-                curve: curves.springMotion(0.36, 1.0),
-                delay: Math.min(idx, 10) * 18
-              })
-            }, (m: RowModel) => m.key)
+                // 只有会话卡片能左右滑，分组标题根本不挂这个手势
+                .swipeAction({ end: this.swipeActions(m.row), edgeEffect: SwipeEdgeEffect.Spring })
+              }            }, (m: RowModel) => m.key)
           }
           .width('100%')
           .height('100%')
@@ -945,14 +1442,36 @@ export struct SessionList {
       .width('100%')
       .height('100%')
 
-      this.headerBlock()
+      // 顶部渐隐：HDS 标题栏的滚动遮罩已关掉（enableScrollEffect=false），
+      // 这里只留一层从页面底色到透明的渐变，让上滑内容在状态栏附近淡出，
+      // 避免卡片文字和时钟/电量叠在一起；不是遮罩板，没有任何硬边界。
+      Row()
+        .width('100%')
+        .height(96)
+        .linearGradient({
+          angle: 180,
+          colors: [[this.themeBg, 0.0], [this.themeBg, 0.55], ['#00' + this.themeBg.slice(1), 1.0]]
+        })
+        .position({ x: 0, y: 0 })
+        .hitTestBehavior(HitTestMode.None)
+        .visibility(this.refreshing ? Visibility.Hidden : Visibility.Visible)
 
-      // 右下角悬浮新建（毛玻璃）
+      // 右下角悬浮新建：白色半透明 + 背后模糊，做出沉浸光感的玻璃钮
       Column() {
         Stack() {
+          // 顶部一层极淡的高光，模拟光从上来
+          Row()
+            .width('100%')
+            .height('100%')
+            .borderRadius(29)
+            .linearGradient({
+              angle: 160,
+              colors: [[Tokens.isDark ? '#33FFFFFF' : '#B3FFFFFF', 0.0], ['#00FFFFFF', 0.62]],
+            })
+            .hitTestBehavior(HitTestMode.None)
           Text(this.creating ? '…' : '＋')
             .fontSize(30)
-            .fontColor(Tokens.fg)
+            .fontColor(Tokens.isDark ? '#F2FFFFFF' : Tokens.fg)
             .textAlign(TextAlign.Center)
             .width(58)
             .height(58)
@@ -960,15 +1479,23 @@ export struct SessionList {
         .width(58)
         .height(58)
         .borderRadius(29)
-        .backgroundColor(Tokens.glassFloat)
-        .backdropBlur(18)
-        .border({ width: 1, color: Tokens.glassLine })
-        .shadow({ radius: 18, color: Tokens.shadow, offsetY: 8 })
-        .margin({ right: 22, bottom: 96 })
+        .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#8CFFFFFF')
+        .backdropBlur(Tokens.isDark ? 20 : 26)
+        .border({ width: 1, color: Tokens.isDark ? '#40FFFFFF' : '#D9FFFFFF' })
+        .shadow({ radius: 20, color: Tokens.isDark ? '#40000000' : '#33000000', offsetY: 8 })
+        .margin({ right: 22, bottom: 132 })
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+        .bindSheet($$this.wsPickOn, this.wsPickBody(), {
+          height: '42%',
+          dragBar: true,
+          showClose: false,
+          backgroundColor: Tokens.sheetWarm,
+          blurStyle: BlurStyle.COMPONENT_THICK,
+          maskColor: '#33000000'
+        })
         .onClick(() => {
           Haptics.tap();
-          this.newSession();
+          this.wsPickOn = true;
         })
       }
       .width('100%')
@@ -980,15 +1507,24 @@ export struct SessionList {
       if (this.renameOn) {
         this.renameSheet()
       }
+
+      if (this.wsNewOn) {
+        this.wsNewSheet()
+      }
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(this.themeBg)
     // 从聊天页退回来时列表并不会重建，标题/运行状态得自己对齐一次
     .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean, ratio: number) => {
       if (isVisible && ratio > 0.5 && !this.loading) {
         this.load();
       }
     })
+    }
+    .hideTitleBar(false)
+    .titleBar(this.listTitle())
+    .hideBackButton(true)
+    .bindToScrollable([this.scroller])
+    .backgroundColor(this.themeBg)
   }
 }

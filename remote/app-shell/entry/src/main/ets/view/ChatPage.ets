@@ -1,7 +1,18 @@
-import { Api, Message, SessionStats, TokenUsage, CatalogGroup, CatalogModel, EffortRef, ModelRef, ImageRef, AgentRef } from '../common/Api';
-import { ImagePart, pickImages } from '../common/Images';
+import curves from '@ohos.curves';
+import { inputMethod } from '@kit.IMEKit';
+import { BlurStrategy, HdsNavDestination, HdsNavigationTitleBarOptions, HdsNavigationBackgroundStyle, HdsNavigationTitleBarStyle, ScrollEffectOptions, ScrollEffectType, SystemMaterialParams, TitleBarContentOptions, TitleBarStyleOptions, hdsMaterial } from '@kit.UIDesignKit';
+import { Api, AskAnswer, AskOption, AskQuestion, AskState, ContextUsage, Message, PendingAsk, QueuedItem, QueueImage, SessionStats, TokenUsage, CatalogGroup, CatalogModel, EffortRef, ModelRef, ImageRef, AgentRef, MessagesResult, TurnInfo, GoalView } from '../common/Api';
+import { Outbox, StashItem, StashImage } from '../common/Outbox';
+import { ChatCache, ChatSnapshot } from '../common/Cache';
+import { ImagePart, pickImages, fromUris } from '../common/Images';
+import { cameraPicker } from '@kit.CameraKit';
+import { camera } from '@kit.CameraKit';
+import { common } from '@kit.AbilityKit';
 import { FilePart, pickFiles, readFile } from '../common/Files';
 import { Tokens } from '../common/Tokens';
+import { Drafts } from '../common/Drafts';
+import { Marks } from '../common/Marks';
+import { ExtrasPanel } from './ExtrasPanel';
 import { Mat } from '../common/Mat';
 import { Haptics } from '../common/Haptics';
 import { NavFx, NavFxSink } from '../common/NavFx';
@@ -13,9 +24,14 @@ import { ChatParam } from '../common/Types';
 import { MdBlock, MdSeg, parseMd, parseInline } from '../common/Md';
 import { texToText, looksLikeTex } from '../common/TeX';
 
-interface DockItem {
-  id: number;
-  text: string;
+interface PendRow {
+  key: string;
+  kind: string;
+  idx: number;
+  id: string;
+  title: string;
+  sub: string;
+  thumb: string;
 }
 
 interface Seg {
@@ -127,6 +143,17 @@ export struct ChatPage {
   @State private msgs: Message[] = [];
   @State private total: number = 0;
   @State private loading: boolean = true;
+  @State private ctx: ContextUsage | null = null;
+  /** 用量构成看哪一段：整个会话还是最近一轮 */
+  @State private statsScope: string = 'session';
+  // 目标（goal）面板：输入框左下环形用量右侧那个靶心图标打开
+  @State private goalOn: boolean = false;
+  @State private goal: GoalView | null = null;
+  @State private goalBusy: boolean = false;
+  @State private goalEdit: boolean = false;
+  @State private goalDraft: string = '';
+  /** 占用构成按谁算百分比：占已用 / 占窗口 */
+  @State private mixScope: string = 'used';
   /** 上面还有更早的历史没取过来 */
   @State private hasMore: boolean = false;
   @State private loadingMore: boolean = false;
@@ -135,14 +162,21 @@ export struct ChatPage {
   @State private sending: boolean = false;
   @State private running: boolean = false;
   // 生成中按发送时先停在这里：可改、可删、可插队
-  @State private dock: DockItem[] = [];
-  private dockSeq: number = 1;
   private scroller: Scroller = new Scroller();
   @State private stats: SessionStats | null = null;
   @State private statsOn: boolean = false;
+  /** 模型面板里的筛选词与服务商过滤（选中态都放在这里，关面板不丢）。 */
+  @State private modelQuery: string = '';
+  @State private modelGroupId: string = '';
   @State private groups: CatalogGroup[] = [];
   @State private groupsLoaded: boolean = false;
   @State private modelOn: boolean = false;
+  /**
+   * 收起时的过渡标志。`transition` 只在组件挂载/卸载时给出场动画，而这两个面板的
+   * 卸载发生在同一个 if 翻转里，出场动画来不及跑就被摘掉了；所以收起改成先把
+   * translate 推上去（属性动画），300ms 后再真正卸载。
+   */
+  @State private sheetClosing: boolean = false;
   /** 展示用的模型名（目录里的 name，不是 id） */
   @State private curModel: string = '';
   /** 选择器比较用的模型 id，跟展示名分开存，否则「当前」标记永远不亮 */
@@ -150,13 +184,48 @@ export struct ChatPage {
   @State private curEffort: string = '';
   @State private curProvider: string = '';
   @State private moreOn: boolean = false;
+  /** ⋯ 菜单的自绘弹层：显式控制展开原点，贴着按钮右上角长出来。 */
+  @State private menuOn: boolean = false;
+  @State private bigEditOn: boolean = false;
+  @State private attachOn: boolean = false;
+  @State private atBottom: boolean = true;
+  @State private queueItems: QueuedItem[] = [];
+  /** 重启/中断后仍没发出去的那几条（本地影子，见 common/Outbox.ets）。 */
+  @State private rescue: StashItem[] = [];
+  @State private rescueBusy: boolean = false;
+  /** 当前这一屏来自本地缓存（还没拿到网络结果）。 */
+  @State private cached: boolean = false;
+  @State private queueOpen: boolean = false;
+  private queueCount: number = 0;
+  @State private queueEditId: string = '';
+  /** 待发送卡片：拖动排序时的源下标，以及跟着手指飘起来的那一行标题 */
+  @State private pendH: number = 0;
+  @State private dragFrom: number = -1;
+  @State private dragTitle: string = '';
+  @State private pendBusy: boolean = false;
+  /** 全屏看图：和 Index 共享，挂在 Navigation 外层才能盖住标题栏 */
+  @StorageLink('bigImg') bigImg: string = '';
+  @State private editBuf: string = '';
+  @State private asks: PendingAsk[] = [];
+  /** 题卡的逐题选择：`callId|questionId` -> 已选标签，全部选完才提交 */
+  @State private askSel: Record<string, string[]> = {};
+  /** 一次问好几题时，每张题卡各自停在第几题 */
+  @State private askAt: Record<string, number> = {};
   @State private renaming: boolean = false;
+  /** 右上角三块电脑侧内容：'' 关闭，否则 plugins / schedules / files */
+  @State private extrasMode: string = '';
   /** 改名后标题要立刻跟着变，param 不是状态变量，改它不会重绘 */
   @State private titleNow: string = '';
   /** 新会话日志还没落盘时的重试次数 */
   private retried: number = 0;
   @State private renameText: string = '';
   @State private toast: string = '';
+  /** 更换模型面板里的「智能体协作」：初值读会话日志里的 team/mode */
+  @State private teamOn: boolean = false;
+  /** 写回途中禁用开关，避免连点发出两个相反的请求 */
+  @State private teamBusy: boolean = false;
+  /** 写回序号：拨一次 +1，在飞的旧读取不许再覆盖新结果 */
+  private teamSeq: number = 0;
   /** 轮询句柄：0 表示没在轮询。 */
   private poller: number = 0;
   @State private agents: AgentRef[] = [];
@@ -212,17 +281,24 @@ export struct ChatPage {
   }
 
   aboutToAppear(): void {
+
     this.alive = true;
     this.gen++;
     this.pinKeyboard();
     this.titleNow = this.param.title;
+    // 进去看过了，这个会话的「完成/中断」颜色就该消掉，回到列表不再亮
+    Marks.clear(this.param.id);
+    // 上一轮没发出去的文字要还在
+    this.draft = Drafts.get(this.param.id);
     // 让外壳的完成通知知道「这个会话正开着」，别给自己正在看的会话弹通知
     AppStorage.setOrCreate('openSession', this.param.id);
-    this.curModel = this.param.model ?? '';
+    this.curModelId = this.param.model ?? '';
+    this.curModel = '';
     this.curEffort = this.param.effort ?? '';
     this.load();
     this.loadModels();
     this.loadAgents();
+    this.loadTeamMode();
     // 这个会话可能在电脑上被别的入口继续推进，手机端不能只靠手动刷新
     this.startPolling();
     this.dotTimer = setInterval(() => {
@@ -250,7 +326,87 @@ export struct ChatPage {
     }
   }
 
+  /** 读本会话的智能体协作开关：电脑端把最后一条 team/mode 事件当作当前值。 */
+  private async loadTeamMode(): Promise<void> {
+    const seq: number = this.teamSeq;
+    const g: number = this.gen;
+    try {
+      const r = await this.api.team(this.param.id);
+      // 读的途中拨过开关、或页面已经离开：这次读到的值作废
+      if (!this.alive || g !== this.gen || seq !== this.teamSeq) {
+        return;
+      }
+      this.teamOn = r.enabled === true;
+    } catch (e) {
+      // 读不到就保持原样：开不了团队不该挡住换模型
+    }
+  }
+
+  /** 失败后回读一次真实状态；回读也失败就返回 undefined，不假装知道结果。 */
+  private async confirmTeamMode(seq: number): Promise<boolean | undefined> {
+    const g: number = this.gen;
+    try {
+      const r = await this.api.team(this.param.id);
+      if (!this.alive || g !== this.gen || seq !== this.teamSeq) {
+        return undefined;
+      }
+      return r.enabled === true;
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  /** 拨开关：先按新值上屏，结果以电脑端回读为准，失败要把原因说出来。 */
+  private async setTeamMode(v: boolean): Promise<void> {
+    if (this.teamBusy) {
+      return;
+    }
+    this.teamBusy = true;
+    this.teamOn = v;
+    Haptics.tap();
+    this.teamSeq++;
+    const seq: number = this.teamSeq;
+    const g: number = this.gen;
+    try {
+      const on = await this.api.teamMode(this.param.id, v);
+      if (!this.alive || g !== this.gen || seq !== this.teamSeq) {
+        return;
+      }
+      this.teamOn = on;
+      this.teamFlash(on ? '智能体协作已开启' : '智能体协作已关闭');
+    } catch (e) {
+      if (!this.alive || g !== this.gen || seq !== this.teamSeq) {
+        return;
+      }
+      // 电脑端可能已经落盘（先追加事件再持久化），回读一次再决定
+      const confirmed = await this.confirmTeamMode(seq);
+      if (confirmed !== undefined) {
+        this.teamOn = confirmed === true;
+        this.teamFlash(confirmed === true ? '智能体协作已开启' : '智能体协作已关闭');
+      } else {
+        const why = '切换结果未确认：' + (e as Error).message;
+        this.toast = why;
+        promptAction.showToast({ message: why, duration: 2600 });
+      }
+    } finally {
+      this.teamBusy = false;
+    }
+  }
+
+  /** 团队开关的一次性提示：沿用本页现有的 toast 条，2.4 秒后收掉。 */
+  private teamFlash(text: string): void {
+    this.toast = text;
+    setTimeout(() => {
+      if (this.alive) {
+        this.toast = '';
+      }
+    }, 2400);
+  }
+
   aboutToDisappear(): void {
+    // 切走（返回列表、切 Tab、被系统回收前）都要把没发的文字存下来
+    Drafts.set(this.param.id, this.draft);
+    Drafts.flush();
     this.unpinKeyboard();
     AppStorage.setOrCreate('openSession', '');
     // 代次 +1 让在飞的请求结果全部作废，重试也要停
@@ -318,10 +474,12 @@ export struct ChatPage {
       const r = await this.api.messagesSince(this.param.id, last);
       // 请求飞行途中用户可能已经退出（或换了一轮），此时既不能写状态也不能再排拍子
       if (!this.alive || g !== this.gen) return;
-      const was: boolean = this.running;
       this.running = r.running === true;
-      if (was && !this.running && this.dock.length > 0) {
-        this.flushDock();
+      this.applyQueue(r.queue === undefined ? [] : r.queue);
+        const qs: AskState | undefined = r.questions;
+        this.asks = qs === undefined || qs.active === undefined ? [] : qs.active;
+      if (r.context !== undefined && r.context !== null) {
+        this.ctx = r.context;
       }
       // 轮询能拿到数据就说明日志回来了，把之前那次重试失败的红字清掉
       if (this.err !== '') {
@@ -342,17 +500,747 @@ export struct ChatPage {
     this.schedulePoll(this.running ? 1200 : 4000);
   }
 
+  /** 某道题已经选中的标签（题卡逐题累积，最后一次性提交整批答案） */
+  private pickedOf(ask: PendingAsk, q: AskQuestion): string[] {
+    const hit: string[] | undefined = this.askSel[ask.callId + '|' + q.id];
+    return hit === undefined ? [] : hit;
+  }
+
+  /**
+   * 记下这一题的选中项；只有这道 ask 的每一题都有答案时才提交整批。
+   *
+   * 宿主要求“每个 question id 恰好一条”，逐题提交会被拒，所以先攒后发；
+   * 多问题题卡上先选的题会一直亮着，等最后一题点完再一起走。
+   */
+  private async answerAsk(ask: PendingAsk, q: AskQuestion, label: string): Promise<void> {
+    Haptics.tap();
+    const key = ask.callId + '|' + q.id;
+    const cur = this.pickedOf(ask, q);
+    let picked: string[] = [label];
+    if (q.multiSelect === true) {
+      picked = cur.indexOf(label) >= 0 ? cur.filter((x: string) => x !== label) : cur.concat([label]);
+    }
+    const next: Record<string, string[]> = {};
+    const keys = Object.keys(this.askSel);
+    for (let i = 0; i < keys.length; i++) {
+      next[keys[i]] = this.askSel[keys[i]];
+    }
+    next[key] = picked;
+    this.askSel = next;
+    // 多选题：只记录勾选，绝不自动翻页/提交（否则点第一项就走了，来不及选第二项）。
+    if (q.multiSelect === true) {
+      return;
+    }
+    // 单选题：答完自动翻到下一题；最后一题且每题都答过才整批提交。
+    const idx = this.askIndex(ask);
+    if (idx < ask.questions.length - 1) {
+      this.askGo(ask, idx + 1);
+      return;
+    }
+    if (this.askDone(ask) < ask.questions.length) {
+      return;
+    }
+    await this.submitAsk(ask);
+  }
+
+  /** 把当前选中项整批交回去；多选/多题都走这里。 */
+  private async submitAsk(ask: PendingAsk): Promise<void> {
+    const answers: AskAnswer[] = [];
+    for (let i = 0; i < ask.questions.length; i++) {
+      const one = ask.questions[i];
+      const hit: string[] | undefined = this.askSel[ask.callId + '|' + one.id];
+      if (hit === undefined || hit.length === 0) {
+        return;
+      }
+      answers.push({ id: one.id, selected: hit });
+    }
+    try {
+      await this.api.answerQuestions(this.param.id, ask.callId, answers);
+      this.asks = this.asks.filter((x: PendingAsk) => x.callId !== ask.callId);
+      this.toast = '已回答';
+      this.schedulePoll(1200);
+    } catch (e) {
+      this.err = `${e}`;
+    }
+  }
+
+  /** 一次问好几题时，题卡只显示当前这一题，答完自动翻下一页（和桌面端一样排队答） */
+  private askIndex(ask: PendingAsk): number {
+    const n = ask.questions.length;
+    if (n <= 1) return 0;
+    const at: number | undefined = this.askAt[ask.callId];
+    const i = at === undefined ? 0 : at;
+    if (i < 0) return 0;
+    return i >= n ? n - 1 : i;
+  }
+
+  private askGo(ask: PendingAsk, i: number): void {
+    const n = ask.questions.length;
+    let j = i;
+    if (j < 0) j = 0;
+    if (j > n - 1) j = n - 1;
+    const next: Record<string, number> = {};
+    const keys = Object.keys(this.askAt);
+    for (let k = 0; k < keys.length; k++) {
+      next[keys[k]] = this.askAt[keys[k]];
+    }
+    next[ask.callId] = j;
+    this.askAt = next;
+  }
+
+  @Builder askCard(ask: PendingAsk, q: AskQuestion) {
+    Column({ space: 8 }) {
+      Row() {
+        Text(q.header === undefined || q.header === '' ? '等待你的操作' : q.header)
+          .fontSize(11).fontColor(Tokens.accent).fontWeight(FontWeight.Medium)
+        Blank()
+        Text(ask.questions.length > 1
+          ? `第 ${this.askIndex(ask) + 1} / ${ask.questions.length} 题`
+          : '请选择')
+          .fontSize(10).fontColor(Tokens.dim2)
+      }.width('100%')
+      if (ask.questions.length > 1) {
+        // 队列感：一条细进度，走到第几题一眼能看到
+        Row() {
+          Row()
+            .width(`${Math.round(((this.askIndex(ask) + 1) * 100) / ask.questions.length)}%`)
+            .height(2.5)
+            .borderRadius(2)
+            .backgroundColor(Tokens.accent)
+        }
+        .width('100%')
+        .height(2.5)
+        .borderRadius(2)
+        .backgroundColor(Tokens.surface3)
+      }
+      Text(q.prompt === undefined ? '' : q.prompt).fontSize(14).fontColor(Tokens.fg).width('100%')
+      if (q.detail !== undefined && q.detail !== '') {
+        Text(q.detail).fontSize(12).fontColor(Tokens.dim).width('100%')
+      }
+      ForEach(q.options === undefined ? [] : q.options, (o: AskOption) => {
+        Row() {
+          Text(o.label)
+            .fontSize(13)
+            .fontColor(this.pickedOf(ask, q).indexOf(o.label) >= 0 ? Tokens.fg : Tokens.accent)
+            .fontWeight(this.pickedOf(ask, q).indexOf(o.label) >= 0 ? FontWeight.Medium : FontWeight.Normal)
+          Blank()
+          Text(this.pickedOf(ask, q).indexOf(o.label) >= 0 ? '已选' : '>')
+            .fontSize(12)
+            .fontColor(this.pickedOf(ask, q).indexOf(o.label) >= 0 ? Tokens.accent : Tokens.dim2)
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+        .borderRadius(12)
+        .backgroundColor(this.pickedOf(ask, q).indexOf(o.label) >= 0 ? Tokens.surface : Tokens.surface3)
+        .border({
+          width: this.pickedOf(ask, q).indexOf(o.label) >= 0 ? 1 : 0,
+          color: Tokens.accent,
+        })
+        .onClick(() => { void this.answerAsk(ask, q, o.label); })
+      }, (o: AskOption) => `${ask.callId}-${q.id}-${o.label}`)
+      if (ask.questions.length > 1 || q.multiSelect === true) {
+        Row() {
+          Text(this.askDone(ask) < ask.questions.length
+            ? `还差 ${ask.questions.length - this.askDone(ask)} 题`
+            : '都答完了，点右边提交')
+            .fontSize(11).fontColor(Tokens.dim2)
+          Blank()
+          if (ask.questions.length > 1 && this.askIndex(ask) > 0) {
+            Text('上一题')
+              .fontSize(12).fontColor(Tokens.dim)
+              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+              .borderRadius(999)
+              .backgroundColor(Tokens.surface3)
+              .margin({ right: 8 })
+              .onClick(() => {
+                Haptics.tap();
+                this.askGo(ask, this.askIndex(ask) - 1);
+              })
+          }
+          if (ask.questions.length > 1 && this.askIndex(ask) < ask.questions.length - 1) {
+            Text('下一题')
+              .fontSize(12).fontWeight(FontWeight.Medium)
+              .fontColor(this.pickedOf(ask, q).length > 0 ? Tokens.accentInk : Tokens.dim2)
+              .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+              .borderRadius(999)
+              .backgroundColor(this.pickedOf(ask, q).length > 0 ? Tokens.accent : Tokens.surface3)
+              .onClick(() => {
+                if (this.pickedOf(ask, q).length === 0) return;
+                Haptics.tap();
+                this.askGo(ask, this.askIndex(ask) + 1);
+              })
+          } else {
+            Text('提交')
+              .fontSize(12).fontWeight(FontWeight.Medium)
+              .fontColor(this.pickedOf(ask, q).length > 0 ? Tokens.accentInk : Tokens.dim2)
+              .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+              .borderRadius(999)
+              .backgroundColor(this.pickedOf(ask, q).length > 0 ? Tokens.accent : Tokens.surface3)
+              .onClick(() => {
+                if (this.pickedOf(ask, q).length > 0) {
+                  Haptics.tap();
+                  void this.submitAsk(ask);
+                }
+              })
+          }
+        }.width('100%').margin({ top: 2 })
+      }
+    }
+    .width('100%')
+    .padding(12)
+    .margin({ bottom: 8 })
+    .borderRadius(16)
+    .backgroundColor(Tokens.glassFloat)
+    .border({ width: 1, color: Tokens.glassLine })
+  }
+
+  /** 这道 ask 已有几题选好了 */
+  private askDone(ask: PendingAsk): number {
+    let n = 0;
+    for (let i = 0; i < ask.questions.length; i++) {
+      const hit: string[] | undefined = this.askSel[ask.callId + '|' + ask.questions[i].id];
+      if (hit !== undefined && hit.length > 0) n += 1;
+    }
+    return n;
+  }
+
+  private async loadGoal(): Promise<void> {
+    try {
+      this.goal = await this.api.goal(this.param.id);
+    } catch (e) {
+      this.err = `${e}`;
+    }
+  }
+
+  private openGoal(): void {
+    this.goalEdit = false;
+    this.goalOn = true;
+    void this.loadGoal();
+  }
+
+  private goalPhaseText(): string {
+    const ph: string = this.goal === null || this.goal.phase === undefined ? '' : this.goal.phase;
+    if (ph === 'active') return '进行中';
+    if (ph === 'paused') return '已暂停';
+    if (ph === 'complete') return '已完成';
+    if (ph === 'blocked') return '被阻塞';
+    return ph === '' ? '未知' : ph;
+  }
+
+  private async actGoal(action: string): Promise<void> {
+    if (this.goalBusy) {
+      return;
+    }
+    this.goalBusy = true;
+    Haptics.tap();
+    try {
+      const next: GoalView | null = await this.api.goalAction(this.param.id, action);
+      this.goal = next;
+      this.goalEdit = false;
+      this.toast = action === 'clear' ? '目标已清除' : '目标已更新';
+    } catch (e) {
+      this.err = `${e}`;
+    } finally {
+      this.goalBusy = false;
+    }
+  }
+
+  private async saveGoalEdit(): Promise<void> {
+    const text: string = this.goalDraft.trim();
+    if (text === '' || this.goalBusy) {
+      return;
+    }
+    this.goalBusy = true;
+    try {
+      const patch: string = JSON.stringify({ objective: text }).slice(1, -1);
+      this.goal = await this.api.goalAction(this.param.id, 'edit', patch);
+      this.goalEdit = false;
+      this.toast = '目标已修改';
+    } catch (e) {
+      this.err = `${e}`;
+    } finally {
+      this.goalBusy = false;
+    }
+  }
+
+  @Builder
+  goalActionChip(label: string, action: string, strong: boolean) {
+    Text(label)
+      .fontSize(13)
+      .fontWeight(FontWeight.Medium)
+      .fontColor(strong ? Tokens.accentInk : Tokens.fg)
+      .textAlign(TextAlign.Center)
+      .padding({ left: 18, right: 18, top: 9, bottom: 9 })
+      .borderRadius(999)
+      .backgroundColor(strong ? Tokens.accent : Tokens.surface3)
+      .opacity(this.goalBusy ? 0.5 : 1)
+      .onClick(() => {
+        void this.actGoal(action);
+      })
+  }
+
+  @Builder
+  goalBody() {
+    Column() {
+      Row() {
+        Text('目标')
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Tokens.fg)
+        Blank()
+        Text('×')
+          .fontSize(19)
+          .fontColor(Tokens.dim)
+          .textAlign(TextAlign.Center)
+          .width(38)
+          .height(38)
+          .borderRadius(999)
+          .onClick(() => {
+            this.goalOn = false;
+          })
+      }
+      .width('100%')
+      .height(56)
+
+      if (this.goal === null) {
+        Column({ space: 8 }) {
+          Text('这个会话现在没有目标')
+            .fontSize(15)
+            .fontColor(Tokens.fg)
+          Text('目标由对话里的智能体创建，建好之后可以在这里查看、修改、暂停与继续。')
+            .fontSize(12)
+            .fontColor(Tokens.dim)
+            .lineHeight(19)
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+        .padding({ top: 18 })
+      } else {
+        Text(this.goal.objective === undefined ? '' : this.goal.objective)
+          .fontSize(14.5)
+          .fontColor(Tokens.fg)
+          .lineHeight(23)
+          .width('100%')
+        Row({ space: 8 }) {
+          Text(this.goalPhaseText())
+            .fontSize(11)
+            .fontColor(Tokens.accent)
+            .padding({ left: 9, right: 9, top: 4, bottom: 4 })
+            .borderRadius(999)
+            .backgroundColor(Tokens.accentSoft)
+          Text('第 ' + String(this.goal.roundsStarted === undefined ? 0 : this.goal.roundsStarted) +
+            ' / ' + String(this.goal.maxGoalRounds === undefined ? 0 : this.goal.maxGoalRounds) + ' 轮')
+            .fontSize(11)
+            .fontColor(Tokens.dim)
+        }
+        .width('100%')
+        .margin({ top: 12 })
+
+        if (this.goalEdit) {
+          TextInput({ text: this.goalDraft, placeholder: '目标内容' })
+            .fontSize(14)
+            .fontColor(Tokens.fg)
+            .backgroundColor(Tokens.surface3)
+            .borderRadius(12)
+            .height(46)
+            .margin({ top: 14 })
+            .onChange((v: string) => {
+              this.goalDraft = v;
+            })
+          Row({ space: 10 }) {
+            Blank()
+            Text('取消')
+              .fontSize(13)
+              .fontColor(Tokens.dim)
+              .padding({ left: 18, right: 18, top: 9, bottom: 9 })
+              .borderRadius(999)
+              .backgroundColor(Tokens.surface3)
+              .onClick(() => {
+                this.goalEdit = false;
+              })
+            Text('保存')
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Tokens.accentInk)
+              .padding({ left: 18, right: 18, top: 9, bottom: 9 })
+              .borderRadius(999)
+              .backgroundColor(Tokens.accent)
+              .onClick(() => {
+                void this.saveGoalEdit();
+              })
+          }
+          .width('100%')
+          .margin({ top: 10 })
+        } else {
+          Row({ space: 10 }) {
+            if (this.goal.phase === 'active') {
+              this.goalActionChip('暂停', 'pause', false)
+            }
+            if (this.goal.phase === 'paused') {
+              this.goalActionChip('继续', 'resume', true)
+            }
+            Text('修改')
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Tokens.fg)
+              .padding({ left: 18, right: 18, top: 9, bottom: 9 })
+              .borderRadius(999)
+              .backgroundColor(Tokens.surface3)
+              .onClick(() => {
+                this.goalDraft = this.goal === null || this.goal.objective === undefined ? '' : this.goal.objective;
+                this.goalEdit = true;
+              })
+            Blank()
+            Text('清除')
+              .fontSize(13)
+              .fontColor(Tokens.err)
+              .padding({ left: 6, right: 2, top: 9, bottom: 9 })
+              .onClick(() => {
+                void this.actGoal('clear');
+              })
+          }
+          .width('100%')
+          .margin({ top: 18 })
+        }
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 20, right: 20, top: 6, bottom: 16 })
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 待发送的三类东西合成一张表：本地图片、本地文件、宿主队列。顺序就是发送顺序。 */
+  private pendRows(): PendRow[] {
+    const out: PendRow[] = [];
+    for (let i = 0; i < this.pendFiles.length; i++) {
+      const it: FilePart = this.pendFiles[i];
+      out.push({
+        key: 'f' + String(i) + it.name,
+        kind: 'file',
+        idx: i,
+        id: '',
+        title: it.name,
+        sub: '随下一条消息一起发出',
+        thumb: '',
+      });
+    }
+    for (let i = 0; i < this.queueItems.length; i++) {
+      const q: QueuedItem = this.queueItems[i];
+      const hasImg: boolean = q.images !== undefined && q.images.length > 0;
+      let title: string = q.text;
+      if (title === '') {
+        title = hasImg ? ('图片 ' + String(q.images === undefined ? 0 : q.images.length) + ' 张') : '待发送';
+      }
+      out.push({
+        key: 'q' + q.id,
+        kind: 'queue',
+        idx: i,
+        id: q.id,
+        title: title,
+        sub: '',
+        thumb: hasImg ? this.api.queueImageUrl(this.param.id, q.id, 0, q.images![0].mediaType) : '',
+      });
+    }
+    return out;
+  }
+
+  /** 卡片高度：默认露三行，多出来的在卡片里上下滚 */
+  private pendCardHeight(): number {
+    const n: number = this.pendingTotal();
+    const rows: number = n > 3 ? 3 : n;
+    // 一条也要紧凑：行高 46，不再额外留白
+    return rows * 42 + 2;
+  }
+
+  /** 拖动结束后重排：本地两类按新顺序摆放，宿主队列整体重排（插件侧全删重排）。 */
+  private pendMove(from: number, to: number): void {
+    const rows: PendRow[] = this.pendRows();
+    if (from < 0 || from >= rows.length || to < 0 || to >= rows.length || from === to) {
+      return;
+    }
+    const moved: PendRow[] = rows.slice();
+    const one: PendRow[] = moved.splice(from, 1);
+    moved.splice(to, 0, one[0]);
+    const imgs: ImagePart[] = [];
+    const files: FilePart[] = [];
+    const ids: string[] = [];
+    for (const r of moved) {
+      if (r.kind === 'img') {
+        imgs.push(this.pendImgs[r.idx]);
+      } else if (r.kind === 'file') {
+        files.push(this.pendFiles[r.idx]);
+      } else {
+        ids.push(r.id);
+      }
+    }
+    this.pendImgs = imgs;
+    this.pendFiles = files;
+    const oldIds: string[] = this.queueItems.map((q: QueuedItem) => q.id);
+    if (ids.join(',') === oldIds.join(',')) {
+      Haptics.tap();
+      return;
+    }
+    Haptics.tap();
+    this.api.queueReorder(this.param.id, ids)
+      .then(() => {
+        this.toast = '顺序已更新';
+        this.load();
+      })
+      .catch((e: Error) => {
+        this.toast = '排序失败：' + e.message;
+      });
+  }
+
+  /** 单条「立即」：队列里的插队到当前轮前面，本地的那一条立刻发出去 */
+  private fireRow(r: PendRow): void {
+    if (r.kind === 'queue') {
+      this.doQueueFire(this.queueItems[r.idx]);
+      return;
+    }
+    this.fireLocal(r.kind, r.idx);
+  }
+
+  private async fireLocal(kind: string, idx: number): Promise<void> {
+    if (this.pendBusy) {
+      return;
+    }
+    const imgs: ImagePart[] = kind === 'img' && idx < this.pendImgs.length ? [this.pendImgs[idx]] : [];
+    const files: FilePart[] = kind === 'file' && idx < this.pendFiles.length ? [this.pendFiles[idx]] : [];
+    const text: string = this.draft.trim();
+    this.pendBusy = true;
+    try {
+      Haptics.tap();
+      await this.api.sendOutbox(this.param.id, text, imgs, files, 'steer');
+      if (text !== '') {
+        this.draft = '';
+        Drafts.set(this.param.id, '');
+      }
+      if (kind === 'img' && idx < this.pendImgs.length) {
+        this.pendImgs.splice(idx, 1);
+      }
+      if (kind === 'file' && idx < this.pendFiles.length) {
+        this.pendFiles.splice(idx, 1);
+      }
+      this.toast = '已经插队发出';
+      await this.load();
+    } catch (e) {
+      this.toast = '发不出去：' + (e as Error).message;
+    } finally {
+      this.pendBusy = false;
+    }
+  }
+
+  private dropRow(r: PendRow): void {
+    if (r.kind === 'queue') {
+      this.doQueueDrop(this.queueItems[r.idx]);
+      return;
+    }
+    Haptics.tap();
+    if (r.kind === 'img') {
+      this.dropImg(r.idx);
+    } else {
+      this.dropFile(r.idx);
+    }
+  }
+
+  private async doQueueDrop(q: QueuedItem): Promise<void> {
+    try {
+      await this.api.queueDrop(this.param.id, q.id);
+      this.queueItems = this.queueItems.filter((x: QueuedItem) => x.id !== q.id);
+      Haptics.tap();
+    } catch (e) {
+      this.err = '撤不回来：' + (e as Error).message;
+    }
+  }
+
+  /** 排队条的总条数：电脑队列 + 本地待发图片 + 待发文件，统一在一个横条里显示 */
+  private pendingTotal(): number {
+    return this.queueItems.length + this.pendImgs.length + this.pendFiles.length;
+  }
+
+  /** 收起时显示的那一行摘要：优先显示队列里的文字，其次图片名/文件名 */
+  private pendingPreview(): string {
+    if (this.queueOpen || this.pendingTotal() === 0) {
+      return '';
+    }
+    if (this.queueItems.length > 0) {
+      return this.queueItems[0].text;
+    }
+    if (this.pendImgs.length > 0) {
+      return '图片 ' + String(this.pendImgs.length) + ' 张';
+    }
+    return this.pendFiles[0].name;
+  }
+
+  private queuePreview(): string {
+    if (this.queueOpen || this.queueItems.length === 0) {
+      return '';
+    }
+    return this.queueItems[this.queueItems.length - 1].text;
+  }
+
+  private applyQueue(list: QueuedItem[]): void {
+    if (list.length > this.queueCount) {
+      this.queueOpen = false;
+    }
+    this.queueCount = list.length;
+    this.queueItems = list;
+  }
+
+  private doQueueEdit(q: QueuedItem): void {
+    Haptics.tap();
+    this.queueEditId = q.id;
+    this.editBuf = q.text;
+    this.bigEditOn = true;
+  }
+
+  private async saveQueueEdit(): Promise<void> {
+    const id: string = this.queueEditId;
+    if (id === '') {
+      return;
+    }
+    const text: string = this.editBuf.trim();
+    if (text === '') {
+      this.toast = '内容不能为空';
+      return;
+    }
+    try {
+      await this.api.queueEdit(this.param.id, id, text);
+      const out: QueuedItem[] = [];
+      for (let i = 0; i < this.queueItems.length; i++) {
+        const x: QueuedItem = this.queueItems[i];
+        if (x.id === id) {
+          const y: QueuedItem = { id: x.id, text: text, at: x.at, index: x.index };
+          out.push(y);
+        } else {
+          out.push(x);
+        }
+      }
+      this.queueItems = out;
+      this.queueEditId = '';
+      this.editBuf = '';
+      this.bigEditOn = false;
+      this.toast = '已更新';
+    } catch (e) {
+      this.toast = '更新失败：' + (e as Error).message;
+    }
+  }
+
+  /** 插队：立刻送进电脑，抢在当前轮前面 */
+  private async doQueueFire(q: QueuedItem): Promise<void> {
+    try {
+      Haptics.tap();
+      await this.api.queueFire(this.param.id, q.id);
+      this.queueItems = this.queueItems.filter((x: QueuedItem) => x.id !== q.id);
+      this.toast = '已插队';
+      this.schedulePoll(1200);
+    } catch (e) {
+      this.err = '插队失败：' + (e as Error).message;
+    }
+  }
+
+  /**
+   * 跟本地影子对账：真发出去了就删；宿主重启把队列丢了、且上一轮是被打断的，
+   * 就把影子列成「未发出」让人一键重发。
+   */
+  private reconcileRescue(r: MessagesResult): void {
+    try {
+      Outbox.load();
+      const seen: string[] = [];
+      for (let i = 0; i < r.messages.length; i++) {
+        const m: Message = r.messages[i];
+        if (m.role === 'user') {
+          seen.push((m.text === undefined ? '' : m.text).trim());
+        }
+      }
+      Outbox.settle(this.param.id, seen);
+      const q: QueuedItem[] = r.queue === undefined ? [] : r.queue;
+      const stash: StashItem[] = Outbox.mine(this.param.id);
+      const turn: string = r.lastTurn === undefined ? '' : r.lastTurn;
+      const lost: boolean = q.length === 0 && stash.length > 0 && turn !== '' && turn !== 'completed';
+      console.info('DSH_OUTBOX reconcile sid=' + this.param.id + ' q=' + q.length + ' stash=' + stash.length +
+        ' turn=' + turn + ' lost=' + lost);
+      this.rescue = lost ? stash : [];
+    } catch (e) {
+      console.info('DSH_OUTBOX reconcile failed ' + JSON.stringify(e));
+      this.rescue = [];
+    }
+  }
+
+  private async resendRescue(): Promise<void> {
+    if (this.rescueBusy || this.rescue.length === 0) {
+      return;
+    }
+    Haptics.tap();
+    this.rescueBusy = true;
+    const items: StashItem[] = this.rescue;
+    try {
+      for (let i = 0; i < items.length; i++) {
+        const it: StashItem = items[i];
+        const imgs: ImagePart[] = [];
+        for (let k = 0; k < it.images.length; k++) {
+          const im: StashImage = it.images[k];
+          if (im.data !== '') {
+            // 影子里的图片带着原始字节，直接复用，不用再让用户重选
+            imgs.push({ mediaType: im.mediaType, data: im.data, name: im.name });
+          }
+        }
+        await this.api.sendOutbox(this.param.id, it.text, imgs, [], 'queue');
+      }
+      Outbox.drop(this.param.id, items);
+      this.rescue = [];
+      this.toast = '已重发 ' + String(items.length) + ' 条';
+      setTimeout(() => {
+        this.toast = '';
+      }, 2400);
+      await this.load();
+    } catch (e) {
+      this.err = (e as Error).message;
+    } finally {
+      this.rescueBusy = false;
+    }
+  }
+
+  private async dismissRescue(): Promise<void> {
+    Haptics.soft();
+    Outbox.clear(this.param.id);
+    this.rescue = [];
+  }
+
   private async load(): Promise<void> {
     const g: number = this.gen;
+    // 先把上次看到的这一屏铺出来：进会话立刻有内容，网络慢也不会白屏。
+    if (this.msgs.length === 0) {
+      const snap: ChatSnapshot | null = ChatCache.read(this.param.id);
+      if (snap !== null) {
+        this.msgs = snap.messages;
+        this.total = snap.total;
+        this.running = snap.running;
+        this.hasMore = snap.messages.length < snap.total;
+        this.cached = true;
+        this.loading = false;
+        setTimeout(() => {
+          this.scroller.scrollEdge(Edge.Bottom);
+        }, 30);
+      }
+    }
     try {
       const r = await this.api.messages(this.param.id, 60);
       if (!this.alive || g !== this.gen) return;
       this.msgs = r.messages;
       this.total = r.total;
       this.stats = r.stats ?? null;
+      this.ctx = r.context === undefined ? null : r.context;
       this.running = r.running === true;
+      this.applyQueue(r.queue === undefined ? [] : r.queue);
+        const qs: AskState | undefined = r.questions;
+        this.asks = qs === undefined || qs.active === undefined ? [] : qs.active;
       this.hasMore = r.messages.length < r.total;
       this.err = '';
+      this.cached = false;
+      ChatCache.write(this.param.id, r.messages, r.total, r.running === true, r.lastTurn ?? '');
+      this.reconcileRescue(r);
       setTimeout(() => {
         this.scroller.scrollEdge(Edge.Bottom);
       }, 80);
@@ -368,6 +1256,10 @@ export struct ChatPage {
           this.retryTimer = 0;
           if (this.alive) this.load();
         }, 500);
+      } else if (this.cached) {
+        // 有缓存铺着就不弹红字，网络恢复了下一轮自己会补上。
+        this.err = '';
+        console.info('DSH_CACHE stale ' + this.param.id + ' ' + msg);
       } else {
         this.err = msg;
       }
@@ -411,41 +1303,36 @@ export struct ChatPage {
     }
   }
 
-  /** 电脑管理里选的「忙碌时发送」：queue 排队等这轮跑完，steer 插话替掉。 */
-  private sendMode(): string {
-    const m = AppStorage.get<string>('sendMode');
-    return m === 'steer' ? 'steer' : 'queue';
-  }
-
-  private async send(): Promise<void> {
+  private async send(steerNow: boolean = false): Promise<void> {
     const text = this.draft.trim();
     if ((text === '' && !this.hasPend()) || this.sending) return;
-    if (this.running && text !== '') {
-      // 生成中：不打断当前轮，先停泊，等用户插队或这一轮结束后自动补发
-      this.dock = this.dock.concat([{ id: this.dockSeq++, text: text }]);
-      this.draft = '';
-      Haptics.tap();
-      this.toast = '已放入待发送';
-      setTimeout(() => {
-        this.toast = '';
-      }, 2000);
-      return;
-    }
+    // 生成中点发送：默认把这条交给电脑端的队列（mode=queue，本轮结束后由宿主自动发出，
+    // 电脑的输入区会把它显示成待发送）；点「插队」则用 steer 立刻送进当前这一轮。
+    const runningNow: boolean = this.running;
+    const mode: string = steerNow ? 'steer' : 'queue';
     Haptics.soft();
     this.sending = true;
     const imgs: ImagePart[] = this.pendImgs;
     const files: FilePart[] = this.pendFiles;
     this.draft = '';
     try {
-      if (imgs.length > 0) {
-        // 图片和文字一起进同一条消息（服务端 content = [text, ...image]）。
-        const n = await this.api.uploadImages(this.param.id, text, imgs);
-        this.toast = '已发送 ' + String(n) + ' 张图片';
-      } else if (files.length > 0) {
-        const n = await this.api.uploadFiles(this.param.id, text, files);
-        this.toast = '已上传 ' + String(n) + ' 个文件';
+      if (imgs.length > 0 || files.length > 0) {
+        // 一条消息：文字在前，图片与文件跟着走同一条 prompt（服务端 /outbox）。
+        // 分成 /images 与 /files 两次请求会变成两条待发送，用户看到的就是被拆开了。
+        await this.api.sendOutbox(this.param.id, text, imgs, files, mode);
+        const bits: string[] = [];
+        if (imgs.length > 0) bits.push(String(imgs.length) + ' 张图片');
+        if (files.length > 0) bits.push(String(files.length) + ' 个文件');
+        this.toast = '已发送 ' + bits.join(' + ');
       } else {
-        await this.api.send(this.param.id, text, this.sendMode());
+        await this.api.send(this.param.id, text, mode);
+      }
+      if (runningNow) {
+        const stashImgs: StashImage[] = [];
+        for (let i = 0; i < imgs.length; i++) {
+          stashImgs.push({ mediaType: imgs[i].mediaType, name: imgs[i].name, data: imgs[i].data });
+        }
+        Outbox.remember(this.param.id, text, stashImgs);
       }
       this.pendImgs = [];
       this.pendFiles = [];
@@ -462,43 +1349,6 @@ export struct ChatPage {
     }
   }
 
-  private dropDock(id: number): void {
-    this.dock = this.dock.filter((it: DockItem) => it.id !== id);
-    Haptics.soft();
-  }
-
-  private editDock(it: DockItem): void {
-    this.draft = it.text;
-    this.dock = this.dock.filter((d: DockItem) => d.id !== it.id);
-    Haptics.tap();
-  }
-
-  /** 立刻插话：用 steer 直接送进当前这一轮。 */
-  private async jumpDock(it: DockItem): Promise<void> {
-    this.dock = this.dock.filter((d: DockItem) => d.id !== it.id);
-    Haptics.tap();
-    try {
-      await this.api.send(this.param.id, it.text, 'steer');
-      await this.load();
-    } catch (e) {
-      this.err = (e as Error).message;
-      this.dock = this.dock.concat([it]);
-    }
-  }
-
-  /** 这一轮跑完后，把停泊里最早的一条按设置的模式补发出去。 */
-  private async flushDock(): Promise<void> {
-    if (this.dock.length === 0 || this.running || this.sending) return;
-    const first: DockItem = this.dock[0];
-    this.dock = this.dock.filter((d: DockItem) => d.id !== first.id);
-    try {
-      await this.api.send(this.param.id, first.text, this.sendMode());
-      await this.load();
-    } catch (e) {
-      this.err = (e as Error).message;
-      this.dock = this.dock.concat([first]);
-    }
-  }
 
   /** 打开系统相册选图，先挂到输入框上方，等用户点发送再和文字一起发。 */
   private async pickAttach(): Promise<void> {
@@ -557,6 +1407,81 @@ export struct ChatPage {
     } catch (e) {
       this.err = (e as Error).message;
     }
+  }
+
+  /** 打开系统相机拍一张，同样先挂到待发区。 */
+  private async pickCamera(): Promise<void> {
+    if (this.sending) return;
+    try {
+      const room: number = 9 - this.pendImgs.length - this.pendFiles.length;
+      if (room <= 0) {
+        this.toast = '一次最多 9 个附件';
+        setTimeout(() => {
+          this.toast = '';
+        }, 2000);
+        return;
+      }
+      const profile: cameraPicker.PickerProfile = {
+        cameraPosition: camera.CameraPosition.CAMERA_POSITION_BACK
+      };
+      const res: cameraPicker.PickerResult = await cameraPicker.pick(
+        getContext(this) as common.UIAbilityContext,
+        [cameraPicker.PickerMediaType.PHOTO],
+        profile
+      );
+      if (res.resultCode !== 0 || res.resultUri === '') {
+        return;
+      }
+      const parts: ImagePart[] = fromUris([res.resultUri]);
+      if (parts.length === 0) {
+        this.err = '拍到的照片读不出来';
+        return;
+      }
+      this.pendImgs = this.pendImgs.concat(parts);
+      Haptics.tap();
+      this.err = '';
+    } catch (e) {
+      this.err = (e as Error).message;
+    }
+  }
+
+  /** 宿主 token-meter 投影的上下文占用；拿不到（老插件）时返回 0。 */
+  private ctxUsed(): number {
+    const c = this.ctx;
+    return c === null ? 0 : c.used;
+  }
+
+  private ctxWindow(): number {
+    const c = this.ctx;
+    return c === null || c.window <= 0 ? 128000 : c.window;
+  }
+
+  private ctxPct(): number {
+    if (this.ctx === null) {
+      return 0;
+    }
+    return Math.min(100, Math.round(this.ctxUsed() * 100 / this.ctxWindow()));
+  }
+
+  @Builder
+  usageRing() {
+    Stack() {
+      Progress({
+        value: Math.min(this.ctxUsed(), this.ctxWindow()),
+        total: this.ctxWindow(),
+        type: ProgressType.Ring
+      })
+        .style({ strokeWidth: 3.5 })
+        .color(Tokens.accent)
+        .backgroundColor(Tokens.surface3)
+        .width(26)
+        .height(26)
+      Text(this.ctxPct() + '%')
+        .fontSize(7.5)
+        .fontColor(Tokens.dim2)
+    }
+    .width(32)
+    .height(32)
   }
 
   private hasPend(): boolean {
@@ -622,6 +1547,91 @@ export struct ChatPage {
       });
     } catch (e) {
       promptAction.showToast({ message: '复制失败', duration: 1600 });
+    }
+  }
+
+  /** 这一轮怎么结束的：一句人话。 */
+  private turnLabel(t: TurnInfo): string {
+    if (t.status === 'completed') {
+      return '已完成';
+    }
+    if (t.status === 'aborted' || t.status === 'interrupted') {
+      return '已中断';
+    }
+    if (t.status === 'error') {
+      return '出错';
+    }
+    if (t.status === 'max-tokens') {
+      return '达到输出上限';
+    }
+    if (t.status === 'blocked') {
+      return '受阻';
+    }
+    return t.status === '' ? '已结束' : t.status;
+  }
+
+  /** 状态点的颜色：完成绿、中断/出错红、其余灰。 */
+  private turnColor(t: TurnInfo): string {
+    if (t.status === 'completed') {
+      return Tokens.ok;
+    }
+    if (t.status === 'aborted' || t.status === 'interrupted' || t.status === 'error') {
+      return Tokens.err;
+    }
+    return Tokens.dim2;
+  }
+
+  /** 用时：90 秒 → 1 分 30 秒；纯给脚注看，不追求精确到毫秒。 */
+  private durText(ms: number): string {
+    if (ms <= 0) {
+      return '';
+    }
+    const s: number = Math.round(ms / 1000);
+    if (s < 60) {
+      return String(s) + ' 秒';
+    }
+    const m: number = Math.floor(s / 60);
+    const rest: number = s % 60;
+    return rest === 0 ? String(m) + ' 分钟' : String(m) + ' 分 ' + String(rest) + ' 秒';
+  }
+
+  /** 结束时间：epoch ms → 21:32（今天）或 11-20 21:32（更早）。 */
+  private clockText(ms: number): string {
+    if (ms <= 0) return '';
+    const d = new Date(ms);
+    const now = new Date();
+    const pad = (n: number): string => n < 10 ? '0' + String(n) : String(n);
+    const hm: string = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    const sameDay: boolean = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() &&
+      d.getDate() === now.getDate();
+    return sameDay ? hm : String(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + hm;
+  }
+
+  /** 1200 → 1.2K，2300000 → 2.3M。 */
+  private tokenText(n: number): string {
+    if (n >= 1000000) {
+      return (n / 1000000).toFixed(1) + 'M';
+    }
+    if (n >= 1000) {
+      return (n / 1000).toFixed(1) + 'K';
+    }
+    return String(n);
+  }
+
+  /** 分叉：以这条回复为界复制出一个新会话。 */
+  private async forkAt(m: Message): Promise<void> {
+    const at: number = m.turn !== undefined ? m.turn.atSeq : m.seq;
+    try {
+      const id: string = await this.api.fork(this.param.id, at);
+      if (id === '') {
+        promptAction.showToast({ message: '分叉失败', duration: 1600 });
+        return;
+      }
+      Haptics.tap();
+      promptAction.showToast({ message: '已分叉，回列表可看到新会话', duration: 2000 });
+      AppStorage.setOrCreate('listDirty', Date.now());
+    } catch (e) {
+      promptAction.showToast({ message: '分叉失败：' + (e as Error).message, duration: 2200 });
     }
   }
 
@@ -724,6 +1734,16 @@ export struct ChatPage {
       }
       .alignItems(VerticalAlign.Top)
       .padding({ left: 2 })
+    } else if (b.kind === 'ordered') {
+      Row() {
+        Text(String(b.ord) + '.')
+          .fontSize(15)
+          .fontColor(Tokens.accent)
+          .width(22)
+        this.mdText(b.segs, 15, 24)
+      }
+      .alignItems(VerticalAlign.Top)
+      .padding({ left: 2 })
     } else if (b.kind === 'quote') {
       Row() {
         Row()
@@ -776,6 +1796,10 @@ export struct ChatPage {
                   .borderRadius(14)
                   .backgroundColor(Tokens.surface2)
                   .alt($r('app.media.app_icon'))
+                  .onClick(() => {
+                    Haptics.tap();
+                    this.bigImg = this.api.attachmentUrl(img);
+                  })
               }, (img: ImageRef) => img.id)
             }
             .alignItems(HorizontalAlign.Start)
@@ -836,12 +1860,19 @@ export struct ChatPage {
             .height(20)
             .borderRadius(6)
             .objectFit(ImageFit.Cover)
-            .margin({ right: 7 })
-          Text(this.curModel !== '' ? this.curModel : 'DSH')
-            .fontSize(11)
-            .fontColor(Tokens.dim2)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Blank()
+          if (m.turn !== undefined) {
+            Row() {
+              Circle()
+                .width(6)
+                .height(6)
+                .fill(this.turnColor(m.turn))
+              Text(this.turnLabel(m.turn) + (m.turn.ms > 0 ? ' · ' + this.durText(m.turn.ms) : ''))
+                .fontSize(11)
+                .fontColor(this.turnColor(m.turn))
+                .margin({ left: 5 })
+            }
+          }
         }
         .width('100%')
         .margin({ bottom: 6 })
@@ -875,24 +1906,55 @@ export struct ChatPage {
         .border({ width: 1, color: Tokens.lineSoft })
         .width('100%')
 
-        Row() {
-          Image($r('app.media.ic_copy'))
-            .width(14)
-            .height(14)
-            .fillColor(Tokens.dim2)
-            .objectFit(ImageFit.Contain)
-          Text('复制')
-            .fontSize(11)
-            .fontColor(Tokens.dim2)
-            .margin({ left: 4 })
+        Row({ space: 6 }) {
+          Row() {
+            Image($r('app.media.ic_copy'))
+              .width(14)
+              .height(14)
+              .fillColor(Tokens.dim2)
+              .objectFit(ImageFit.Contain)
+            Text('复制')
+              .fontSize(11)
+              .fontColor(Tokens.dim2)
+              .margin({ left: 4 })
+          }
+          .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+          .borderRadius(10)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          .onClick(() => {
+            this.copyMessage(m);
+          })
+          if (m.turn !== undefined) {
+            Text(this.tokenText(m.turn.tokensIn + m.turn.tokensOut) + ' tokens')
+              .fontSize(11)
+              .fontColor(Tokens.dim2)
+              .margin({ left: 2 })
+          }
+          Row() {
+            Image($r('app.media.ic_fork'))
+              .width(13)
+              .height(13)
+              .fillColor(Tokens.dim2)
+              .objectFit(ImageFit.Contain)
+            Text('分支')
+              .fontSize(11)
+              .fontColor(Tokens.dim2)
+              .margin({ left: 4 })
+          }
+          .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+          .borderRadius(10)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          .onClick(() => {
+            this.forkAt(m);
+          })
+          if (m.turn !== undefined && this.clockText(m.turn.finishedAt === undefined ? 0 : m.turn.finishedAt) !== '') {
+            Text(this.clockText(m.turn.finishedAt === undefined ? 0 : m.turn.finishedAt))
+              .fontSize(11)
+              .fontColor(Tokens.dim2)
+              .margin({ left: 4 })
+          }
         }
-        .padding({ left: 8, right: 8, top: 6, bottom: 6 })
         .margin({ top: 6 })
-        .borderRadius(10)
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-        .onClick(() => {
-          this.copyMessage(m);
-        })
       }
       .width('100%')
       .alignItems(HorizontalAlign.Start)
@@ -910,10 +1972,6 @@ export struct ChatPage {
           .height(20)
           .borderRadius(6)
           .objectFit(ImageFit.Cover)
-          .margin({ right: 7 })
-        Text(this.curModel !== '' ? this.curModel : 'DSH')
-          .fontSize(11)
-          .fontColor(Tokens.dim2)
       }
       .width('100%')
       .margin({ bottom: 6 })
@@ -994,8 +2052,43 @@ export struct ChatPage {
     }
   }
 
+  /** 当前模型的显示名（目录还没拉到时退回会话里的 id）。 */
+  private curModelName(): string {
+    for (const g of this.groups) {
+      for (const m of g.models) {
+        if (m.id === this.curModelId) {
+          return m.name;
+        }
+      }
+    }
+    return this.curModel !== '' ? this.curModel : '—';
+  }
+
+  /** 当前档位的显示名，没有档位就空串。 */
+  private curEffortName(): string {
+    for (const g of this.groups) {
+      for (const m of g.models) {
+        if (m.id === this.curModelId) {
+          for (const e of m.efforts) {
+            if (e.id === this.curEffort) {
+              return e.name;
+            }
+          }
+        }
+      }
+    }
+    return '';
+  }
+
+  /** 模型面板不再做搜索与筛选：服务商各自一张卡片，直接展开。 */
+  private showsModel(gid: string, m: CatalogModel): boolean {
+    return true;
+  }
+
   private openModels(): void {
     this.modelOn = true;
+    // 面板每次弹出都问一次：电脑端也能改这个开关，别拿旧值糊上去
+    this.loadTeamMode();
     if (!this.groupsLoaded) {
       this.loadModels();
     }
@@ -1007,125 +2100,209 @@ export struct ChatPage {
       this.curModelId = m;
       this.curModel = this.labelOf(m);
       this.curEffort = effort;
-      this.modelOn = false;
+      this.shutSheet();
     } catch (e) {
       this.err = (e as Error).message;
     }
   }
 
-  @Builder
-  modelSheet() {
-    Column() {
-      Blank()
-        .width('100%')
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-        .onClick(() => {
-          this.modelOn = false;
-        })
-      Column() {
-        Row() {
-          Text('更换模型')
-            .fontSize(17)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(Tokens.fg)
-            .layoutWeight(1)
-          Text('关闭')
-            .fontSize(13)
-            .fontColor(Tokens.dim)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => {
-              this.modelOn = false;
-            })
-        }
-        .width('100%')
-        .padding({ bottom: 10 })
+  /** 关闭模型 / 运行统计面板：先播收起动画，再卸载，保证进出对称。 */
+  private shutSheet(): void {
+    if (this.sheetClosing) {
+      return;
+    }
+    this.sheetClosing = true;
+    setTimeout(() => {
+      this.modelOn = false;
+      this.statsOn = false;
+      this.sheetClosing = false;
+    }, 300);
+  }
 
-        if (!this.groupsLoaded) {
-          Row() {
-            LoadingProgress().width(18).height(18).color(Tokens.dim2)
-            Text('读取模型目录…').fontSize(13).fontColor(Tokens.dim2).margin({ left: 8 })
-          }
-          .height(80)
-        } else {
-          Scroll() {
-            Column() {
-              ForEach(this.groups, (g: CatalogGroup) => {
-                Column() {
+  private hideKb(): void {
+    try {
+      inputMethod.getController().stopInputSession();
+    } catch (err) {
+    }
+  }
+
+  /**
+   * 模型面板：系统半模态从底部上滑（bindSheet），玻璃底，布局照 CubeAgent 的「选择模型」。
+   * 不再自绘遮罩与位移，顶部四个控件保持可见，关闭后立刻回到原位，连续性好。
+   */
+  @Builder
+  modelSheetBody() {
+    Column() {
+      // 标题行：和「上下文」一模一样，左标题、右图标
+      Row() {
+        Text('选择模型')
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Tokens.fg)
+          .layoutWeight(1)
+        Text('×')
+          .fontSize(19)
+          .fontColor(Tokens.dim)
+          .width(38)
+          .height(38)
+          .textAlign(TextAlign.Center)
+          .borderRadius(999)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+          .accessibilityText('关闭')
+          .onClick(() => {
+            this.modelOn = false;
+          })
+      }
+      .width('100%')
+      .padding({ left: 2, right: 2, bottom: 8 })
+
+      Row() {
+        Text('当前选择')
+          .fontSize(12)
+          .fontColor(Tokens.dim2)
+        Text(this.curModelName() + (this.curEffortName() !== '' ? ' · ' + this.curEffortName() : ''))
+          .fontSize(13)
+          .fontColor(Tokens.accent)
+          .layoutWeight(1)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ left: 8 })
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .backgroundColor(Tokens.accentSoft)
+      .borderRadius(12)
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        Column() {
+          Text('智能体协作')
+            .fontSize(13.5)
+            .fontColor(Tokens.fg)
+          Text('开启后本轮可以派多个子智能体并行干活')
+            .fontSize(10.5)
+            .fontColor(Tokens.dim2)
+            .margin({ top: 2 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        Toggle({ type: ToggleType.Switch, isOn: this.teamOn })
+          .selectedColor(Tokens.accent)
+          .enabled(!this.teamBusy)
+          .onChange((v: boolean) => {
+            if (v !== this.teamOn) {
+              void this.setTeamMode(v);
+            }
+          })
+      }
+      .width('100%')
+      .padding({ top: 12, bottom: 4 })
+      .alignItems(VerticalAlign.Center)
+
+      Divider().color(Tokens.line).margin({ top: 6, bottom: 2 })
+
+      if (!this.groupsLoaded) {
+        Row() {
+          LoadingProgress().width(18).height(18).color(Tokens.dim2)
+          Text('读取模型目录…').fontSize(13).fontColor(Tokens.dim2).margin({ left: 8 })
+        }
+        .height(90)
+      } else {
+        Scroll() {
+          Column() {
+            ForEach(this.groups, (g: CatalogGroup) => {
+              Column() {
+                Row() {
                   Text(g.name)
-                    .fontSize(11)
-                    .fontColor(Tokens.dim2)
-                    .letterSpacing(1.2)
-                    .width('100%')
-                    .margin({ top: 14, bottom: 8 })
-                  ForEach(g.models, (m: CatalogModel) => {
-                    Column() {
-                      Row() {
+                    .fontSize(12)
+                    .fontColor(Tokens.dim)
+                    .letterSpacing(0.6)
+                    .layoutWeight(1)
+                  if (g.models.some((m: CatalogModel) => m.id === this.curModelId)) {
+                    Text('当前')
+                      .fontSize(10)
+                      .fontColor(Tokens.accent)
+                  }
+                }
+                .width('100%')
+                .margin({ bottom: 6 })
+                ForEach(g.models.filter((m: CatalogModel) => this.showsModel(g.id, m)), (m: CatalogModel) => {
+                  Column() {
+                    Row() {
+                      Column() {
                         Text(m.name)
                           .fontSize(15)
                           .fontColor(Tokens.fg)
-                          .layoutWeight(1)
-                        if (this.curModelId === m.id) {
-                          Text('当前')
-                            .fontSize(10)
-                            .fontColor(Tokens.accent)
-                            .borderRadius(999)
-                            .border({ width: 1, color: Tokens.accent })
-                            .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+                          .maxLines(1)
+                          .textOverflow({ overflow: TextOverflow.Ellipsis })
+                        if (m.description !== '') {
+                          Text(m.description)
+                            .fontSize(10.5)
+                            .fontColor(Tokens.dim2)
+                            .maxLines(1)
+                            .textOverflow({ overflow: TextOverflow.Ellipsis })
+                            .margin({ top: 2 })
                         }
                       }
-                      .width('100%')
-
-                      if (m.efforts.length > 0) {
-                        Row() {
-                          ForEach(m.efforts, (e: EffortRef) => {
-                            Text(e.name)
-                              .fontSize(11)
-                              .fontColor(this.curModelId === m.id && this.curEffort === e.id ? Tokens.accentInk : Tokens.dim)
-                              .backgroundColor(this.curModelId === m.id && this.curEffort === e.id ? Tokens.accent : Tokens.surface3)
-                              .borderRadius(999)
-                              .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-                              .margin({ right: 6 })
-                              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-                              .onClick(() => {
-                                Haptics.tap();
-                                this.pick(g.id, m.id, e.id, m.name);
-                              })
-                          }, (e: EffortRef) => e.id)
-                        }
-                        .width('100%')
-                        .margin({ top: 9 })
+                      .alignItems(HorizontalAlign.Start)
+                      .layoutWeight(1)
+                      if (this.curModelId === m.id) {
+                        Text('✓')
+                          .fontSize(15)
+                          .fontColor(Tokens.accent)
                       }
                     }
-                    .alignItems(HorizontalAlign.Start)
-                    .padding({ top: 10, bottom: 10 })
                     .width('100%')
-                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-                    .onClick(() => {
-                      this.pick(g.id, m.id, m.defaultEffort, m.name);
-                    })
-                  }, (m: CatalogModel) => m.id)
-                }
-                .width('100%')
-              }, (g: CatalogGroup) => g.id)
-            }
-            .width('100%')
+
+                    if (m.efforts.length > 0) {
+                      Row() {
+                        ForEach(m.efforts, (e: EffortRef) => {
+                          Text(e.name)
+                            .fontSize(11)
+                            .fontColor(this.curModelId === m.id && this.curEffort === e.id ? Tokens.accentInk : Tokens.dim)
+                            .backgroundColor(this.curModelId === m.id && this.curEffort === e.id ? Tokens.accent : Tokens.surface3)
+                            .borderRadius(999)
+                            .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+                            .margin({ right: 6 })
+                            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+                            .onClick(() => {
+                              Haptics.tap();
+                              this.pick(g.id, m.id, e.id, m.name);
+                            })
+                        }, (e: EffortRef) => e.id)
+                      }
+                      .width('100%')
+                      .margin({ top: 8 })
+                    }
+                  }
+                  .alignItems(HorizontalAlign.Start)
+                  .padding({ top: 10, bottom: 10 })
+                  .width('100%')
+                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+                  .onClick(() => {
+                    this.pick(g.id, m.id, m.defaultEffort, m.name);
+                  })
+                }, (m: CatalogModel) => m.id)
+              }
+              .width('100%')
+              .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+              .backgroundColor(Tokens.surface2)
+              .borderRadius(16)
+              .margin({ bottom: 12 })
+            }, (g: CatalogGroup) => g.id)
           }
-          .layoutWeight(1)
-          .scrollBar(BarState.Off)
-          .edgeEffect(EdgeEffect.Spring)
+          .width('100%')
         }
+        .layoutWeight(1)
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
       }
-      .width('100%')
-      .height('92%')
-      .padding({ left: 20, right: 20, top: 18, bottom: 10 })
-      .backgroundColor(Tokens.surface)
-      .borderRadius({ topLeft: 28, topRight: 28 })
-      .border({ width: 1, color: Tokens.line })
-      .transition(TransitionEffect.OPACITY.combine(TransitionEffect.translate({ y: 60 })))
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#99000000')
+    .padding({ left: 20, right: 20, top: 6, bottom: 16 })
+    .alignItems(HorizontalAlign.Start)
+    .backgroundColor(Color.Transparent)
   }
 
   @Builder
@@ -1143,35 +2320,169 @@ export struct ChatPage {
     .padding({ top: 7, bottom: 7 })
   }
 
+  /** 会话操作菜单：和会话列表右上角四宫格一样，用系统 Menu 挂在按钮上。 */
+  private moreMenu(): MenuElement[] {
+    const items: MenuElement[] = [];
+    items.push({
+      value: '重命名会话',
+      action: () => {
+        this.renameText = this.titleNow;
+        this.renaming = true;
+      }
+    });
+    items.push({
+      value: '上传文件',
+      action: () => {
+        this.pickAttachFile();
+      }
+    });
+    items.push({
+      value: '预设与权限',
+      action: () => {
+        const p: ChatParam = { id: this.param.id, title: this.param.title };
+        this.stack.pushPathByName('presets', p);
+      }
+    });
+    items.push({
+      value: '刷新',
+      action: () => {
+        this.load();
+      }
+    });
+    if (this.running) {
+      items.push({
+        value: '停止生成',
+        action: () => {
+          this.doStop();
+        }
+      });
+    }
+    return items;
+  }
+
+  /** 打开右上角那块电脑侧面板（插件 / 自动化任务 / 工作区文件）。 */
+  private openExtras(mode: string): void {
+    this.hideKb();
+    this.moreOn = false;
+    this.extrasMode = mode;
+  }
+
+  /** ⋯ 菜单：自绘小卡片，展开原点固定在按钮所在的右上角，动画方向不再交给系统。 */
+  @Builder
+  menuRow(label: string, act: () => void) {
+    Row() {
+      Text(label)
+        .fontSize(15)
+        .fontColor(Tokens.fg)
+    }
+    .width('100%')
+    .height(46)
+    .padding({ left: 16, right: 16 })
+    .alignItems(VerticalAlign.Center)
+    .onClick(() => {
+      this.menuOn = false;
+      act();
+    })
+  }
+
+  /** …… 菜单：交给系统原生 Menu（弹出方向与过渡都由系统控制）。 */
+  @Builder
+  chatMenu() {
+    Menu() {
+      MenuItem({ content: '插件' }).onClick(() => { this.openExtras('plugins'); })
+      MenuItem({ content: '自动化任务' }).onClick(() => { this.openExtras('schedules'); })
+      MenuItem({ content: '工作区文件' }).onClick(() => { this.openExtras('files'); })
+      MenuItem({ content: '智能体团队' }).onClick(() => { this.openExtras('team'); })
+      MenuItem({ content: '预设与权限' }).onClick(() => {
+        const p: ChatParam = { id: this.param.id, title: this.param.title };
+        this.stack.pushPathByName('presets', p);
+      })
+      MenuItem({ content: '刷新' }).onClick(() => { this.load(); })
+    }
+  }
+
+  /** 重命名的小弹窗：系统菜单里塞不了输入框，单独来一块。 */
+  @Builder
+  renameDialog() {
+    Column() {
+      Column() {
+        Text('重命名会话')
+          .fontSize(15)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.fg)
+          .width('100%')
+          .margin({ bottom: 12 })
+        TextInput({ text: this.renameText, placeholder: '新的会话名字' })
+          .fontSize(14)
+          .fontColor(Tokens.fg)
+          .placeholderColor(Tokens.dim2)
+          .backgroundColor(Tokens.surface2)
+          .borderRadius(12)
+          .height(42)
+          .onChange((v: string) => {
+            this.renameText = v;
+          })
+        Row() {
+          Text('取消')
+            .fontSize(14)
+            .fontColor(Tokens.dim)
+            .padding({ left: 6, right: 6, top: 10, bottom: 4 })
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+            .onClick(() => {
+              this.renaming = false;
+            })
+          Blank()
+          Text('保存')
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.accent)
+            .padding({ left: 6, right: 6, top: 10, bottom: 4 })
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+            .onClick(() => {
+              this.doRename();
+            })
+        }
+        .width('100%')
+      }
+      .width(300)
+      .padding({ left: 18, right: 18, top: 16, bottom: 8 })
+      .backgroundColor(Tokens.surface)
+      .borderRadius(20)
+      .border({ width: 1, color: Tokens.lineSoft })
+      .shadow({ radius: 28, color: Tokens.shadow, offsetY: 12 })
+      .onClick(() => {
+      })
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor('#66000000')
+    .transition(TransitionEffect.OPACITY.animation({ duration: 160 }))
+    .onClick(() => {
+      this.renaming = false;
+    })
+  }
+
   @Builder
   moreSheet() {
     Column() {
-      Blank()
-        .width('100%')
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-        .onClick(() => {
-          this.moreOn = false;
-          this.renaming = false;
-        })
-
       Column() {
         Row() {
           Text('会话操作')
-            .fontSize(17)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(Tokens.fg)
-            .layoutWeight(1)
-          Text('关闭')
             .fontSize(13)
             .fontColor(Tokens.dim)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+            .layoutWeight(1)
+          Text('×')
+            .fontSize(18)
+            .fontColor(Tokens.dim2)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
             .onClick(() => {
               this.moreOn = false;
               this.renaming = false;
             })
         }
         .width('100%')
-        .padding({ bottom: 8 })
+        .padding({ bottom: 6 })
 
         if (this.renaming) {
           TextInput({ text: this.renameText, placeholder: '新的会话名字' })
@@ -1179,173 +2490,603 @@ export struct ChatPage {
             .fontColor(Tokens.fg)
             .placeholderColor(Tokens.dim2)
             .backgroundColor(Tokens.surface2)
-            .borderRadius(14)
-            .height(44)
+            .borderRadius(12)
+            .height(40)
             .onChange((v: string) => {
               this.renameText = v;
             })
           Row() {
             Text('取消')
-              .fontSize(14)
+              .fontSize(13)
               .fontColor(Tokens.dim)
-              .padding({ top: 12, bottom: 4 })
-              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+              .padding({ top: 10, bottom: 2 })
               .onClick(() => {
                 this.renaming = false;
               })
             Blank()
             Text('保存')
-              .fontSize(14)
+              .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor(Tokens.accent)
-              .padding({ top: 12, bottom: 4 })
-              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+              .padding({ top: 10, bottom: 2 })
               .onClick(() => {
                 this.doRename();
               })
           }
           .width('100%')
         } else {
-          Text('停止生成')
-            .width('100%')
-            .fontSize(15)
-            .fontColor(Tokens.fg)
-            .padding({ top: 14, bottom: 14 })
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => {
+          this.moreRow('重命名会话', () => {
+            this.renameText = this.titleNow;
+            this.renaming = true;
+          })
+          this.moreRow('上传文件', () => {
+            this.moreOn = false;
+            this.pickAttachFile();
+          })
+          this.moreRow('预设与权限', () => {
+            this.moreOn = false;
+            const p: ChatParam = { id: this.param.id, title: this.param.title };
+            this.stack.pushPathByName('presets', p);
+          })
+          this.moreRow('刷新', () => {
+            this.moreOn = false;
+            this.load();
+          })
+          if (this.running) {
+            this.moreRow('停止生成', () => {
+              this.moreOn = false;
               this.doStop();
             })
-          Divider()
-            .color(Tokens.lineSoft)
-          Text('重命名会话')
-            .width('100%')
-            .fontSize(15)
-            .fontColor(Tokens.fg)
-            .padding({ top: 14, bottom: 14 })
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          }
+        }
+      }
+      .width(240)
+      .padding({ left: 14, right: 14, top: 12, bottom: 8 })
+      .backgroundColor(Tokens.glassFloat)
+      .backdropBlur(26)
+      .borderRadius(18)
+      .border({ width: 1, color: Tokens.glassLine })
+      .shadow({ radius: 26, color: Tokens.shadow, offsetY: 10 })
+      .transition(TransitionEffect.OPACITY
+        .combine(TransitionEffect.scale({ x: 0.9, y: 0.9, centerX: '100%', centerY: 0 }))
+        .animation({ duration: 200, curve: Curve.EaseOut }))
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ top: 104, right: 10 })
+    .alignItems(HorizontalAlign.End)
+    .justifyContent(FlexAlign.Start)
+    .onClick(() => {
+      this.moreOn = false;
+      this.renaming = false;
+    })
+  }
+
+  /** 会话操作里的一行 */
+  @Builder
+  moreRow(label: string, act: () => void) {
+    Row() {
+      Text(label)
+        .fontSize(15)
+        .fontColor(Tokens.fg)
+        .layoutWeight(1)
+    }
+    .width('100%')
+    .height(42)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+    .onClick(act)
+  }
+
+
+
+  /** 长文本编辑：输入框一行看不全时，整块抬起来写。 */
+  @Builder
+  bigEditor() {
+    Column() {
+      Row() {
+        Text(this.queueEditId === '' ? '编辑消息' : '编辑待发送')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.fg)
+          .layoutWeight(1)
+        Text('完成')
+          .fontSize(13.5)
+          .fontColor(Tokens.accent)
+          .padding({ left: 12, right: 4, top: 8, bottom: 8 })
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          .onClick(() => {
+            Haptics.tap();
+            this.bigEditOn = false;
+            this.queueEditId = '';
+            this.editBuf = '';
+          })
+      }
+      .width('100%')
+      .padding({ bottom: 10 })
+
+      TextArea({ text: this.queueEditId === '' ? this.draft : this.editBuf, placeholder: '想清楚了再发…' })
+        .placeholderColor(Tokens.dim2)
+        .fontColor(Tokens.fg)
+        .fontSize(15)
+        .width('100%')
+        .layoutWeight(1)
+        .backgroundColor(Tokens.surface3)
+        .borderRadius(16)
+        .padding(14)
+        // 光标行始终留在可视区内：内容超出时 TextArea 会自己往上滚，
+        // 前提是它的底边不被键盘盖住（见外层 padding 的 kbH）。
+        .barState(BarState.Auto)
+        .onChange((v: string) => {
+          if (this.queueEditId !== '') {
+            this.editBuf = v;
+            return;
+          }
+          this.draft = v;
+          Drafts.set(this.param.id, v);
+        })
+
+      Row() {
+        Blank()
+        if (this.queueEditId !== '') {
+          Text('保存')
+            .fontSize(14)
+            .fontColor(Tokens.accentInk)
+            .padding({ left: 20, right: 20, top: 10, bottom: 10 })
+            .backgroundColor(this.editBuf.trim() === '' ? Tokens.surface3 : Tokens.accent)
+            .borderRadius(999)
+            .margin({ top: 12 })
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
             .onClick(() => {
-              this.renameText = this.titleNow;
-              this.renaming = true;
+              this.saveQueueEdit();
             })
-          Divider()
-            .color(Tokens.lineSoft)
-          Text('上传文件')
-            .width('100%')
-            .fontSize(15)
-            .fontColor(Tokens.fg)
-            .padding({ top: 14, bottom: 14 })
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+        } else {
+          Text('发送')
+            .fontSize(14)
+            .fontColor(Tokens.accentInk)
+            .padding({ left: 20, right: 20, top: 10, bottom: 10 })
+            .backgroundColor(this.draft.trim() === '' && !this.hasPend() ? Tokens.surface3 : Tokens.accent)
+            .borderRadius(999)
+            .margin({ top: 12 })
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
             .onClick(() => {
-              this.moreOn = false;
-              this.pickAttachFile();
-            })
-          Divider()
-            .color(Tokens.lineSoft)
-          Text('预设与权限')
-            .width('100%')
-            .fontSize(15)
-            .fontColor(Tokens.fg)
-            .padding({ top: 14, bottom: 14 })
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => {
-              this.moreOn = false;
-              const p: ChatParam = { id: this.param.id, title: this.param.title };
-              this.stack.pushPathByName('presets', p);
-            })
-          Divider()
-            .color(Tokens.lineSoft)
-          Text('刷新')
-            .width('100%')
-            .fontSize(15)
-            .fontColor(Tokens.fg)
-            .padding({ top: 14, bottom: 14 })
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => {
-              this.moreOn = false;
-              this.load();
+              this.bigEditOn = false;
+              this.send();
             })
         }
       }
       .width('100%')
-      .padding({ left: 20, right: 20, top: 18, bottom: 26 })
-      .backgroundColor(Tokens.surface)
-      .borderRadius({ topLeft: 22, topRight: 22 })
+    }
+    .width('100%')
+    .height('100%')
+    // 键盘高度要从可视高度里扣掉：整页用 KeyboardAvoidMode.NONE 自己排版，
+    // 以前这里只留 16，长文本的光标行正好落在键盘底下，写多就「看不见」了。
+    .padding({ left: 16, right: 16, top: 68, bottom: 16 + this.kbH })
+    .backgroundColor(Tokens.bg)
+    .transition(TransitionEffect.OPACITY
+      .combine(TransitionEffect.translate({ y: '100%' }))
+      .animation({ duration: 300, curve: curves.cubicBezierCurve(0.2, 0.0, 0.2, 1.0) }))
+  }
+
+  /** 上下文占比：0 到 100，保留一位小数，够大就不带小数。 */
+  private ctxPercent(): number {
+    if (this.ctx === null || this.ctx.window <= 0) return 0;
+    const p = (this.ctx.used / this.ctx.window) * 100;
+    return p < 0 ? 0 : (p > 100 ? 100 : p);
+  }
+
+  private ctxPctText(): string {
+    const p = this.ctxPercent();
+    return p >= 10 ? '' + Math.round(p) : p.toFixed(1);
+  }
+
+  private tokenTotal(): number {
+    if (this.stats === null) return 0;
+    const t = this.stats.tokens;
+    return t.uncachedInputTokens + t.cacheReadTokens + t.cacheWriteTokens + t.outputTokens;
+  }
+
+  /** 首轮 prompt 的 token 数：系统提示词 + 工具定义 + 第一条消息，用它当「系统与工具」的估算基线。 */
+  private baseTokens(): number {
+    for (let i = 0; i < this.msgs.length; i++) {
+      const t = this.msgs[i].turn;
+      if (t !== undefined && t !== null && t.tokensIn > 0) return t.tokensIn;
+    }
+    return 0;
+  }
+
+  /** 上下文里被对话本身占掉的部分（估算）：上一次请求 - 首轮基线。 */
+  private msgTokens(): number {
+    if (this.ctx === null) return 0;
+    const base = this.baseTokens();
+    const used = this.ctx.used;
+    if (base <= 0 || used <= base) return used;
+    return used - base;
+  }
+
+  private mixUnit(): number {
+    if (this.mixScope === 'window') return this.ctx === null ? 0 : this.ctx.window;
+    return this.ctx === null ? 0 : this.ctx.used;
+  }
+
+  /** 最近一轮的输入/输出（拿最后一条带 turn 的助手消息）。 */
+  private lastTurnIn(): number {
+    for (let i = this.msgs.length - 1; i >= 0; i--) {
+      const t = this.msgs[i].turn;
+      if (t !== undefined && t !== null) return t.tokensIn;
+    }
+    return 0;
+  }
+
+  private lastTurnOut(): number {
+    for (let i = this.msgs.length - 1; i >= 0; i--) {
+      const t = this.msgs[i].turn;
+      if (t !== undefined && t !== null) return t.tokensOut;
+    }
+    return 0;
+  }
+
+  private lastTurnWhen(): string {
+    for (let i = this.msgs.length - 1; i >= 0; i--) {
+      const t = this.msgs[i].turn;
+      if (t !== undefined && t !== null && t.finishedAt !== undefined) return this.clockText(t.finishedAt as number);
+    }
+    return '';
+  }
+
+  /** 一条构成行：色点、名称、右侧数值与占比。 */
+  @Builder
+  private mixRow(color: string, name: string, value: number, total: number) {
+    Row() {
+      Circle().width(9).height(9).fill(color)
+      Text(name)
+        .fontSize(13.5)
+        .fontColor(Tokens.fg)
+        .margin({ left: 10 })
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+      Text(fmtNum(value))
+        .fontSize(13.5)
+        .fontColor(Tokens.fg)
+      Text(total > 0 ? (Math.round(Math.min(100, (value / total) * 100) * 10) / 10).toFixed(1) + '%' : '-')
+        .fontSize(12)
+        .fontColor(Tokens.dim2)
+        .width(58)
+        .textAlign(TextAlign.End)
+    }
+    .width('100%')
+    .height(40)
+    .alignItems(VerticalAlign.Center)
+  }
+
+  /** 一条明细：左侧标签，右侧数值。 */
+  @Builder
+  private metaRow(label: string, value: string, strong: boolean) {
+    Row() {
+      Text(label)
+        .fontSize(13)
+        .fontColor(strong ? Tokens.fg : Tokens.dim)
+        .layoutWeight(1)
+      Text(value)
+        .fontSize(strong ? 14 : 13)
+        .fontWeight(strong ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(strong ? Tokens.fg : Tokens.dim2)
+    }
+    .width('100%')
+    .height(38)
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  private mixTab(label: string, value: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.mixScope === value ? Tokens.fg : Tokens.dim2)
+      .fontWeight(this.mixScope === value ? FontWeight.Medium : FontWeight.Normal)
+      .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+      .borderRadius(999)
+      .backgroundColor(this.mixScope === value ? Tokens.surface : Color.Transparent)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+      .onClick(() => {
+        this.mixScope = value;
+      })
+  }
+
+  @Builder
+  private scopeTab(label: string, value: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.statsScope === value ? Tokens.fg : Tokens.dim2)
+      .fontWeight(this.statsScope === value ? FontWeight.Medium : FontWeight.Normal)
+      .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+      .borderRadius(999)
+      .backgroundColor(this.statsScope === value ? Tokens.surface : Color.Transparent)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+      .onClick(() => {
+        this.statsScope = value;
+      })
+  }
+
+  @Builder
+  statsBody() {
+    Column() {
+      Column() {
+        // 标题行：左侧大标题，右上角只留一个刷新（关闭靠下拉收起）
+        Row() {
+          Text('上下文')
+            .fontSize(22)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(Tokens.fg)
+            .layoutWeight(1)
+          Text('↻')
+            .fontSize(19)
+            .fontColor(Tokens.dim)
+            .width(38)
+            .height(38)
+            .textAlign(TextAlign.Center)
+            .borderRadius(999)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+            .accessibilityText('刷新')
+            .onClick(() => {
+              Haptics.tap();
+              this.load();
+            })
+        }
+        .width('100%')
+        .padding({ left: 2, right: 2, bottom: 10 })
+        .backgroundColor(Tokens.surface2)
+        .zIndex(2)
+
+        Scroll() {
+          Column({ space: 12 }) {
+            // ---------- 卡片一：当前上下文 ----------
+            Column() {
+              Text('当前上下文')
+                .fontSize(12)
+                .fontColor(Tokens.dim)
+                .width('100%')
+              Row() {
+                Row() {
+                  Text(this.ctxPctText())
+                    .fontSize(52)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor(Tokens.fg)
+                  Text('%')
+                    .fontSize(20)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(Tokens.dim)
+                    .margin({ left: 2, bottom: 7 })
+                }
+                .alignItems(VerticalAlign.Bottom)
+                .layoutWeight(1)
+
+                Column() {
+                  Text(this.ctx !== null ? ('≈ ' + fmtNum(this.ctx.used) + ' / ' + fmtNum(this.ctx.window) + ' token')
+                    : '还没有上下文用量')
+                    .fontSize(12)
+                    .fontColor(Tokens.fg)
+                  Text(this.ctx !== null ? ('剩余 ≈ ' + fmtNum(Math.max(0, this.ctx.window - this.ctx.used)))
+                    : '跑一轮之后就有了')
+                    .fontSize(12)
+                    .fontColor(Tokens.dim2)
+                    .margin({ top: 3 })
+                }
+                .alignItems(HorizontalAlign.End)
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Bottom)
+              .margin({ top: 2, bottom: 14 })
+
+              // 占比条：已用实色、剩余浅色轨道，右端标出窗口大小
+              Stack({ alignContent: Alignment.Start }) {
+                Row()
+                  .width('100%')
+                  .height(13)
+                  .borderRadius(7)
+                  .backgroundColor(Tokens.surface3)
+                Row()
+                  .width(this.ctxPercent() + '%')
+                  .height(13)
+                  .borderRadius(7)
+                  .backgroundColor(Tokens.accent)
+              }
+              .width('100%')
+              .height(13)
+              .clip(true)
+
+              Row() {
+                Text('0')
+                  .fontSize(10.5)
+                  .fontColor(Tokens.dim2)
+                Blank()
+                Text('已用 ' + fmtNum(this.ctx !== null ? this.ctx.used : 0))
+                  .fontSize(10.5)
+                  .fontColor(Tokens.accent)
+                Blank()
+                Text(this.ctx !== null ? fmtNum(this.ctx.window) : '-')
+                  .fontSize(10.5)
+                  .fontColor(Tokens.dim2)
+              }
+              .width('100%')
+              .margin({ top: 7 })
+
+              Text('按 ' + (this.curModel !== '' ? this.curModel : '当前模型') + ' 的窗口大小计算，取宿主下一次请求的 prompt 估算；接近满时会自动压缩较早的历史。')
+                .fontSize(11.5)
+                .fontColor(Tokens.dim2)
+                .lineHeight(17)
+                .margin({ top: 12 })
+                .width('100%')
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+            .borderRadius(Tokens.rGroup)
+            .backgroundColor(Tokens.accentSoft)
+            .alignItems(HorizontalAlign.Start)
+
+            // ---------- 卡片二：占用构成（估） ----------
+            Column() {
+              Row() {
+                Text('占用构成')
+                  .fontSize(15)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(Tokens.fg)
+                  .layoutWeight(1)
+                Row() {
+                  this.mixTab('占已用', 'used')
+                  this.mixTab('占窗口', 'window')
+                }
+                .padding(3)
+                .borderRadius(999)
+                .backgroundColor(Tokens.surface3)
+              }
+              .width('100%')
+              .padding({ bottom: 4 })
+
+              if (this.ctx === null) {
+                Row() {
+                  Text('跑一轮之后这里会有上下文构成').fontSize(13).fontColor(Tokens.dim2)
+                }
+                .height(60)
+                .width('100%')
+              } else {
+                this.mixRow(Tokens.accent, '消息（含附件）', this.msgTokens(), this.mixUnit())
+                this.mixRow('#7AA2FF', '系统与工具', this.baseTokens(), this.mixUnit())
+                if (this.mixScope === 'window') {
+                  this.mixRow(Tokens.surface3, '剩余', Math.max(0, this.ctx.window - this.ctx.used), this.mixUnit())
+                }
+                Divider().color(Tokens.line).margin({ top: 4, bottom: 2 })
+                this.metaRow('上下文合计', fmtNum(this.ctx.used) + ' / ' + fmtNum(this.ctx.window) + ' token', true)
+              }
+
+              Text('数值是本地估算：系统与工具取首轮 prompt，消息部分是上一次请求减掉这个基线；以宿主的 token-meter 为准。')
+                .fontSize(11.5)
+                .fontColor(Tokens.dim2)
+                .lineHeight(17)
+                .margin({ top: 8 })
+                .width('100%')
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 14, bottom: 12 })
+            .borderRadius(Tokens.rGroup)
+            .backgroundColor(Tokens.surface)
+            .alignItems(HorizontalAlign.Start)
+
+            // ---------- 卡片三：用量明细 ----------
+            Column() {
+              Row() {
+                Text('用量')
+                  .fontSize(15)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(Tokens.fg)
+                  .layoutWeight(1)
+                Row() {
+                  this.scopeTab('本会话', 'session')
+                  this.scopeTab('最近一轮', 'turn')
+                }
+                .padding(3)
+                .borderRadius(999)
+                .backgroundColor(Tokens.surface3)
+              }
+              .width('100%')
+              .padding({ bottom: 4 })
+
+              if (this.stats === null) {
+                Row() {
+                  Text('这个会话还没有用量记录').fontSize(13).fontColor(Tokens.dim2)
+                }
+                .height(56)
+                .width('100%')
+              } else if (this.statsScope === 'session') {
+                this.mixRow(Tokens.accent, '输入（未缓存）', this.stats.tokens.uncachedInputTokens, this.tokenTotal())
+                this.mixRow('#7AA2FF', '缓存读取', this.stats.tokens.cacheReadTokens, this.tokenTotal())
+                this.mixRow('#A9C0FF', '缓存写入', this.stats.tokens.cacheWriteTokens, this.tokenTotal())
+                this.mixRow(Tokens.ok, '输出', this.stats.tokens.outputTokens, this.tokenTotal())
+                Divider().color(Tokens.line).margin({ top: 4, bottom: 2 })
+                this.metaRow('合计', fmtNum(this.tokenTotal()) + ' token', true)
+              } else {
+                this.mixRow(Tokens.accent, '输入', this.lastTurnIn(), this.lastTurnIn() + this.lastTurnOut())
+                this.mixRow(Tokens.ok, '输出', this.lastTurnOut(), this.lastTurnIn() + this.lastTurnOut())
+                Divider().color(Tokens.line).margin({ top: 4, bottom: 2 })
+                this.metaRow('合计', fmtNum(this.lastTurnIn() + this.lastTurnOut()) + ' token', true)
+                if (this.lastTurnWhen() !== '') {
+                  this.metaRow('完成于', this.lastTurnWhen(), false)
+                }
+              }
+
+              Divider().color(Tokens.line).margin({ top: 6, bottom: 2 })
+
+              if (this.stats !== null) {
+                this.metaRow('轮次', '' + this.stats.turns, false)
+                this.metaRow('步骤', '' + this.stats.steps, false)
+                this.metaRow('工具调用', '' + this.stats.toolCalls, false)
+                this.metaRow('消息', this.msgs.length + (this.hasMore ? '+' : '') + ' 条', false)
+                Divider().color(Tokens.line).margin({ top: 4, bottom: 4 })
+                this.metaRow('上次请求的 prompt', this.ctx !== null ? '≈ ' + fmtNum(this.ctx.used) + ' token' : '-', true)
+                this.metaRow('缓存命中率', cmpRate(this.stats.tokens), true)
+                this.metaRow('这个会话一共用了', fmtNum(this.tokenTotal()) + ' token', true)
+              } else {
+                Row() {
+                  Text('跑一轮之后这里会有明细').fontSize(13).fontColor(Tokens.dim2)
+                }
+                .height(60)
+              }
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 10, bottom: 10 })
+            .borderRadius(Tokens.rGroup)
+            .backgroundColor(Tokens.surface)
+            .alignItems(HorizontalAlign.Start)
+          }
+          .width('100%')
+          .padding({ bottom: 20 })
+        }
+        .layoutWeight(1)
+        .scrollBar(BarState.Off)
+        .align(Alignment.Top)
+        .clip(true)
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ left: 20, right: 20, top: 6, bottom: 14 })
+      .backgroundColor(Color.Transparent)
     }
     .width('100%')
     .height('100%')
   }
 
+  /** 附件菜单的一枚胶囊：点一下选完自动收起，输入法不会掉。 */
   @Builder
-  statsSheet() {
-    Column() {
-      Blank()
-        .width('100%')
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-        .onClick(() => {
-          this.statsOn = false;
-        })
-      Column() {
-        Row() {
-          Text('运行统计')
-            .fontSize(17)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(Tokens.fg)
-            .layoutWeight(1)
-          Text('关闭')
-            .fontSize(13)
-            .fontColor(Tokens.dim)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => {
-              this.statsOn = false;
-            })
-        }
-        .width('100%')
-        .padding({ bottom: 6 })
-
-        if (this.stats === null) {
-          Row() {
-            Text('这个会话还没有统计数据').fontSize(13).fontColor(Tokens.dim2)
-          }
-          .height(70)
-        } else {
-          this.kvRow('轮次', '' + this.stats.turns)
-          this.kvRow('步骤', '' + this.stats.steps)
-          this.kvRow('工具调用', '' + this.stats.toolCalls)
-          this.kvRow('输入（未缓存）', fmtNum(this.stats.tokens.uncachedInputTokens))
-          this.kvRow('缓存读取', fmtNum(this.stats.tokens.cacheReadTokens))
-          this.kvRow('输出', fmtNum(this.stats.tokens.outputTokens))
-          Divider().color(Tokens.line).margin({ top: 8, bottom: 8 })
-          this.kvRow('Token 合计', fmtNum(this.stats.tokens.uncachedInputTokens + this.stats.tokens.cacheReadTokens + this.stats.tokens.outputTokens))
-          this.kvRow('缓存命中率', cmpRate(this.stats.tokens))
-        }
-      }
-      .width('100%')
-      .padding({ left: 20, right: 20, top: 18, bottom: 28 })
-      .backgroundColor(Tokens.surface)
-      .borderRadius({ topLeft: 24, topRight: 24 })
-      .border({ width: 1, color: Tokens.line })
-    }
-    .width('100%')
-    .height('100%')
-    .backgroundColor('#99000000')
+  attachChip(label: string, act: () => void) {
+    Text(label)
+      .fontSize(13)
+      .fontColor(Tokens.fg)
+      .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+      .borderRadius(999)
+      .backgroundColor(Tokens.surface3)
+      .border({ width: 1, color: Tokens.glassLine })
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+      .onClick(() => {
+        act();
+      })
   }
 
   @Builder
   headerBar() {
     Column() {
       Row() {
-        Text('‹')
-          .fontSize(26)
-          .fontColor(Tokens.fg)
-          .width(40)
-          .height(40)
-          .textAlign(TextAlign.Center)
-          .borderRadius(999)
-          .backgroundColor(Tokens.glassFloat)
-          .backdropBlur(18)
-          .border({ width: 1, color: Tokens.glassLine })
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-          .onClick(() => this.stack.pop())
+        Stack() {
+          Text('‹')
+            .fontSize(16)
+            .fontColor(Tokens.fg)
+            .textAlign(TextAlign.Center)
+        }
+        .width(42)
+        .height(42)
+        .borderRadius(999)
+        .systemMaterial(Mat.whiteOn(this.matOn()))
+        .border({ width: 1, color: Tokens.glassLine })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+        .onClick(() => this.stack.pop())
 
         Row() {
           Column() {
@@ -1355,7 +3096,7 @@ export struct ChatPage {
               .fontColor(Tokens.fg)
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(this.curModel !== '' ? this.curModel : (this.loading ? '加载中…' : ('共 ' + this.total + ' 条')))
+            Text(this.curModel !== '' ? this.curModel : (this.loading ? '拉取中…' : ''))
               .fontSize(10.5)
               .fontColor(Tokens.dim)
               .maxLines(1)
@@ -1365,52 +3106,88 @@ export struct ChatPage {
           .alignItems(HorizontalAlign.Center)
           .padding({ left: 14, right: 14 })
         }
-        .height(46)
+        .height(42)
+        // 标题胶囊吃掉中间剩余空间：固定宽高会让标题一长就把 ▤ / ⋯ 顶出屏幕，
+        // 之前「▤ 摁不了」就是这么来的。
         .layoutWeight(1)
+        .constraintSize({ minWidth: 110 })
         .justifyContent(FlexAlign.Center)
         .margin({ left: 8, right: 8 })
-        .backgroundColor(Tokens.glassFloat)
-        .backdropBlur(18)
+        .systemMaterial(Mat.whiteOn(this.matOn()))
         .borderRadius(999)
         .border({ width: 1, color: Tokens.glassLine })
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
         .onClick(() => {
+          this.hideKb();
           this.openModels();
         })
+        .bindSheet($$this.modelOn, this.modelSheetBody(), {
+          height: '76%',
+          dragBar: true,
+          showClose: false,
+          backgroundColor: Tokens.sheetWarm,
+          blurStyle: BlurStyle.COMPONENT_THICK,
+          maskColor: '#33000000',
+          onDisappear: () => {
+            this.modelOn = false;
+          }
+        })
 
-        Text('▤')
-          .fontSize(15)
-          .fontColor(Tokens.dim)
-          .width(38)
-          .height(38)
-          .textAlign(TextAlign.Center)
-          .borderRadius(999)
-          .backgroundColor(Tokens.glassFloat)
-          .backdropBlur(18)
-          .border({ width: 1, color: Tokens.glassLine })
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-          .onClick(() => {
-            this.statsOn = true;
-          })
+        Stack() {
+          Text('▤')
+            .fontSize(16)
+            .fontColor(Tokens.fg)
+            .textAlign(TextAlign.Center)
+        }
+        .width(42)
+        .height(42)
+        .borderRadius(999)
+        .systemMaterial(Mat.whiteOn(this.matOn()))
+        .border({ width: 1, color: Tokens.glassLine })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+        .onClick(() => {
+          this.hideKb();
+          this.statsOn = true;
+        })
+        .accessibilityText('运行统计')
+        .bindSheet($$this.statsOn, this.statsBody(), {
+          height: '76%',
+          dragBar: true,
+          showClose: false,
+          backgroundColor: Tokens.sheetWarm,
+          blurStyle: BlurStyle.COMPONENT_THICK,
+          maskColor: '#33000000',
+          onDisappear: () => {
+            this.statsOn = false;
+          }
+        })
 
-        Text('⋯')
-          .fontSize(16)
-          .fontColor(Tokens.dim)
-          .width(38)
-          .height(38)
-          .textAlign(TextAlign.Center)
-          .borderRadius(999)
-          .backgroundColor(Tokens.glassFloat)
-          .backdropBlur(18)
-          .border({ width: 1, color: Tokens.glassLine })
-          .margin({ left: 8 })
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-          .onClick(() => {
-            this.moreOn = true;
-          })
+        Stack() {
+          Text('⋯')
+            .fontSize(16)
+            .fontColor(Tokens.fg)
+            .textAlign(TextAlign.Center)
+        }
+        .width(42)
+        .height(42)
+        .borderRadius(999)
+        .systemMaterial(Mat.whiteOn(this.matOn()))
+        .border({ width: 1, color: Tokens.glassLine })
+        .margin({ left: 8 })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+        .onTouch((e: TouchEvent) => {
+          if (e.type === TouchType.Down) {
+            this.hideKb();
+          }
+        })
+        .onClick(() => {
+          this.menuOn = true;
+        })
+        .bindMenu(this.chatMenu())
       }
       .width('100%')
-      .padding({ left: 12, right: 12 })
+      .justifyContent(FlexAlign.SpaceBetween)
+      .padding({ left: 2, right: 8 })
 
       // 顶部成员条：这个会话的子智能体（横向滚动，不单独成页）
       if (this.agents.length > 0) {
@@ -1451,8 +3228,252 @@ export struct ChatPage {
     .width('100%')
   }
 
+  /** HDS 标题栏：内容交给自绘的 headerBar，底板与材质由 HDS 画。 */
+  /** 标题栏内容整体下压，别贴着屏幕上沿。 */
+  @Builder
+  headerPadded() {
+    // HDS 标题栏从屏幕最上沿开始画，不会自动让出状态栏；内边距只能加在这里。
+    Column() {
+      this.headerBar();
+    }
+    .width('100%')
+    .padding({ top: 65, left: 14, right: 6, bottom: 10 })
+  }
+
+  private hdsTitle(): HdsNavigationTitleBarOptions {
+    const stack: CustomBuilder = (): void => {
+      this.headerPadded();
+    };
+    const content: TitleBarContentOptions = { stackBuilder: stack };
+    // 标题栏底板留空：只要几枚自绘胶囊悬浮，不要整条泛白/泛灰的遮挡
+    const style: TitleBarStyleOptions = {};
+    // 顶栏不要整条底板/遮罩：只要几枚自绘胶囊浮着
+    const bgStyle: HdsNavigationBackgroundStyle = {};
+    bgStyle.backgroundColor = Color.Transparent;
+    bgStyle.blurRadius = 0;
+    // 标题栏下面那条泛白/泛灰的整块遮罩就是它：额外遮罩高度清零
+    bgStyle.maskExtraHeight = 0;
+    const origStyle: HdsNavigationTitleBarStyle = {};
+    origStyle.backgroundStyle = bgStyle;
+    style.originalStyle = origStyle;
+    // 标题栏自带的模糊带：彻底关掉，让内容直接从胶囊后面穿过
+    style.blurStrategy = BlurStrategy.DISABLE;
+    // 关键：HDS 标题栏默认开启滚动特效（COMMON_BLUR + 默认底色），滚动后会画出一条
+    // 半透明遮罩带。scrollEffectStyle 未设时用的是系统默认样式，所以必须显式关掉。
+    const eff: ScrollEffectOptions = {};
+    eff.enableScrollEffect = false;
+    style.scrollEffectOpts = eff;
+    // 双保险：即使系统仍走滚动样式，也用同一套透明底色
+    style.scrollEffectStyle = origStyle;
+    // 往下压一点：贴住状态栏会让顶栏看着像被顶到屏幕上沿
+    const opts: HdsNavigationTitleBarOptions = { content: content, style: style };
+    return opts;
+  }
+
+  /** 设备是否支持 HDS 沉浸材质。 */
+  /** 沉浸光感开关：设置里关掉后退回普通底色 */
+  private matOn(): boolean {
+    const v: boolean | undefined = AppStorage.get<boolean>('hdsOn');
+    if (v === false) {
+      return false;
+    }
+    return this.hdsMat();
+  }
+
+  private hdsMat(): boolean {
+    try {
+      const types: hdsMaterial.MaterialType[] = hdsMaterial.getSystemMaterialTypes();
+      return types.indexOf(hdsMaterial.MaterialType.IMMERSIVE) >= 0;
+    } catch (e) {
+      console.info('DSH_HDS probe failed: ' + JSON.stringify(e));
+      return false;
+    }
+  }
+
+  /**
+   * 待发送列表：不再自成一张卡片，而是输入框向上长出来的同材质区域。
+   * 只有上圆角，下沿与输入框连成一体；高度变化写进 pendH，底部留白跟着抬。
+   */
+  @Builder
+  pendListInline() {
+    Column() {
+      List({ space: 0 }) {
+        ForEach(this.pendRows(), (r: PendRow) => {
+          ListItem() {
+            this.pendRowView(r)
+          }
+        }, (r: PendRow) => r.key)
+      }
+      .width('100%')
+      .height(this.pendCardHeight())
+      .scrollBar(BarState.Off)
+      .onItemDragStart((e: ItemDragInfo, index: number) => {
+        const rows: PendRow[] = this.pendRows();
+        this.dragFrom = index;
+        this.dragTitle = index >= 0 && index < rows.length ? rows[index].title : '';
+        Haptics.tap();
+        return this.dragChip;
+      })
+      .onItemDrop((e: ItemDragInfo, itemIndex: number, insertIndex: number, isSuccess: boolean) => {
+        if (!isSuccess || insertIndex < 0) {
+          return;
+        }
+        this.pendMove(itemIndex, insertIndex);
+      })
+    }
+    .width('100%')
+    .padding({ left: 6, right: 6, top: 4, bottom: 2 })
+    // 待发送板比输入框更透：只留一层薄雾，下面的正文要能透出来
+    .backgroundColor(Tokens.isDark ? '#14FFFFFF' : '#3DFFFFFF')
+    .backdropBlur(24)
+    // 单独一块悬浮板：四角都圆，和下面输入框之间留一点缝，不贴边
+    .borderRadius(20)
+    .border({ width: 1, color: Tokens.isDark ? '#33FFFFFF' : '#B3FFFFFF' })
+    .shadow({ radius: 18, color: Tokens.shadow, offsetY: 2 })
+    .margin({ left: 0, right: 0, bottom: 8 })
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      const h: number = Number(newValue.height);
+      if (h > 0 && Math.abs(h - this.pendH) > 2) {
+        this.pendH = h;
+        setTimeout(() => { this.scroller.scrollEdge(Edge.Bottom); }, 40);
+      }
+    })
+  }
+
+  /** 拖动时跟着手指的小卡片 */
+  @Builder
+  dragChip() {
+    Row() {
+      Text(this.dragTitle)
+        .fontSize(13)
+        .fontColor(Tokens.fg)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .constraintSize({ maxWidth: 240 })
+    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+    .backgroundColor(Tokens.surface2)
+    .borderRadius(12)
+    .shadow({ radius: 16, color: '#55000000', offsetY: 6 })
+  }
+
+  @Builder
+  pendRowView(r: PendRow) {
+    Row() {
+      // 六点手柄：长按这里可以上下拖动
+      Column({ space: 2 }) {
+        Row({ space: 2 }) {
+          Circle().width(2).height(2).fill(Tokens.dim2)
+          Circle().width(2).height(2).fill(Tokens.dim2)
+        }
+        Row({ space: 2 }) {
+          Circle().width(2).height(2).fill(Tokens.dim2)
+          Circle().width(2).height(2).fill(Tokens.dim2)
+        }
+        Row({ space: 2 }) {
+          Circle().width(2).height(2).fill(Tokens.dim2)
+          Circle().width(2).height(2).fill(Tokens.dim2)
+        }
+      }
+      .width(16)
+      .height(34)
+      .justifyContent(FlexAlign.Center)
+
+      if (r.thumb !== '') {
+        Image(r.thumb)
+          .width(30)
+          .height(30)
+          .borderRadius(7)
+          .objectFit(ImageFit.Cover)
+          .backgroundColor(Tokens.surface2)
+          .margin({ right: 8 })
+      } else if (r.kind === 'file') {
+        Text('件')
+          .fontSize(10)
+          .fontColor('#FFFFFF')
+          .textAlign(TextAlign.Center)
+          .width(30)
+          .height(30)
+          .borderRadius(7)
+          .backgroundColor(Tokens.accentStrong)
+          .margin({ right: 8 })
+      }
+
+      Column({ space: 2 }) {
+        Text(r.title)
+          .fontSize(13.5)
+          .fontColor(Tokens.fg)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+        if (r.sub !== '') {
+          Text(r.sub)
+            .fontSize(9.5)
+            .fontColor(Tokens.dim2)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      Row({ space: 2 }) {
+        Row({ space: 3 }) {
+          Image($r('app.media.ic_now'))
+            .width(13)
+            .height(13)
+            .fillColor(Tokens.dim)
+          Text(r.kind === 'queue' ? '立即' : '现在发')
+            .fontSize(11.5)
+            .fontColor(Tokens.dim)
+        }
+        .padding({ left: 4, right: 6, top: 6, bottom: 6 })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+        .onClick(() => {
+          this.fireRow(r);
+        })
+
+        if (r.kind === 'queue') {
+          Row() {
+            Image($r('app.media.ic_edit'))
+              .width(17)
+              .height(17)
+              .fillColor(Tokens.dim)
+          }
+          .width(32)
+          .height(36)
+          .justifyContent(FlexAlign.Center)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+          .onClick(() => {
+            this.doQueueEdit(this.queueItems[r.idx]);
+          })
+        }
+
+        Row() {
+          Image($r('app.media.ic_trash'))
+            .width(17)
+            .height(17)
+            .fillColor(Tokens.dim)
+        }
+        .width(32)
+        .height(36)
+        .justifyContent(FlexAlign.Center)
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+        .onClick(() => {
+          this.dropRow(r);
+        })
+      }
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .height(42)
+    .padding({ left: 2, right: 2 })
+    .alignItems(VerticalAlign.Center)
+  }
+
   build() {
-    NavDestination() {
+    HdsNavDestination() {
       Stack({ alignContent: Alignment.Bottom }) {
         // 底色画成栈里的第一层，而不是 NavDestination 的 backgroundColor：
         // NavDestination 自带不透明底色时，子节点的 backgroundEffect 会糊到那层底色上，
@@ -1463,16 +3484,24 @@ export struct ChatPage {
           .backgroundColor(this.themeBg)
           .hitTestBehavior(HitTestMode.None)
 
-        // 顶部一层极淡的蓝光，跟列表页保持同一套沉浸感
-        Row()
+        if (this.loading && this.msgs.length === 0) {
+          Column() {
+            LoadingProgress()
+              .width(46)
+              .height(46)
+              .color(Tokens.accent)
+            Text('正在拉取会话…')
+              .fontSize(12)
+              .fontColor(Tokens.dim)
+              .margin({ top: 10 })
+          }
           .width('100%')
-          .height(220)
-          .linearGradient({
-            angle: 180,
-            colors: [[Tokens.accentGlow, 0.0], ['#00000000', 1.0]]
-          })
-          .position({ x: 0, y: 0 })
+          .height('100%')
+          .justifyContent(FlexAlign.Center)
+          .zIndex(5)
           .hitTestBehavior(HitTestMode.None)
+          .transition(TransitionEffect.OPACITY.animation({ duration: 180 }))
+        }
 
           List({ space: 0, scroller: this.scroller }) {
             // 顶部留白用占位项而不是 padding：padding 会裁掉列表视口，
@@ -1480,7 +3509,7 @@ export struct ChatPage {
             ListItem() {
               Row()
                 .width('100%')
-                .height(104)
+                .height(96)
             }
             if (this.hasMore) {
               ListItem() {
@@ -1518,7 +3547,7 @@ export struct ChatPage {
             ListItem() {
               Row()
                 .width('100%')
-                .height(200 + this.kbH)
+                .height(200 + this.kbH + this.pendH)
             }
           }
           .width('100%')
@@ -1526,28 +3555,38 @@ export struct ChatPage {
           .padding({ left: 14, right: 14 })
           .scrollBar(BarState.Off)
           .edgeEffect(EdgeEffect.Spring)
-
-        // 顶栏做成浮层压在列表上：系统材质的标题栏拿不到浮动效果，
-        // 这里保留自绘胶囊，用原生背景模糊给它一块跟着应用主题走的玻璃底。
-        Column() {
-          Column() {
-            this.headerBar()
-          }
-          .width('100%')
-          .padding({ top: 46, bottom: 8 })
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: this.themeDark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT
+          .onScroll(() => {
+            try {
+              this.atBottom = this.scroller.isAtEnd();
+            } catch (e) {
+              this.atBottom = true;
+            }
           })
-          .hitTestBehavior(HitTestMode.Transparent)
-        }
-        .width('100%')
-        .height('100%')
-        .justifyContent(FlexAlign.Start)
-        .hitTestBehavior(HitTestMode.Transparent)
 
+          .hitTestBehavior(HitTestMode.Transparent)
+
+
+          // 顶栏透明（HDS 的滚动模糊被关掉），内容滚上来会和状态栏文字叠在一起，
+          // 这里用一层同色渐变压淡顶部，并且不吃点击。
+          Column()
+            .width('100%')
+            .height(120)
+            .linearGradient({ angle: 180, colors: [[this.themeBg, 0.0], [this.themeBg, 0.55], ['#00' + this.themeBg.slice(1), 1.0]] })
+            .hitTestBehavior(HitTestMode.None)
+            .position({ x: 0, y: 0 })
 
           // 底部：玻璃胶囊条 + 输入行 + 免责声明
-          Column() {
+          Stack({ alignContent: Alignment.Bottom }) {
+            // 待发送板与输入框是半透明的，底下正文太花会看不清：
+            // 贴一层由下往上收的底色，靠下越实，上缘完全透明。
+            Row()
+              .width('100%')
+              .height(this.pendH + 230 + this.kbH)
+              .linearGradient({
+                angle: 180,
+                colors: [['#00' + this.themeBg.slice(1), 0.0], [this.themeBg, 0.72], [this.themeBg, 1.0]]
+              })
+              .hitTestBehavior(HitTestMode.None)
             Column() {
             if (this.err !== '' || this.toast !== '') {
               Text(this.err !== '' ? this.err : this.toast)
@@ -1559,214 +3598,377 @@ export struct ChatPage {
                 .padding({ left: 4, bottom: 6 })
             }
 
-            // 停泊区：生成中点发送先落在这里，可改、可删、可插队
-            if (this.dock.length > 0) {
-              Column({ space: 6 }) {
-                ForEach(this.dock, (it: DockItem) => {
-                  Column() {
-                    Row() {
-                      Text('待发送')
-                        .fontSize(10)
-                        .fontColor(Tokens.accent)
-                        .backgroundColor(Tokens.accentSoft)
-                        .borderRadius(6)
-                        .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                      Blank()
-                      Text('插队')
-                        .fontSize(11)
-                        .fontColor(Tokens.accent)
-                        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-                        .borderRadius(8)
-                        .onClick(() => {
-                          this.jumpDock(it);
-                        })
-                      Text('×')
-                        .fontSize(14)
-                        .fontColor(Tokens.dim)
-                        .padding({ left: 8, right: 2, top: 2, bottom: 2 })
-                        .onClick(() => {
-                          this.dropDock(it.id);
-                        })
-                    }
-                    .width('100%')
-
-                    Text(it.text)
-                      .fontSize(13)
-                      .fontColor(Tokens.fg)
-                      .maxLines(3)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                      .width('100%')
-                      .margin({ top: 2 })
-                      .onClick(() => {
-                        this.editDock(it);
-                      })
-                  }
-                  .alignItems(HorizontalAlign.Start)
-                  .padding({ left: 10, right: 8, top: 7, bottom: 8 })
-                  .backgroundColor(Tokens.glassBar)
-                  .borderRadius(14)
-                  .border({ width: 1, color: Tokens.glassLine })
-                }, (it: DockItem) => 'dk' + it.id)
-              }
-              .width('100%')
-              .margin({ bottom: 8 })
-            }
-
-            // 待发送附件：选好的图片/文件挂在这里，点 × 可以摘掉
-            if (this.hasPend()) {
-              Scroll() {
-                Row({ space: 8 }) {
-                  ForEach(this.pendImgs, (it: ImagePart, i: number) => {
-                    Row() {
-                      Text(it.name !== '' ? it.name : ('图片 ' + String(i + 1)))
-                        .fontSize(11)
-                        .fontColor(Tokens.fg)
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                        .constraintSize({ maxWidth: 132 })
-                      Text('×')
-                        .fontSize(13)
-                        .fontColor(Tokens.dim)
-                        .margin({ left: 6 })
-                    }
-                    .padding({ left: 10, right: 9, top: 6, bottom: 6 })
-                    .backgroundColor(Tokens.glassBar)
-                    .borderRadius(14)
-                    .border({ width: 1, color: Tokens.glassLine })
-                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
-                    .onClick(() => {
-                      this.dropImg(i);
-                    })
-                  }, (it: ImagePart, i: number) => 'i' + String(i) + it.name)
-                  ForEach(this.pendFiles, (it: FilePart, i: number) => {
-                    Row() {
-                      Text(it.name)
-                        .fontSize(11)
-                        .fontColor(Tokens.fg)
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                        .constraintSize({ maxWidth: 132 })
-                      Text('×')
-                        .fontSize(13)
-                        .fontColor(Tokens.dim)
-                        .margin({ left: 6 })
-                    }
-                    .padding({ left: 10, right: 9, top: 6, bottom: 6 })
-                    .backgroundColor(Tokens.glassBar)
-                    .borderRadius(14)
-                    .border({ width: 1, color: Tokens.glassLine })
-                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
-                    .onClick(() => {
-                      this.dropFile(i);
-                    })
-                  }, (it: FilePart, i: number) => 'f' + String(i) + it.name)
-                }
-              }
-              .scrollable(ScrollDirection.Horizontal)
-              .scrollBar(BarState.Off)
-              .width('100%')
-              .margin({ bottom: 8 })
-            }
-
-
+            // 电脑端队列：这些是真正在宿主里排着的，本轮结束后由电脑自动发出
+            if (this.asks.length > 0) {
+          Column({ space: 6 }) {
+            ForEach(this.asks, (a: PendingAsk) => {
+              this.askCard(a, a.questions[this.askIndex(a)])
+            }, (a: PendingAsk) => a.callId + '-' + String(this.askIndex(a)))
+          }
+          .width('100%')
+          .margin({ bottom: 8 })
+        }
+        // 重启/中断把宿主的队列丢了：本地影子在这里兜底，一键重发
+        if (this.rescue.length > 0) {
+          Column({ space: 6 }) {
             Row() {
-              Text('＋')
-                .fontSize(18)
-                .fontColor(Tokens.dim)
-                .width(34)
-                .height(34)
-                .textAlign(TextAlign.Center)
-                .borderRadius(999)
+              Text('未发出 ' + String(this.rescue.length))
+                .fontSize(10)
+                .fontColor(Tokens.err)
                 .backgroundColor(Tokens.surface3)
-                .margin({ right: 6 })
+                .borderRadius(8)
+                .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+              Text(this.rescue[0].text !== '' ? this.rescue[0].text : '（图片消息）')
+                .fontSize(12)
+                .fontColor(Tokens.dim)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+                .margin({ left: 8 })
+              Text(this.rescueBusy ? '重发中' : '重发')
+                .fontSize(12)
+                .fontColor(Tokens.accent)
+                .padding({ left: 10, right: 8, top: 2, bottom: 2 })
                 .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
                 .onClick(() => {
-                  this.pickAttach();
+                  this.resendRescue();
                 })
-              TextInput({ placeholder: '发消息或问点什么…', text: this.draft })
-                .placeholderColor(Tokens.dim2)
-                .fontColor(Tokens.fg)
-                .fontSize(15)
-                .height(40)
-                .backgroundColor(Color.Transparent)
-                .layoutWeight(1)
-                .onChange((v: string) => {
-                  this.draft = v;
+              Text('忽略')
+                .fontSize(12)
+                .fontColor(Tokens.dim)
+                .padding({ left: 4, right: 4, top: 2, bottom: 2 })
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                .onClick(() => {
+                  this.dismissRescue();
                 })
-                .onSubmit(() => this.send())
-              if (this.running) {
-                // 正在生成时，发送键变成停止键——手机上不该为了停一轮去翻菜单。
-                Text('■')
-                  .fontSize(13)
-                  .fontColor(Tokens.fg)
-                  .width(36)
-                  .height(36)
-                  .textAlign(TextAlign.Center)
-                  .backgroundColor(Tokens.surface3)
-                  .borderRadius(999)
-                  .margin({ left: 8 })
-                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-                  .onClick(() => this.doStop())
-              } else {
-                Text(this.sending ? '···' : '↑')
-                  .fontSize(16)
-                  .fontColor(Tokens.accentInk)
-                  .width(36)
-                  .height(36)
-                  .textAlign(TextAlign.Center)
-                  .backgroundColor(this.draft.trim() === '' && !this.hasPend() ? Tokens.surface3 : Tokens.accent)
-                  .borderRadius(999)
-                  .margin({ left: 8 })
-                  .shadow({
-                    radius: this.draft.trim() === '' && !this.hasPend() ? 0 : 16,
-                    color: Tokens.accentSoft,
-                    offsetY: 4
-                  })
-                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-                  .onClick(() => this.send())
-              }
             }
             .width('100%')
-            .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-            .backgroundColor(Tokens.glassBar)
-            .borderRadius(28)
-            .border({ width: 1, color: Tokens.glassLine })
-            .shadow({ radius: 20, color: Tokens.shadow, offsetY: 6 })
-
-            Text('内容由 AI 生成，请仔细甄别')
-              .fontSize(10)
-              .fontColor(Tokens.dim2)
+            .padding({ left: 12, right: 10, top: 8, bottom: 8 })
+            .backgroundColor(Tokens.surface2)
+            .borderRadius(14)
+            Text('这一轮被中断（多半是电脑端重启），这几条还留在手机上，重发会按原顺序再发一遍。')
+              .fontSize(10.5)
+              .fontColor(Tokens.dim)
               .width('100%')
-              .textAlign(TextAlign.Center)
-              .margin({ top: 9, bottom: 2 })
+              .padding({ left: 4 })
+          }
+          .width('100%')
+          .margin({ bottom: 8 })
+        }
+
+
+
+            // 候选板：垫在输入框下面，下部被输入框盖住
+            if (this.pendFiles.length + this.queueItems.length > 0) {
+              this.pendListInline()
+            }
+
+            Column() {
+              // 选好的图片直接贴在输入框上方：输入区随之往上撑，点图看大图，左上角叉掉
+              if (this.pendImgs.length > 0) {
+                Scroll() {
+                  Row({ space: 10 }) {
+                    ForEach(this.pendImgs, (it: ImagePart, i: number) => {
+                      Stack({ alignContent: Alignment.TopStart }) {
+                        Image('data:' + it.mediaType + ';base64,' + it.data)
+                          .width(72)
+                          .height(72)
+                          .borderRadius(12)
+                          .objectFit(ImageFit.Cover)
+                          .backgroundColor(Tokens.surface2)
+                          .onClick(() => {
+                            Haptics.tap();
+                            this.bigImg = 'data:' + it.mediaType + ';base64,' + it.data;
+                          })
+                        Row() {
+                          Image($r('app.media.ic_close'))
+                            .width(9)
+                            .height(9)
+                            .fillColor('#FFFFFF')
+                        }
+                        .width(20)
+                        .height(20)
+                        .borderRadius(10)
+                        .backgroundColor('#99000000')
+                        .justifyContent(FlexAlign.Center)
+                        .offset({ x: -6, y: -6 })
+                        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                        .onClick(() => {
+                          Haptics.tap();
+                          this.pendImgs.splice(i, 1);
+                          this.pendImgs = this.pendImgs.slice();
+                        })
+                      }
+                    }, (it: ImagePart, i: number) => 'pi' + String(i) + it.name)
+                  }
+                  .padding({ left: 10, right: 10 })
+                }
+                .scrollable(ScrollDirection.Horizontal)
+                .scrollBar(BarState.Off)
+                .width('100%')
+                .height(84)
+                .padding({ top: 8, bottom: 2 })
+              }
+
+              Row() {
+                // 多行：默认一行，输入多了自动长高，最多三行
+                TextArea({ placeholder: '发消息或问点什么…', text: this.draft })
+                  .placeholderColor(Tokens.dim2)
+                  .fontColor(Tokens.fg)
+                  .fontSize(15)
+                  .padding({ left: 12, right: 4, top: 12, bottom: 12 })
+                  .backgroundColor(Color.Transparent)
+                  .layoutWeight(1)
+                  .constraintSize({ minHeight: 46, maxHeight: 112 })
+                  .maxLines(3)
+                  .enterKeyType(EnterKeyType.Send)
+                  .onChange((v: string) => {
+                    this.draft = v;
+                    Drafts.set(this.param.id, v);
+                  })
+                  .onSubmit(() => {
+                    this.send();
+                  })
+                Row() {
+                  Image($r('app.media.ic_expand'))
+                    .width(18)
+                    .height(18)
+                    .fillColor(Tokens.dim)
+                    .draggable(false)
+                }
+                .width(40)
+                .height(40)
+                .justifyContent(FlexAlign.Center)
+                .margin({ left: 2, right: 6 })
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                .accessibilityText('展开编辑')
+                .onClick(() => {
+                  Haptics.tap();
+                  this.bigEditOn = true;
+                })
+              }
+              .width('100%')
+
+              if (this.attachOn) {
+                Row({ space: 8 }) {
+                  this.attachChip('拍照', (): void => {
+                    this.attachOn = false;
+                    this.pickCamera();
+                  })
+                  this.attachChip('照片', (): void => {
+                    this.attachOn = false;
+                    this.pickAttach();
+                  })
+                  this.attachChip('本地文件', (): void => {
+                    this.attachOn = false;
+                    this.pickAttachFile();
+                  })
+                }
+                .width('100%')
+                .justifyContent(FlexAlign.Center)
+                .padding({ left: 10, right: 10, top: 2 })
+                .margin({ bottom: 10 })
+
+              }
+
+              Row() {
+                this.usageRing()
+                Stack() {
+                  Image($r('app.media.ic_goal'))
+                    .width(17)
+                    .height(17)
+                    .fillColor(Tokens.dim)
+                }
+                .width(30)
+                .height(30)
+                .margin({ left: 8 })
+                .borderRadius(999)
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                .onClick(() => {
+                  Haptics.tap();
+                  this.openGoal();
+                })
+                .bindSheet($$this.goalOn, this.goalBody(), {
+                  height: '46%',
+                  dragBar: true,
+                  showClose: false,
+                  backgroundColor: Tokens.sheetWarm,
+                  blurStyle: BlurStyle.COMPONENT_THICK,
+                  maskColor: '#33000000',
+                  onDisappear: () => {
+                    this.goalEdit = false;
+                  }
+                })
+                Blank()
+                Text('＋')
+                  .fontSize(19)
+                  .fontColor(Tokens.dim)
+                  .width(36)
+                  .height(36)
+                  .textAlign(TextAlign.Center)
+                  .borderRadius(999)
+                  .backgroundColor(Color.Transparent)
+                  .margin({ left: 8 })
+                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                  .onClick(() => {
+                    Haptics.tap();
+                    this.attachOn = !this.attachOn;
+                  })
+                if (this.running && (this.draft.trim() !== '' || this.hasPend())) {
+                  Text('排队')
+                    .fontSize(12)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor('#FFFFFF')
+                    .padding({ left: 13, right: 13, top: 7, bottom: 7 })
+                    .backgroundColor(Tokens.accent)
+                    .borderRadius(999)
+                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                    .margin({ left: 8 })
+                    .onClick(() => {
+                      Haptics.tap();
+                      this.send(false);
+                    })
+                  Text('插队')
+                    .fontSize(12)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor('#FFFFFF')
+                    .padding({ left: 13, right: 13, top: 7, bottom: 7 })
+                    .backgroundColor(Tokens.err)
+                    .borderRadius(999)
+                    .shadow({ radius: 12, color: '#4DD4380D', offsetY: 2 })
+                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                    .margin({ left: 8 })
+                    .onClick(() => {
+                      Haptics.tap();
+                      this.send(true);
+                    })
+                }
+                if (this.running && this.draft.trim() === '' && !this.hasPend()) {
+                  // 正在生成时，发送键变成停止键——手机上不该为了停一轮去翻菜单。
+                  Text('■')
+                    .fontSize(13)
+                    .fontColor(Tokens.fg)
+                    .width(38)
+                    .height(38)
+                    .textAlign(TextAlign.Center)
+                    .backgroundColor(Color.Transparent)
+                    .borderRadius(999)
+                    .margin({ left: 14 })
+                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                    .onClick(() => this.doStop())
+                } else if (!this.running) {
+                  Text(this.sending ? '···' : '↑')
+                    .fontSize(this.draft.trim() === '' && !this.hasPend() ? 18 : 20)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor(this.draft.trim() === '' && !this.hasPend() ? Tokens.dim2 : '#FFFFFF')
+                    .width(38)
+                    .height(38)
+                    .textAlign(TextAlign.Center)
+                    .backgroundColor(this.draft.trim() === '' && !this.hasPend() ? Color.Transparent : Tokens.accent)
+                    .borderRadius(999)
+                    .shadow(this.draft.trim() === '' && !this.hasPend()
+                      ? { radius: 0, color: Color.Transparent }
+                      : { radius: 14, color: Tokens.accentGlow, offsetY: 3 })
+                    .animation({ duration: 180, curve: Curve.EaseOut })
+                    .margin({ left: 10 })
+                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                    .onClick(() => this.send())
+                }
+              }
+              .width('100%')
+              .padding({ left: 8, right: 8, top: 2, bottom: 2 })
             }
             .width('100%')
-            .padding({ left: 12, right: 12, top: 14, bottom: 18 })
-            .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-              colorMode: this.themeDark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT
-            })
+            .padding({ top: 6, bottom: 6 })
+            .backgroundColor(Tokens.glassFloat)
+            .backdropBlur(18)
+            // 永远是完整的悬浮圆角矩形：候选板不参与造形，另成一块
+            .borderRadius(24)
+            .border({ width: 1, color: Tokens.isDark ? '#59FFFFFF' : '#F2FFFFFF' })
+            .shadow({ radius: 26, color: Tokens.shadow, offsetY: 6 })
+
+            }
+            .width('100%')
+            .padding({ left: 20, right: 20, top: 12, bottom: 26 + this.kbH })
           }
           .width('100%')
           .height('100%')
-          .justifyContent(FlexAlign.End)
-          .padding({ bottom: this.kbH })
           .hitTestBehavior(HitTestMode.Transparent)
 
 
-        if (this.modelOn) {
-          this.modelSheet()
+        if (!this.atBottom && !this.queueOpen && this.pendingTotal() === 0) {
+          Stack() {
+            Image($r('app.media.ic_down'))
+              .width(17)
+              .height(17)
+              .fillColor(Tokens.fg)
+              .draggable(false)
+          }
+          .width(42)
+          .height(42)
+          .borderRadius(999)
+          .backgroundColor(Tokens.glassFloat)
+          .backdropBlur(18)
+          .border({ width: 1, color: Tokens.glassTop })
+          .shadow({ radius: 18, color: Tokens.shadow, offsetY: 6 })
+          .position({ right: 18, bottom: this.kbH + 132 + this.pendH })
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          .transition(TransitionEffect.OPACITY.animation({ duration: 160 }))
+          .onClick(() => {
+            Haptics.tap();
+            this.scroller.scrollEdge(Edge.Bottom);
+            this.atBottom = true;
+          })
         }
-        if (this.statsOn) {
-          this.statsSheet()
+
+        if (this.renaming) {
+          this.renameDialog()
         }
-        if (this.moreOn) {
-          this.moreSheet()
+        if (this.extrasMode !== '') {
+          ExtrasPanel({
+            mode: this.extrasMode,
+            sessionId: this.param.id,
+            api: this.api,
+            onExit: () => {
+              this.extrasMode = '';
+            }
+          })
+        }
+        if (this.bigEditOn) {
+          this.bigEditor()
         }
       }
       .width('100%')
       .height('100%')
     }
-    .hideTitleBar(true)
+    // 打开三块面板时藏掉聊天页标题栏：面板自带返回键，两个返回键会打架
+    .hideTitleBar(this.bigEditOn || this.extrasMode !== '')
+    .titleBar(this.hdsTitle())
+    .padding({ top: 0 })
+    .padding({ top: 0 })
+    .onBackPressed(() => {
+      // 面板打开时，返回键先关面板，而不是退出到会话列表
+      if (this.extrasMode !== '') {
+        this.extrasMode = '';
+        return true;
+      }
+      if (this.menuOn) {
+        this.menuOn = false;
+        return true;
+      }
+      if (this.modelOn || this.statsOn || this.moreOn) {
+        this.shutSheet();
+        this.moreOn = false;
+        return true;
+      }
+      if (this.bigEditOn) {
+        this.bigEditOn = false;
+        return true;
+      }
+      return false;
+    })
+    .hideBackButton(true)
+    .bindToScrollable([this.scroller])
     .backgroundColor(this.themeBg)
     .mode(NavDestinationMode.STANDARD)
     .onReady((context: NavDestinationContext) => {
@@ -1780,3 +3982,5 @@ export struct ChatPage {
     .scale({ x: this.fxSc, y: this.fxSc })
   }
 }
+
+

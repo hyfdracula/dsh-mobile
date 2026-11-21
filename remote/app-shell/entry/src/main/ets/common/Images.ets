@@ -82,3 +82,15 @@ export async function pickImages(limit: number): Promise<ImagePart[]> {
   }
   return out;
 }
+
+/** Turn already-granted uris (e.g. from the camera picker) into image parts. */
+export function fromUris(uris: string[]): ImagePart[] {
+  const out: ImagePart[] = [];
+  for (const uri of uris) {
+    const part = readOne(uri);
+    if (part !== undefined) {
+      out.push(part);
+    }
+  }
+  return out;
+}

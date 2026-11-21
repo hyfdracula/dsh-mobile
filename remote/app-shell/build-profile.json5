@@ -1,4 +1,4 @@
-﻿{
+{
   "app": {
     "products": [
       {
@@ -18,6 +18,8 @@
       { "name": "debug" },
       { "name": "release" }
     ],
+    // 本仓库不带任何签名材料：用 DevEco Studio 的「自动生成签名」或你自己的证书，
+    // 生成后这里会写入本机的 signingConfigs（该行已被 .gitignore 保护，勿提交）。
     "signingConfigs": []
   },
   "modules": [

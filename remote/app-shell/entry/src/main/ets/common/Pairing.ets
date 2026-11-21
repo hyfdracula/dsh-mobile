@@ -47,7 +47,7 @@ interface CodeBody {
 }
 
 export class Pairing {
-  /** 补协议、去尾斜杠：用户手输 "192.168.1.10:8901" 也能连。 */
+  /** 补协议、去尾斜杠：用户手输 "192.168.1.3:8901" 也能连。 */
   static normalizeBase(input: string): string {
     let b = input.trim();
     if (b === '') {

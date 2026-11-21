@@ -1,4 +1,4 @@
-﻿import common from '@ohos.app.ability.common';
+import common from '@ohos.app.ability.common';
 import pasteboard from '@ohos.pasteboard';
 import scanBarcode from '@hms.core.scan.scanBarcode';
 import { Api } from '../common/Api';
@@ -115,27 +115,26 @@ export struct PairPage {
   @Builder
   backRow(title: string) {
     Row() {
-      Text('‹')
-        .fontSize(26)
-        .fontColor(Tokens.fg)
-        .width(40)
-        .textAlign(TextAlign.Start)
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-        .onClick(() => {
-          Haptics.soft();
-          this.onExit();
-        })
-      Column() {
-        Text('设置')
-          .fontSize(11)
-          .fontColor(Tokens.dim2)
-        Text(title)
-          .fontSize(19)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Tokens.fg)
-          .margin({ top: 1 })
+      Stack() {
+        Image($r('app.media.ic_back'))
+          .width(21)
+          .height(21)
+          .fillColor(Tokens.fg)
+          .objectFit(ImageFit.Contain)
       }
-      .alignItems(HorizontalAlign.Start)
+      .width(40)
+      .height(40)
+      .borderRadius(999)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+      .onClick(() => {
+        Haptics.soft();
+        this.onExit();
+      })
+      Text(title)
+        .fontSize(19)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.fg)
+        .margin({ left: 2 })
       Blank()
     }
     .width('100%')
@@ -505,7 +504,8 @@ export struct PairPage {
 
       Text('· 手机和电脑连的是同一个 WiFi（别用手机流量）；同一 WiFi 也可能互相隔离\n' +
         '· 电脑 DSH 需常驻，配对码 15 分钟过期，重新看一一眼面板\n' +
-        '· 异地首次配对：需要先在电脑端插件面板打开「允许异地配对」')
+        '· 异地首次配对：需要先在电脑端插件面板打开「允许异地配对」\n' +
+        '· 想在家门外也能用：配对完进 设置 → 连接，里面写了怎么开隧道')
         .fontSize(11)
         .fontColor(Tokens.dim2)
         .lineHeight(18)

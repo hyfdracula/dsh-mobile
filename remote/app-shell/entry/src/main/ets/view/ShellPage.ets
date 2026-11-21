@@ -1,11 +1,13 @@
-﻿import curves from '@ohos.curves';
+import curves from '@ohos.curves';
 import uiMaterial from '@ohos.arkui.uiMaterial';
+import { HdsBarWidthRangeOptions, HdsTabs, HdsTabsController, HdsTabsFloatingStyle, SystemMaterialParams, hdsMaterial } from '@kit.UIDesignKit';
 import { Api } from '../common/Api';
 import { Mat } from '../common/Mat';
 import { Tokens } from '../common/Tokens';
 import { Haptics } from '../common/Haptics';
 import { NavFx, NavFxSink } from '../common/NavFx';
 import { Notifier } from '../common/Notifier';
+import { Marks } from '../common/Marks';
 import { SessionList } from './SessionList';
 import { SettingsPage } from './SettingsPage';
 
@@ -20,20 +22,30 @@ export struct ShellPage {
   token0: string = '';
   themeMode: string = 'auto';
   systemDark: boolean = true;
-  forceWan: boolean = false;
+  @Prop forceWan: boolean = false;
+  /** 设置 → 连接：「自动切换局域网」，默认开（@Prop：等 loadCfg 读到存储值后要能刷新） */
+  @Prop autoLan: boolean = true;
   haptics: boolean = true;
+  @StorageLink('hdsOn') hdsOn: boolean = true;
   defaultLan: string = '';
   onReset: () => void = () => {};
   onSave: (b: string, t: string) => void = () => {};
   onSaveLan: (b: string, t: string, lan: string[]) => void = () => {};
   onTheme: (m: string) => void = () => {};
   onWan: (v: boolean) => void = () => {};
+  onAutoLan: (v: boolean) => void = () => {};
   onHaptics: (v: boolean) => void = () => {};
+  onHds: (v: boolean) => void = () => {};
   @State private idx: number = 0;
   @State private pressIdx: number = -1;
   // 列表页开了重命名弹窗时把底栏收掉，弹窗和蒙层才能盖全屏
   @StorageLink('sheetOpen') sheetOpen: boolean = false;
-  private tc: TabsController = new TabsController();
+  /**
+   * 设置页二级页们开着时底部光感菜单要消失：
+   * 用户要求它只存在于首页与设置页一级。
+   */
+  @StorageLink('settingsSub') settingsSub: string = '';
+  private tc: HdsTabsController = new HdsTabsController();
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
   /** 转场状态：首页没有 navDestinationId，用 NavFx.HOME 注册给 Navigation 驱动。 */
   @State private fxTx: string = '0%';
@@ -47,6 +59,14 @@ export struct ShellPage {
   private watching: Map<string, string> = new Map<string, string>();
   private watchTimer: number = 0;
   private watchBusy: boolean = false;
+  // 回前台立刻补扫一次：后台被冻结期间可能有回合跑完，靠这一次把漏掉的补上
+  @StorageLink('fgProbe') @Watch('onForegroundProbe') fgProbe: number = 0;
+
+  private onForegroundProbe(): void {
+    this.scanSessions(false);
+    this.checkWatching();
+  }
+
   private tickN: number = 0;
 
   aboutToAppear(): void {
@@ -102,12 +122,20 @@ export struct ShellPage {
         if (changed) {
           changedN++;
         }
-        if (!baseline && changed && row.id !== open) {
+        if (row.running === true) {
+          // 又开始跑了：旧的结果标记作废，卡片回到「进行中」
+          Marks.clear(row.id);
+        }
+        if (!baseline && changed) {
           const title: string = row.title !== '' ? row.title : '未命名会话';
           if (row.running === true) {
             this.watching.set(row.id, title);
           } else {
-            this.notifyDone(row.id, title);
+            // 用户正开着的会话不上色：他就在里面看着，回列表时不该再亮一次
+            if (row.id !== open) {
+              this.markOutcome(row.id);
+              this.notifyDone(row.id, title);
+            }
           }
         }
         this.lastSeen.set(row.id, row.updatedAt);
@@ -140,13 +168,37 @@ export struct ShellPage {
             title = t;
           }
           this.watching.delete(id);
+          // 正在看的会话不给它上色（用户已经在里面看过了）
           if (this.openId() !== id) {
+            this.markOutcome(id);
             this.notifyDone(id, title !== '' ? title : '会话');
           }
         }
       } catch (e) {
         this.watching.delete(id);
       }
+    }
+  }
+
+  /**
+   * 判断这一轮是「完成」还是「中断」，记到 Marks 里给列表卡片上色。
+   * 宿主没有 interrupted 状态：末条是 user 说明这一轮没等到回复就停了（被中断），
+   * 末条是 assistant 才算真的完成。
+   */
+  private async markOutcome(id: string): Promise<void> {
+    try {
+      const r = await this.api.messages(id, 1);
+      // 宿主的 turn/end 会写 reason.kind：completed 才算完成，
+      // aborted / interrupted / error / max-tokens / blocked 都算中断。
+      const kind: string = r.lastTurn === undefined ? '' : r.lastTurn;
+      if (kind === '') {
+        return;
+      }
+      const s: string = kind === 'completed' ? 'done' : 'interrupted';
+      Marks.set(id, s);
+      console.info('DSH_MARK session=' + id + ' turn=' + kind + ' -> ' + s);
+    } catch (e) {
+      console.info('DSH_MARK failed session=' + id);
     }
   }
 
@@ -223,6 +275,37 @@ export struct ShellPage {
    * 只在 Navigation/NavDestination 标题栏与 Tabs 底部 TabBar 里生效，所以底栏必须走 Tabs
    * 自己的 tabBar，自绘浮层再漂亮也拿不到。设备不支持时退回空材质，外观与之前一致。
    */
+  /** 底部浮岛样式：HDS 能上系统材质就上，不能就只留形状。 */
+  private floatStyle(): HdsTabsFloatingStyle {
+    // 浮岛宽度按屏幕算：320vp 是这套图上的可用宽度，留 16vp 边距。
+    const w: HdsBarWidthRangeOptions = { smallWidth: 288, mediumWidth: 288, largeWidth: 288 };
+    const style: HdsTabsFloatingStyle = { barWidth: w, barBottomMargin: 18 };
+    if (this.hdsReady()) {
+      // 类型与档位都交给系统自适应：跟随设备算力与用户的光感档位设置
+      const mat: SystemMaterialParams = {
+        materialType: hdsMaterial.MaterialType.IMMERSIVE,
+        materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE
+      };
+      style.systemMaterialEffect = mat;
+    }
+    return style;
+  }
+
+  /** HDS 沉浸光感可用性：设置里的开关开着，且设备声明支持 IMMERSIVE。 */
+  private hdsReady(): boolean {
+    const v: boolean | undefined = AppStorage.get<boolean>('hdsOn');
+    if (v === false) {
+      return false;
+    }
+    try {
+      const types: hdsMaterial.MaterialType[] = hdsMaterial.getSystemMaterialTypes();
+      return types.indexOf(hdsMaterial.MaterialType.IMMERSIVE) >= 0;
+    } catch (e) {
+      console.info('DSH_HDS probe failed: ' + JSON.stringify(e));
+      return false;
+    }
+  }
+
   private mat(): uiMaterial.Material {
     return Mat.bar();
   }
@@ -236,15 +319,7 @@ export struct ShellPage {
   @Builder
   tabPill(i: number, label: string) {
     Stack() {
-      // 按压高亮：白色一层，跟 QQ/微信那样，不用蓝底
-      if (this.pressIdx === i) {
-        Row()
-          .width('100%')
-          .height('100%')
-          .borderRadius(18)
-          .backgroundColor('#26FFFFFF')
-          .hitTestBehavior(HitTestMode.None)
-      }
+      // 按压只做缩放，不铺任何底色块
       Column() {
         if (i === 0) {
           this.iconChat(this.idx === 0)
@@ -270,7 +345,6 @@ export struct ShellPage {
     .width('100%')
     .height('100%')
     .padding({ left: 6, right: 6, top: 6, bottom: 6 })
-    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
     .onTouch((e: TouchEvent) => {
       if (e.type === TouchType.Down) this.pressIdx = i;
       else if (e.type === TouchType.Up || e.type === TouchType.Cancel) this.pressIdx = -1;
@@ -298,7 +372,7 @@ export struct ShellPage {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
-      Tabs({ barPosition: BarPosition.End, index: this.idx, controller: this.tc }) {
+      HdsTabs({ controller: this.tc }) {
         TabContent() {
           SessionList({ api: this.api })
         }
@@ -312,7 +386,9 @@ export struct ShellPage {
             themeMode: this.themeMode,
             systemDark: this.systemDark,
             forceWan: this.forceWan,
+            autoLan: this.autoLan,
             haptics: this.haptics,
+            hdsOn: this.hdsOn,
             defaultLan: this.defaultLan,
             onReset: () => {
               this.onReset();
@@ -329,28 +405,33 @@ export struct ShellPage {
             onWan: (v: boolean) => {
               this.onWan(v);
             },
+            onAutoLan: (v: boolean) => {
+              this.onAutoLan(v);
+            },
             onHaptics: (v: boolean) => {
               this.onHaptics(v);
+            },
+            onHds: (v: boolean) => {
+              this.onHds(v);
             }
           })
         }
         .tabBar(this.tabPill(1, '设置'))
       }
-      .barHeight(this.sheetOpen ? 0 : 64)
-      .barFloatingStyle({
-        // 浮岛宽度按屏幕算：320vp 是这套图上的可用宽度，留 16vp 边距。
-        barWidth: { smallBarWidth: 288, mediumBarWidth: 288, largeBarWidth: 288 },
-        barBottomMargin: 18,
-        systemMaterial: this.mat()
-      })
+      .barHeight(this.sheetOpen || this.settingsSub !== '' ? 0 : 64)
+      .barFloatingStyle(this.floatStyle())
       .barMode(BarMode.Fixed)
+      .barPosition(BarPosition.End)
+      .vertical(false)
       // 内容从底栏背后穿过去，材质才有东西可以折射
       .barOverlap(true)
-      .barBackgroundColor(Color.Transparent)
-      .barBackgroundBlurStyle(BlurStyle.NONE)
+      // 有 HDS 材质时底栏透明，材质自己画底板；没有材质就补一块玻璃底，
+      // 否则内容从底栏背后穿过去时图标和文字没有对比度。
+      .barBackgroundColor(this.hdsReady() ? Color.Transparent : Tokens.glassBar)
+      .barBackgroundBlurStyle(this.hdsReady() ? BlurStyle.NONE : BlurStyle.COMPONENT_THICK)
       .scrollable(false)
       .animationDuration(0)
-      .divider({ strokeWidth: 0 })
+      // 浮岛本身不画分隔线，HdsTabs 的 divider 交给默认值
       .onChange((i: number) => {
         this.idx = i;
         // 切走设置页时把二级页状态清掉，否则按返回键会被隐藏的设置页吞掉

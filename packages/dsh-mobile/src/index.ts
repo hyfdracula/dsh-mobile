@@ -30,11 +30,11 @@
  */
 
 import { randomBytes, randomInt, timingSafeEqual } from 'node:crypto'
-import { chmodSync, closeSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { networkInterfaces, homedir, hostname } from 'node:os'
-import { dirname, extname, join, normalize } from 'node:path'
+import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as zlib from 'node:zlib'
 
@@ -108,10 +108,19 @@ export interface PairPrefs {
   publicUrl: string
 }
 
+/**
+ * Who answers `ask_user_question`: the phone while it is present (`phone`, the
+ * default) or always the desktop (`desktop`). Persisted next to the token so the
+ * choice survives a host restart.
+ */
+type AnswerMode = 'phone' | 'desktop'
+
 /** Persisted state: the bearer token plus the pairing preferences. */
 interface MobileState {
   token: string
   pair?: Partial<PairPrefs>
+  /** `phone` (default) or `desktop`; anything else reads as the default. */
+  answerMode?: AnswerMode
 }
 
 const statePath = (): string => join(dshHome(), 'dsh-mobile.json')
@@ -127,16 +136,34 @@ function readState(): Partial<MobileState> {
   }
 }
 
-/** Merge a patch into the persisted state, keeping the file 0600. */
-function writeState(patch: Partial<MobileState>): void {
+/**
+ * Merge a patch into the persisted state, keeping the file 0600.
+ *
+ * Written to a sibling temp file and renamed into place: a failed write leaves
+ * the previous file (and the token in it) intact instead of truncated.
+ * @param patch - fields to merge over whatever is on disk (the token survives).
+ * @param onError - told about a failed write so the caller can log it.
+ * @returns false when the write failed; the process keeps serving either way.
+ */
+function writeState(patch: Partial<MobileState>, onError?: (error: unknown) => void): boolean {
   const file = statePath()
   const next: Partial<MobileState> = { ...readState(), ...patch }
+  const temp = `${file}.${String(process.pid)}.tmp`
   try {
     mkdirSync(dirname(file), { recursive: true })
-    writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+    writeFileSync(temp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+    renameSync(temp, file)
     chmodSync(file, 0o600)
-  } catch {
+    return true
+  } catch (error) {
+    try {
+      unlinkSync(temp)
+    } catch {
+      // Nothing was written, or the rename already consumed it.
+    }
     // A read-only home still works: the change lasts for this process only.
+    onError?.(error)
+    return false
   }
 }
 
@@ -156,6 +183,16 @@ function pairPrefs(): PairPrefs {
           ? envPublic
           : '',
   }
+}
+
+/**
+ * The answer-mode preference as it stands on disk right now.
+ *
+ * Read per question rather than cached: flipping the switch on the phone (or
+ * hand-editing the file) takes effect on the next card, without a restart.
+ */
+function answerMode(): AnswerMode {
+  return readState().answerMode === 'desktop' ? 'desktop' : 'phone'
 }
 
 /**
@@ -202,11 +239,20 @@ interface SessionRow {
   updatedAt: number
   cwd: string
   running: boolean
+  /** 宿主侧有挂起的提问/审批：手机端用来把会话标成「等你回答」。 */
+  asking: boolean
   archived: boolean
   pinned: boolean
   tokens: TokenUsage
+  context: ContextUsage | null
   model: ModelRef | null
   agents: AgentSummary
+}
+
+/** 上下文占用：宿主 token-meter 的投影值（provider 报的 prompt 大小 + 之后增量估算）。 */
+interface ContextUsage {
+  used: number
+  window: number
 }
 
 interface TokenUsage {
@@ -264,12 +310,139 @@ function agentsOf(values: Record<string, unknown> | undefined): AgentSummary {
     id: String(t.id ?? ''),
     subject: String(t.subject ?? t.title ?? ''),
     status: String(t.status ?? ''),
-    owner: String(t.owner ?? ''),
+    // TeamTaskSnapshot 没有 owner 字段，负责人拆在 ownerName / ownerId 两处
+    owner: String(t.ownerName ?? t.ownerId ?? ''),
   }))
   return { enabled: team.enabled === true, tasks, subagents }
 }
 
+/** One live ask_user_question waiting for a human, mirrored from the host waterfall. */
+interface LiveAsk {
+  sessionId: string
+  callId: string
+  questions: AskQuestion[]
+  createdAt: number
+  /** True when the host sent no `wait.callId` and this plugin minted the id itself. */
+  synthetic: boolean
+  resolve: (answer: unknown) => void
+  delegate: () => void
+}
+
+function normalizeQuestions(raw: unknown): AskQuestion[] {
+  const list = Array.isArray(raw) ? (raw as Array<Record<string, unknown>>) : []
+  return list.map((q) => {
+    const optsRaw = Array.isArray(q.options) ? (q.options as Array<Record<string, unknown>>) : []
+    const options: AskOption[] = optsRaw
+      .map((o) => ({
+        label: String(o.label ?? ''),
+        description: o.description === undefined ? '' : String(o.description),
+      }))
+      .filter((o) => o.label !== '')
+    const one: AskQuestion = {
+      id: String(q.id ?? ''),
+      prompt: String(q.question ?? q.prompt ?? ''),
+      options,
+      multiSelect: q.multiSelect === true,
+    }
+    if (typeof q.header === 'string' && q.header !== '') one.header = q.header
+    if (typeof q.detail === 'string' && q.detail !== '') one.detail = q.detail
+    return one
+  })
+}
+
+/** Copy the phone's answers into the shape the host waterfall resolves with. */
+function normalizeAskAnswers(raw: unknown): AskAnswerItem[] {
+  const list = Array.isArray(raw) ? (raw as Array<Record<string, unknown>>) : []
+  const answers: AskAnswerItem[] = []
+  for (const item of list) {
+    const id = String(item?.id ?? '')
+    if (id === '') continue
+    const selectedRaw = Array.isArray(item?.selected) ? (item.selected as unknown[]) : []
+    const selected = selectedRaw.map((value) => String(value)).filter((value) => value !== '')
+    const one: AskAnswerItem = { id, selected }
+    if (typeof item?.custom === 'string' && item.custom !== '') one.custom = item.custom
+    answers.push(one)
+  }
+  return answers
+}
+
 /** Token counters live under `projections.values.tokenUsage`. */
+function contextOf(values: Record<string, unknown> | undefined): ContextUsage | null {
+  const raw = (values?.contextPressure ?? {}) as Record<string, unknown>
+  const used = Number(raw.projectedTokens ?? raw.pressureTokens)
+  const window = Number(raw.contextWindow)
+  if (!Number.isFinite(used) || used <= 0) return null
+  if (!Number.isFinite(window) || window <= 0) return null
+  return { used: Math.trunc(used), window: Math.trunc(window) }
+}
+
+/** Structured questions the model asked, under `projections.values.userQuestions`. */
+interface AskOption {
+  label: string
+  description?: string
+}
+
+interface AskQuestion {
+  id: string
+  prompt?: string
+  header?: string
+  detail?: string
+  options?: AskOption[]
+  multiSelect?: boolean
+}
+
+interface PendingAsk {
+  callId: string
+  questions: AskQuestion[]
+  state: string
+  /** True when `callId` was minted by this plugin instead of the host tool call. */
+  synthetic?: boolean
+}
+
+/** One answer as the host's `user-questions/request` waterfall expects it. */
+interface AskAnswerItem {
+  id: string
+  selected: string[]
+  custom?: string
+}
+
+interface AskState {
+  active: PendingAsk[]
+  settled: Array<Record<string, unknown>>
+}
+
+function asksOf(values: Record<string, unknown> | undefined): AskState {
+  const raw = (values?.userQuestions ?? {}) as Record<string, unknown>
+  const activeRaw = Array.isArray(raw.active) ? (raw.active as Array<Record<string, unknown>>) : []
+  const settledRaw = Array.isArray(raw.settled) ? (raw.settled as Array<Record<string, unknown>>) : []
+  const active: PendingAsk[] = []
+  for (const entry of activeRaw) {
+    const callId = String(entry.callId ?? '')
+    const list = Array.isArray(entry.questions) ? (entry.questions as Array<Record<string, unknown>>) : []
+    if (callId === '' || list.length === 0) continue
+    const questions: AskQuestion[] = list.map((q) => {
+      const optsRaw = Array.isArray(q.options) ? (q.options as Array<Record<string, unknown>>) : []
+      const options: AskOption[] = optsRaw
+        .map((o) => ({
+          label: String(o.label ?? ''),
+          description: o.description === undefined ? '' : String(o.description),
+        }))
+        .filter((o) => o.label !== '')
+      const one: AskQuestion = {
+        id: String(q.id ?? ''),
+        prompt: String(q.prompt ?? q.question ?? ''),
+        options,
+        multiSelect: q.multiSelect === true,
+      }
+      if (typeof q.header === 'string' && q.header !== '') one.header = q.header
+      if (typeof q.detail === 'string' && q.detail !== '') one.detail = q.detail
+      return one
+    })
+    active.push({ callId, questions, state: String(entry.state ?? 'open'), synthetic: false })
+  }
+  return { active, settled: settledRaw }
+}
+
 function tokensOf(values: Record<string, unknown> | undefined): TokenUsage {
   const raw = (values?.tokenUsage ?? {}) as Record<string, unknown>
   const num = (v: unknown): number => {
@@ -427,8 +600,11 @@ function presetRows(raw: unknown, currentId: string): Record<string, unknown>[] 
   return out
 }
 
-/** Sessions are addressed by id in the URL; the controller wants the row. */
-function projectSessions(payload: unknown): SessionRow[] {
+/**
+ * Sessions are addressed by id in the URL; the controller wants the row.
+ * @param liveAsking - 本插件自己按住、尚未作答的提问所在会话（宿主投影里没有）；省略即只看投影。
+ */
+function projectSessions(payload: unknown, liveAsking?: ReadonlySet<string>): SessionRow[] {
   const rows: SessionRow[] = []
   for (const item of rowsOf(payload)) {
     if (item === null || typeof item !== 'object') continue
@@ -453,8 +629,11 @@ function projectSessions(payload: unknown): SessionRow[] {
       updatedAt: Number.isFinite(updated) ? updated : 0,
       cwd: String(s.cwd ?? ''),
       running: s.running === true,
+      // 手机接管中的提问不在宿主投影里，只按投影算会让等待答题的会话仍然是绿的。
+      asking: (liveAsking?.has(id) ?? false) || asksOf(projectedValues).active.length > 0,
       archived: false,
       tokens: tokensOf(projectedValues),
+      context: contextOf(projectedValues),
       model: modelOf(projectedValues),
       agents: agentsOf(projectedValues),
     })
@@ -545,6 +724,25 @@ interface ChatMessage {
   seq: number
   /** Image parts this message carried; the phone fetches the bytes separately. */
   images?: ImageRef[]
+  /** Turn outcome, attached to the last reply of a finished turn. */
+  turn?: TurnInfo
+}
+
+/**
+ * How one turn ended, for the phone's per-reply footer.
+ *
+ * `status` is the host's `turn/end` reason (`completed`, `aborted`,
+ * `interrupted`, `error`, `max-tokens`, `blocked`); `atSeq` is that event's seq
+ * and doubles as the fork anchor the phone sends back.
+ */
+interface TurnInfo {
+  status: string
+  ms: number
+  tokensIn: number
+  tokensOut: number
+  atSeq: number
+  /** 这一轮结束的墙上时间（epoch ms），手机端在气泡底部显示「21:32」。 */
+  finishedAt: number
 }
 
 /** One image part, resolved to the attachment object the host keeps on disk. */
@@ -574,7 +772,7 @@ const MAX_SESSION_BYTES = 160 * 1024 * 1024
 /** Decoded history keyed by path, invalidated by size+mtime. */
 const historyCache = new Map<
   string,
-  { size: number; mtimeMs: number; messages: ChatMessage[]; stats: SessionStats }
+  { size: number; mtimeMs: number; messages: ChatMessage[]; stats: SessionStats; lastTurn: string }
 >()
 
 /**
@@ -799,11 +997,11 @@ function imagesOf(content: unknown): ImageRef[] {
  * @param file - absolute path.
  * @returns the transcript in order.
  */
-function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats } {
+function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats; lastTurn: string } {
   const stat = statSync(file)
   const cached = historyCache.get(file)
   if (cached !== undefined && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
-    return { messages: cached.messages, stats: cached.stats }
+    return { messages: cached.messages, stats: cached.stats, lastTurn: cached.lastTurn }
   }
 
   const messages: ChatMessage[] = []
@@ -814,6 +1012,13 @@ function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats
     toolCalls: 0,
     tokens: { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
   }
+  let lastTurn = ''
+  // Per-turn bookkeeping for the reply footer: when it started, what it spent,
+  // and which row is the turn's final visible reply.
+  let turnStart = 0
+  let turnIn = 0
+  let turnOut = 0
+  let turnReplyAt = -1
   for (const line of readSessionLines(file)) {
     let event: unknown
     try {
@@ -823,8 +1028,30 @@ function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats
     }
     if (event === null || typeof event !== 'object') continue
     const ev = event as Record<string, any>
-    if (ev.type === 'turn/start') stats.turns += 1
-    else if (ev.type === 'step/start') stats.steps += 1
+    if (ev.type === 'turn/start') {
+      stats.turns += 1
+      turnStart = Number(ev.time ?? 0)
+      turnIn = 0
+      turnOut = 0
+      turnReplyAt = -1
+    }
+    // 本轮怎么结束的：completed / aborted / interrupted / error / max-tokens / blocked。
+    // 手机端靠它区分「完成」与「中断」，宿主没有单独的 interrupted 状态。
+    else if (ev.type === 'turn/end') {
+      lastTurn = String(ev.data?.reason?.kind ?? '')
+      const row = turnReplyAt >= 0 ? messages[turnReplyAt] : undefined
+      if (row !== undefined) {
+        const endAt = Number(ev.time ?? 0)
+        row.turn = {
+          status: lastTurn,
+          ms: endAt > turnStart && turnStart > 0 ? endAt - turnStart : 0,
+          tokensIn: turnIn,
+          tokensOut: turnOut,
+          atSeq: Number(ev.seq ?? 0),
+          finishedAt: endAt > 0 ? endAt : Date.now(),
+        }
+      }
+    } else if (ev.type === 'step/start') stats.steps += 1
     else if (ev.type === 'tool/call') stats.toolCalls += 1
     else if (ev.type === 'assistant/attempt') accumulateTokens(stats.tokens, ev.data)
     if (ev.type === 'user/message') {
@@ -840,6 +1067,13 @@ function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats
     }
     if (ev.type === 'assistant/message') {
       const text = textOf(ev.data?.message?.content)
+      const usage = ev.data?.usage
+      if (usage !== null && typeof usage === 'object') {
+        // 每一跳的 inputTokens 都是「整段上下文」，累加会翻好几倍；取最后一跳的输入，
+        // 输出按跳累加，才是这一轮真实读了多少、写了多少。
+        turnIn = Number(usage.inputTokens ?? 0) || 0
+        turnOut += Number(usage.outputTokens ?? 0) || 0
+      }
       if (text.length === 0) continue
       const row: ChatMessage = {
         role: 'assistant',
@@ -849,15 +1083,18 @@ function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats
       }
       const key = `${String(ev.data?.turn ?? '')}:${String(ev.data?.step ?? '')}`
       const at = stepAt.get(key)
-      if (at !== undefined) messages[at] = row
-      else {
+      if (at !== undefined) {
+        messages[at] = row
+        turnReplyAt = at
+      } else {
         stepAt.set(key, messages.length)
+        turnReplyAt = messages.length
         messages.push(row)
       }
     }
   }
-  historyCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, messages, stats })
-  return { messages, stats }
+  historyCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, messages, stats, lastTurn })
+  return { messages, stats, lastTurn }
 }
 
 /** Fold one attempt's usage counters into the running totals, if it carries any. */
@@ -952,6 +1189,38 @@ function tokenMatches(given: string, expected: string): boolean {
   return timingSafeEqual(a, b)
 }
 
+/**
+ * Files picked on the phone do not exist on this machine, so /outbox writes them
+ * to disk first and hands the paths to the session as one trailing text part.
+ * Returns the saved rows plus that text block (empty when nothing was saved).
+ */
+async function saveMobileFiles(raw: unknown[]): Promise<{ saved: Record<string, unknown>[]; bytes: number; text: string }> {
+  const saved: Record<string, unknown>[] = []
+  if (raw.length === 0) return { saved, bytes: 0, text: '' }
+  const stamp = new Date()
+  const day = `${String(stamp.getFullYear())}${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}`
+  const dir = join(homedir(), '.dsh', 'mobile-uploads', day)
+  await mkdir(dir, { recursive: true })
+  let bytes = 0
+  for (const item of raw) {
+    if (item === null || typeof item !== 'object') throw new Error('each file must be an object')
+    const f = item as Record<string, unknown>
+    const data = String(f.data ?? '')
+    if (data.length === 0) throw new Error('file data is empty')
+    const safe = String(f.name ?? 'file')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+      .trim()
+      .slice(0, 120) || 'file'
+    const target = join(dir, `${String(Date.now())}-${safe}`)
+    const buf = Buffer.from(data, 'base64')
+    await writeFile(target, buf)
+    bytes += buf.length
+    saved.push({ name: safe, path: target, bytes: buf.length })
+  }
+  const lines = saved.map((s) => `- ${String(s.path)}`)
+  return { saved, bytes, text: `已保存到这台机器：\n${lines.join('\n')}` }
+}
+
 /** Pull the caller's token out of the Authorization header or `?t=`. */
 function presentedToken(req: IncomingMessage, url: URL): string {
   const header = req.headers.authorization
@@ -1004,8 +1273,144 @@ export function apply(ctx: any, rawConfig?: Config): void {
   let pairCode: PairCode | null = null
   /** Last authenticated request, which is how the panel knows the phone is there. */
   let phoneSeenAt = 0
+  /** Last phone poll per Session: only a chat somebody is watching holds a question. */
+  const phoneSessionAt = new Map<string, number>()
   /** Wrong-claim counters per peer; a coarse throttle, not an account lock. */
   const pairFails = new Map<string, { n: number; until: number }>()
+
+  /**
+   * Live `ask_user_question` calls mirrored from the host waterfall.
+   *
+   * 宿主会依次询问每个答器；这里先把请求按住交给手机，等 ASK_HOLD_MS 到期或
+   * signal 被 abort 才 next() 交还桌面答器。phone 模式不看手机在不在线：手机
+   * 离线也照样等它（用户要求）。
+   *
+   * Blocking asks - the default `tool-ask-user` mode - carry no `wait.callId` at
+   * all, so the card is only reachable if this listener (a) runs before the
+   * desktop answerer, which never calls `next()` once it holds a request, and
+   * (b) invents an id the phone can answer with.
+   */
+  const liveAsks = new Map<string, LiveAsk>()
+  /** 手机模式下最多替手机按住一个提问这么久（5 分钟），到期交还桌面。 */
+  const ASK_HOLD_MS = 5 * 60 * 1000
+  /**
+   * 手机在最后一次认证请求之后算「在线」的时长，由 `POST /api/presence` 维持。
+   * 现在只用于面板显示和 presence 回包，不再决定提问由谁回答。
+   */
+  const PRESENCE_TTL_MS = 15 * 1000
+  /**
+   * 手机接管中的提问按会话归集，供会话列表的 asking 用：宿主投影只反映桌面答器，
+   * 看不到 liveAsks。'*' 是宿主没给会话 id 的提问，归不到任何一行，跳过。
+   */
+  const liveAsking = (): Set<string> => {
+    const out = new Set<string>()
+    for (const ask of liveAsks.values()) {
+      if (ask.sessionId !== '*') out.add(ask.sessionId)
+    }
+    return out
+  }
+  /** Bumped for every id minted here, so two asks in one millisecond stay apart. */
+  let syntheticSeq = 0
+  try {
+    ctx.on(
+      'user-questions/request',
+      (request: any, next: () => Promise<unknown>) => {
+        const questions = normalizeQuestions(request?.questions)
+        if (questions.length === 0) return next()
+        // desktop 模式立即交桌面：即使手机在线，这里也不按住卡片，不铸 id、不等待。
+        if (answerMode() === 'desktop') {
+          void record(logFile, 'ask desktop-only, delegate')
+          return next()
+        }
+        const agent = request?.agent
+        // `request.sessionId` is not part of the host event type; it is kept as a
+        // courtesy for hosts that pass it, with the agent session as the source.
+        const sessionId = String(request?.sessionId ?? agent?.session?.id ?? '')
+        const hostCallId = request?.wait?.callId === undefined ? '' : String(request.wait.callId)
+        const synthetic = hostCallId === ''
+        let callId = hostCallId
+        if (synthetic) {
+          syntheticSeq += 1
+          const tag = sessionId.replace(/[^0-9A-Za-z]/g, '').slice(0, 8) || 'anon'
+          callId = `q-${tag}-${Date.now().toString(36)}-${String(syntheticSeq)}`
+        }
+        // A timed ask belongs to the host timed answerer: it answers through the
+        // `userQuestions` service by callId, so holding it here would leave the
+        // phone's reply with nobody to deliver it to.
+        if (!synthetic && request?.wait?.timed === true) {
+          void record(logFile, `ask timed, delegate session=${sessionId} call=${callId}`)
+          return next()
+        }
+        // An ask with no session still has to reach a phone: park it under '*' so
+        // every session's card list offers it, and match it by callId on answer.
+        const askSessionId = sessionId === '' ? '*' : sessionId
+        // phone 模式不再用 presence 当闸门：手机不在线也先接管并等它，
+        // 兜底是 ASK_HOLD_MS 超时与 signal abort（都会 handOver 交还桌面）。
+        const signal: AbortSignal | undefined =
+          request?.signal !== undefined && typeof request.signal.addEventListener === 'function'
+            ? (request.signal as AbortSignal)
+            : undefined
+        void record(
+          logFile,
+          `ask pending session=${sessionId} call=${callId} synthetic=${String(synthetic)} q=${String(questions.length)}`,
+        )
+        return new Promise<unknown>((resolve, reject) => {
+          let done = false
+          let timer: ReturnType<typeof setTimeout> | undefined
+          const cleanup = (): void => {
+            if (timer !== undefined) clearTimeout(timer)
+            // Only drop the entry this call owns: a reused id must not be evicted.
+            if (liveAsks.get(callId) === entry) liveAsks.delete(callId)
+            if (signal !== undefined) signal.removeEventListener('abort', onAbort)
+          }
+          const handOver = (reason: string): void => {
+            if (done) return
+            done = true
+            cleanup()
+            void record(logFile, `${reason} session=${sessionId} call=${callId}`)
+            void Promise.resolve()
+              .then(() => next())
+              .then(resolve, reject)
+          }
+          const onAbort = (): void => handOver('ask aborted')
+          if (signal !== undefined) {
+            if (signal.aborted) {
+              // Cancelled before we could show a card: nothing to answer.
+              void record(logFile, `ask already aborted session=${sessionId} call=${callId}`)
+              void Promise.resolve()
+                .then(() => next())
+                .then(resolve, reject)
+              return
+            }
+            signal.addEventListener('abort', onAbort, { once: true })
+          }
+          // phone 模式不设超时：只要还是手机为主，就一直等手机，直到桌面把模式切回电脑。
+          const entry: LiveAsk = {
+            sessionId: askSessionId,
+            callId,
+            questions,
+            createdAt: Date.now(),
+            synthetic,
+            resolve: (answer: unknown) => {
+              if (done) return
+              done = true
+              cleanup()
+              void record(logFile, `ask answered session=${sessionId} call=${callId}`)
+              resolve(answer)
+            },
+            delegate: () => handOver('ask delegate'),
+          }
+          liveAsks.set(callId, entry)
+        })
+      },
+      // The desktop answerer holds a blocking ask and never calls next(), so this
+      // listener has to be first in the chain or the phone never sees the card.
+      { prepend: true },
+    )
+    void record(logFile, 'ask hook registered (prepend)')
+  } catch (error) {
+    void record(logFile, `ask hook skipped: ${String(error)}`)
+  }
 
   /** The current code, extending it when it expired. */
   const ensurePair = (): PairCode => {
@@ -1062,6 +1467,216 @@ export function apply(ctx: any, rawConfig?: Config): void {
   }
 
   /** Resolve the controller per request: a later mount must be visible here. */
+  // ---- 手机端发送队列 ----------------------------------------------------
+  // 运行中的会话不能直接 steer（会打断当前轮），queue 又只在宿主里躺着看不见。
+  // 所以这一层自己排队：先收下（手机和面板都能看到），等会话空下来再逐条 steer 进去，
+  // 想插队就立刻 steer 并把它从队里摘掉。
+  interface QueuedPrompt {
+    id: string
+    text: string
+    content: Record<string, unknown>[]
+    at: number
+  }
+
+  const promptQueues = new Map<string, QueuedPrompt[]>()
+
+  // 排队要活得比进程久：宿主重启不应该把用户排着的话丢掉。
+  const queueFile = (): string => join(dshHome(), 'queue.json')
+  let queueSaveTimer: ReturnType<typeof setTimeout> | undefined
+
+  const flushQueue = (): void => {
+    try {
+      const out: Record<string, QueuedPrompt[]> = {}
+      promptQueues.forEach((list, sid) => {
+        if (list.length > 0) out[sid] = list
+      })
+      writeFileSync(queueFile(), JSON.stringify(out), { mode: 0o600 })
+    } catch {
+      /* 队列落盘失败不影响发送 */
+    }
+  }
+
+  const saveQueue = (): void => {
+    if (queueSaveTimer !== undefined) clearTimeout(queueSaveTimer)
+    queueSaveTimer = setTimeout(() => {
+      queueSaveTimer = undefined
+      flushQueue()
+    }, 200)
+  }
+
+  const loadQueue = (): void => {
+    try {
+      const parsed = JSON.parse(readFileSync(queueFile(), 'utf8')) as Record<string, QueuedPrompt[]>
+      for (const sid of Object.keys(parsed)) {
+        const list = parsed[sid]
+        if (Array.isArray(list) && list.length > 0) promptQueues.set(sid, list)
+      }
+    } catch {
+      /* 首次启动没有队列文件 */
+    }
+  }
+
+  loadQueue()
+
+  const queueList = (sessionId: string): QueuedPrompt[] => promptQueues.get(sessionId) ?? []
+
+  const queueView = (sessionId: string): Record<string, unknown>[] =>
+    queueList(sessionId).map((q, i) => ({ id: q.id, text: q.text, at: q.at, index: i + 1 }))
+
+  const enqueuePrompt = (sessionId: string, text: string, content: Record<string, unknown>[]): QueuedPrompt => {
+    const item: QueuedPrompt = { id: randomBytes(8).toString('hex'), text, content, at: Date.now() }
+    const list = queueList(sessionId)
+    list.push(item)
+    promptQueues.set(sessionId, list)
+    saveQueue()
+    return item
+  }
+
+  const dequeueById = (sessionId: string, id: string): QueuedPrompt | null => {
+    const list = queueList(sessionId)
+    const at = list.findIndex((q) => q.id === id)
+    if (at < 0) return null
+    const [one] = list.splice(at, 1)
+    if (list.length === 0) promptQueues.delete(sessionId)
+    else promptQueues.set(sessionId, list)
+    saveQueue()
+    return one ?? null
+  }
+
+  let drainingQueues = false
+
+  /** 每次拍子：把已经空闲的会话的队头送进去（steer，空会话用它才能起一轮）。 */
+  const drainQueues = async (): Promise<void> => {
+    if (drainingQueues || promptQueues.size === 0) return
+    const ctl = controller()
+    if (!ctl || typeof ctl.prompt !== 'function') return
+    drainingQueues = true
+    try {
+      for (const sessionId of [...promptQueues.keys()]) {
+        const list = queueList(sessionId)
+        if (list.length === 0) continue
+        const head = list[0]
+        if (head === undefined) continue
+        const probe = await pickMode(ctl, sessionId, 'queue')
+        if (!probe.known || probe.running) continue
+        dequeueById(sessionId, head.id)
+        try {
+          await Promise.resolve(
+            ctl.prompt(
+              {
+                requestId: randomBytes(16).toString('hex'),
+                sessionId,
+                mode: 'steer',
+                content: head.content,
+              },
+              AbortSignal.timeout(60000),
+            ),
+          )
+          await record(logFile, `200 QUEUE flush session=${sessionId} id=${head.id}`)
+        } catch (e) {
+          // 送失败就放回队头，下一拍再试
+          const back = queueList(sessionId)
+          back.unshift(head)
+          promptQueues.set(sessionId, back)
+          await record(logFile, `500 QUEUE flush session=${sessionId} id=${head.id} err=${(e as Error).message}`)
+        }
+      }
+    } finally {
+      drainingQueues = false
+    }
+  }
+
+  const queueTimer = setInterval(() => {
+    void drainQueues()
+  }, 2500)
+  // 排队交给宿主：桌面版输入区会显示「待发送」，手机端再用 updateQueue 改 / 删 / 插队。
+  const hostState = async (ctl: any, sessionId: string): Promise<any> => {
+    if (!ctl || typeof ctl.state !== 'function') return null
+    try {
+      return await Promise.resolve(ctl.state({ sessionId }, AbortSignal.timeout(8000)))
+    } catch {
+      return null
+    }
+  }
+
+  const hostQueued = async (ctl: any, sessionId: string): Promise<any[]> => {
+    const st = await hostState(ctl, sessionId)
+    const q = st && Array.isArray(st.queue) ? st.queue : []
+    return q.filter((it: any) => it !== null && typeof it === 'object' && it.placement === 'queued')
+  }
+
+  const hostText = (it: any): string => {
+    const parts = it && Array.isArray(it.content) ? it.content : []
+    return parts
+      .filter((p: any) => p !== null && typeof p === 'object' && p.type === 'text')
+      .map((p: any) => String(p.text ?? ''))
+      .join(' ')
+      .trim()
+  }
+
+  /** Image parts of one queued prompt, with metadata only: bytes go through /queue-image. */
+  const hostImages = (it: any): Record<string, unknown>[] => {
+    const parts = it && Array.isArray(it.content) ? it.content : []
+    const out: Record<string, unknown>[] = []
+    for (const p of parts) {
+      if (p === null || typeof p !== 'object' || p.type !== 'image') continue
+      const mediaType = String(p.mediaType ?? 'image/png')
+      const name = String(p.name ?? '')
+      out.push(name === '' ? { mediaType } : { mediaType, name })
+    }
+    return out
+  }
+
+  const hostQueueView = async (ctl: any, sessionId: string): Promise<Record<string, unknown>[]> => {
+    const list = await hostQueued(ctl, sessionId)
+    return list.map((it: any, i: number) => ({
+      id: String(it.id),
+      text: hostText(it),
+      at: 0,
+      index: i + 1,
+      images: hostImages(it),
+    }))
+  }
+
+  const hostEnqueue = async (
+    ctl: any,
+    sessionId: string,
+    content: Record<string, unknown>[],
+  ): Promise<string> => {
+    const before = new Set((await hostQueued(ctl, sessionId)).map((x: any) => String(x.id)))
+    await Promise.resolve(
+      ctl.prompt(
+        {
+          requestId: randomBytes(16).toString('hex'),
+          sessionId,
+          mode: 'queue',
+          content,
+        },
+        AbortSignal.timeout(30000),
+      ),
+    )
+    const after = await hostQueued(ctl, sessionId)
+    const fresh = after.find((x: any) => !before.has(String(x.id)))
+    return fresh === undefined ? '' : String(fresh.id)
+  }
+
+  const hostMutate = async (
+    ctl: any,
+    sessionId: string,
+    itemId: string,
+    action: Record<string, unknown>,
+  ): Promise<boolean> => {
+    if (!ctl || typeof ctl.updateQueue !== 'function') return false
+    try {
+      await Promise.resolve(
+        ctl.updateQueue({ sessionId, itemId, action }, AbortSignal.timeout(20000)),
+      )
+      return true
+    } catch {
+      return false
+    }
+  }
+
   const controller = (): any => {
     try {
       return ctx.get('sessionController')
@@ -1078,6 +1693,36 @@ export function apply(ctx: any, rawConfig?: Config): void {
     } catch {
       return null
     }
+  }
+
+  /**
+   * Context pressure is a SessionProjectionSummaryExcluded value: `ctl.list()`
+   * never carries it, so the Ring in the app would read 0% forever. The
+   * projection registry keeps the full map, and its snapshot needs the live
+   * Session object rather than the id — resolved here, cached briefly because
+   * the phone polls this route every few seconds.
+   */
+  const deepCache = new Map<string, { at: number; value: ContextUsage | null }>()
+  const DEEP_TTL_MS = 15000
+  const deepContext = (sessionId: string): ContextUsage | null => {
+    const hit = deepCache.get(sessionId)
+    if (hit !== undefined && Date.now() - hit.at < DEEP_TTL_MS) return hit.value
+    let value: ContextUsage | null = null
+    try {
+      const registry = service('sessionProjections')
+      const sessions = service('sessions')
+      const live: any = sessions !== null && typeof sessions.get === 'function'
+        ? sessions.get(sessionId)
+        : undefined
+      if (registry !== null && live !== undefined && typeof registry.snapshot === 'function') {
+        const snap: any = registry.snapshot(live)
+        value = contextOf((snap?.values ?? {}) as Record<string, unknown>)
+      }
+    } catch (error) {
+      void record(logFile, `deep context failed: ${String(error)}`)
+    }
+    deepCache.set(sessionId, { at: Date.now(), value })
+    return value
   }
 
   /**
@@ -1350,6 +1995,62 @@ export function apply(ctx: any, rawConfig?: Config): void {
         return
       }
 
+      // Presence: the phone pings this every few seconds while it is in the
+      // foreground and says `online:false` when it goes away. While it is online
+      // it owns every ask_user_question card; once the window lapses the desktop
+      // is the answerer again.
+      if (path === '/api/presence') {
+        let online = true
+        if (method === 'POST') {
+          const body = await readJson(req).catch(() => undefined)
+          if (body !== undefined && typeof body === 'object' && body !== null) {
+            const flag = (body as { online?: unknown }).online
+            if (flag === false) online = false
+          }
+        }
+        if (online) {
+          phoneSeenAt = Date.now()
+        } else {
+          phoneSeenAt = 0
+        }
+        send(res, 200, {
+          ok: true,
+          online,
+          ttlMs: PRESENCE_TTL_MS,
+          sessionId: String(url.searchParams.get('sessionId') ?? ''),
+        })
+        return
+      }
+
+      // Who answers ask_user_question: `phone` (default) or `desktop`. Persisted
+      // next to the token, so the phone's setting survives a host restart.
+      if (path === '/api/answer-mode' && method === 'GET') {
+        send(res, 200, { ok: true, mode: answerMode() })
+        return
+      }
+
+      if (path === '/api/answer-mode' && method === 'POST') {
+        const body = await readJson(req)
+        const wanted = body.mode
+        if (wanted !== 'phone' && wanted !== 'desktop') {
+          send(res, 400, { error: 'mode must be "phone" or "desktop"' })
+          return
+        }
+        const persisted = writeState({ answerMode: wanted }, (error) => {
+          void record(logFile, `answer mode persist failed: ${String(error)}`)
+        })
+        if (!persisted) {
+          // Report the mode that is actually in force, not the one that failed
+          // to persist: the hook reads the file, so the old mode still wins.
+          await record(logFile, `500 ANSWER wanted=${wanted} persist failed`)
+          send(res, 500, { ok: false, error: 'answer mode not saved', mode: answerMode() })
+          return
+        }
+        await record(logFile, `200 ANSWER mode=${wanted}`)
+        send(res, 200, { ok: true, mode: wanted })
+        return
+      }
+
       // Pairing state for an already-paired phone: shows the live code so the
       // app can act as a second screen for the panel, and lets the phone flip
       // the two switches the panel also drives.
@@ -1461,13 +2162,82 @@ export function apply(ctx: any, rawConfig?: Config): void {
           return
         }
         const listed = await Promise.resolve(ctl.list({}, AbortSignal.timeout(15000)))
-        send(res, 200, { ok: true, sessions: markPinned(markArchived(projectSessions(listed))) })
+        send(res, 200, { ok: true, sessions: markPinned(markArchived(projectSessions(listed, liveAsking()))) })
+        return
+      }
+
+      /**
+       * Open questions for one Session: the projection knows every recorded
+       * ask, and `liveAsks` adds the ones currently blocking a turn.
+       */
+      const pendingAsks = (listed: unknown, sessionId: string): AskState => {
+        const raw = rowsOf(listed).find((item) => {
+          const r = item as Record<string, unknown>
+          return String(r.sessionId ?? r.id ?? '') === sessionId
+        }) as Record<string, unknown> | undefined
+        const proj = raw?.projections as { values?: Record<string, unknown> } | undefined
+        const fromProjection = asksOf(proj?.values as Record<string, unknown> | undefined)
+        const seen = new Set(fromProjection.active.map((a) => a.callId))
+        for (const ask of liveAsks.values()) {
+          // '*' means the host gave no session id: offer the card everywhere
+          // rather than lose a question nobody can answer.
+          if (ask.sessionId !== sessionId && ask.sessionId !== '*') continue
+          if (seen.has(ask.callId)) continue
+          fromProjection.active.push({
+            callId: ask.callId,
+            questions: ask.questions,
+            state: 'open',
+            synthetic: ask.synthetic,
+          })
+        }
+        return fromProjection
+      }
+
+      const questionsMatch = /^\/api\/sessions\/([^/]+)\/questions$/.exec(path)
+      if (questionsMatch !== null && method === 'GET') {
+        const sessionId = decodeURIComponent(questionsMatch[1])
+        phoneSessionAt.set(sessionId, Date.now())
+        const ctl = controller()
+        let listed: unknown = []
+        if (ctl && typeof ctl.list === 'function') {
+          try {
+            listed = await Promise.resolve(ctl.list({}, AbortSignal.timeout(8000)))
+          } catch {
+            /* a question may already be live even when the list call fails */
+          }
+        }
+        send(res, 200, { ok: true, sessionId, ...pendingAsks(listed, sessionId) })
+        return
+      }
+
+      const answerMatch = /^\/api\/sessions\/([^/]+)\/questions\/answer$/.exec(path)
+      if (answerMatch !== null && method === 'POST') {
+        const sessionId = decodeURIComponent(answerMatch[1])
+        const body = await readJson(req, 64 * 1024)
+        const callId = String((body as Record<string, unknown>).callId ?? '')
+        const answers = normalizeAskAnswers((body as Record<string, unknown>).answers)
+        if (callId === '' || answers.length === 0) {
+          send(res, 400, { error: 'callId and answers are required' })
+          return
+        }
+        // Lookup is by callId alone: blocking asks minted here have no host id,
+        // and an ask parked under '*' still has to be answerable from its chat.
+        const live = liveAsks.get(callId)
+        if (live === undefined || (live.sessionId !== sessionId && live.sessionId !== '*')) {
+          send(res, 409, { error: 'this question is no longer waiting', callId })
+          return
+        }
+        const synthetic = live.synthetic
+        live.resolve({ answers })
+        send(res, 200, { ok: true, callId, synthetic, answered: answers.length })
         return
       }
 
       const historyMatch = /^\/api\/sessions\/([^/]+)\/messages$/.exec(path)
       if (historyMatch !== null && method === 'GET') {
         const sessionId = decodeURIComponent(historyMatch[1])
+        // 手机正在看这个会话：记下时间，只有刚被手机轮询过的会话才由手机接管选择题。
+        phoneSessionAt.set(sessionId, Date.now())
         if (zstdDecompressSync === undefined) {
           send(res, 501, { error: 'this Node build has no zstd support' })
           return
@@ -1487,17 +2257,21 @@ export function apply(ctx: any, rawConfig?: Config): void {
         // 手机端一次只拿最近 60 条，向上翻时才补更早的，避免一次拖 2000 多条。
         const beforeRaw = Number(url.searchParams.get('before') ?? '0')
         const before = Number.isFinite(beforeRaw) ? Math.max(Math.trunc(beforeRaw), 0) : 0
-        const { messages: all, stats } = historyOf(file)
+        const { messages: all, stats, lastTurn } = historyOf(file)
         let tokens = stats.tokens
         let running = false
+        let context: ContextUsage | null = null
         const ctl = controller()
+        let listed: unknown = []
         if (ctl && typeof ctl.list === 'function') {
           try {
-            const listed = await Promise.resolve(ctl.list({}, AbortSignal.timeout(8000)))
+            listed = await Promise.resolve(ctl.list({}, AbortSignal.timeout(8000)))
             const row = projectSessions(listed).find((r) => r.id === sessionId)
             if (row !== undefined) {
               tokens = row.tokens
               running = row.running === true
+              context = row.context
+              if (context === null) context = deepContext(sessionId)
             }
           } catch {
             /* token counters are decorative; keep the event-derived fallback */
@@ -1515,7 +2289,12 @@ export function apply(ctx: any, rawConfig?: Config): void {
           firstSeq: all.length > 0 ? all[0].seq : 0,
           messages: page,
           stats: { ...stats, tokens },
+          // 最后一轮的结束原因：completed / aborted / interrupted / error …
+          lastTurn,
+          context,
           running,
+          queue: await hostQueueView(ctl, sessionId),
+          questions: pendingAsks(listed, sessionId),
         })
         return
       }
@@ -1591,31 +2370,75 @@ export function apply(ctx: any, rawConfig?: Config): void {
         const sessionId = decodeURIComponent(archiveMatch[1])
         const ctl = controller()
         const reg = service('workspaceRegistry')
-        let cancelledFirst = false
-        try {
+        if (!(ctl && typeof ctl.archive === 'function') && !(reg && typeof reg.archiveSession === 'function')) {
+          send(res, 503, { error: 'archiving is unavailable on this host' })
+          return
+        }
+        // `stopActivity` is the host's own admission switch: without it a session
+        // that still owns a turn is refused as `workspace/session-active`.
+        const archiveCall = async (stopActivity: boolean): Promise<void> => {
           if (ctl && typeof ctl.archive === 'function') {
-            await Promise.resolve(ctl.archive({ sessionId }))
-          } else if (reg && typeof reg.archiveSession === 'function') {
-            await Promise.resolve(reg.archiveSession(sessionId))
-          } else {
-            send(res, 503, { error: 'archiving is unavailable on this host' })
+            await Promise.resolve(ctl.archive({ sessionId, stopActivity }))
             return
           }
+          await Promise.resolve(reg.archiveSession(sessionId, { stopActivity }))
+        }
+        let cancelledFirst = false
+        let stoppedFirst = false
+        try {
+          await archiveCall(false)
         } catch (err) {
-          // The host refuses to archive a session that still owns a turn; the
-          // console stops it first, so mirror that instead of failing.
           const message = err instanceof Error ? err.message : String(err)
-          if (/active|running|busy/i.test(message) && ctl && typeof ctl.cancel === 'function') {
-            await Promise.resolve(ctl.cancel({ sessionId }))
-            cancelledFirst = true
-            if (typeof ctl.archive === 'function') await Promise.resolve(ctl.archive({ sessionId }))
-            else if (reg && typeof reg.archiveSession === 'function') await Promise.resolve(reg.archiveSession(sessionId))
+          if (/session-active|active|running|busy/i.test(message)) {
+            try {
+              await archiveCall(true)
+              stoppedFirst = true
+            } catch (err2) {
+              // Older hosts ignore `stopActivity`, so cancel the turn first.
+              if (ctl && typeof ctl.cancel === 'function') {
+                await Promise.resolve(ctl.cancel({ sessionId }))
+                cancelledFirst = true
+                await archiveCall(false)
+              } else {
+                throw err2
+              }
+            }
           } else {
             throw err
           }
         }
-        await record(logFile, `200 POST archive session=${sessionId} cancelledFirst=${cancelledFirst}`)
-        send(res, 200, { ok: true, sessionId, archived: true, cancelledFirst })
+        await record(logFile, `200 POST archive session=${sessionId} stoppedFirst=${stoppedFirst} cancelledFirst=${cancelledFirst}`)
+        send(res, 200, { ok: true, sessionId, archived: true, stoppedFirst, cancelledFirst })
+        return
+      }
+
+      // 分叉：把源会话截至 atSeq（含）的事件前缀复制成一个独立会话。
+      // atSeq 省略时宿主取「最近一个已完成轮次」的边界；给了就按该事件精确切。
+      const forkMatch = /^\/api\/sessions\/([^/]+)\/fork$/.exec(path)
+      if (forkMatch !== null && method === 'POST') {
+        const sessionId = decodeURIComponent(forkMatch[1])
+        const ctl = controller()
+        if (!(ctl && typeof ctl.fork === 'function')) {
+          send(res, 503, { error: 'forking is unavailable on this host' })
+          return
+        }
+        const body = await readJson(req)
+        const raw = body.atSeq
+        const atSeq = typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined
+        try {
+          const out = await Promise.resolve(ctl.fork(atSeq === undefined ? { sessionId } : { sessionId, atSeq }))
+          const child = typeof out === 'string' ? out : String((out as Record<string, unknown> | null)?.sessionId ?? '')
+          if (child === '') {
+            send(res, 500, { error: 'host returned no session for the fork' })
+            return
+          }
+          await record(logFile, `200 POST fork session=${sessionId} at=${String(atSeq ?? 'latest')} child=${child}`)
+          send(res, 200, { ok: true, sessionId: child, atSeq: atSeq ?? null })
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          await record(logFile, `500 POST fork session=${sessionId} at=${String(atSeq ?? 'latest')} err=${message}`)
+          send(res, 500, { error: message })
+        }
         return
       }
 
@@ -1785,6 +2608,21 @@ export function apply(ctx: any, rawConfig?: Config): void {
         const sessionId = decodeURIComponent(imagesMatch[1])
         const text = String(body.text ?? '').trim() || '（来自手机）'
         const { mode, running, known } = await pickMode(ctl, sessionId, body.mode === 'steer' ? 'steer' : 'queue')
+        if (mode === 'queue' && running) {
+          const itemId = await hostEnqueue(ctl, sessionId, [{ type: 'text', text }, ...parts])
+          await record(logFile, `200 POST images session=${sessionId} mode=queue host=${itemId} n=${String(parts.length)}`)
+          send(res, 200, {
+            ok: true,
+            sessionId,
+            mode: 'queue',
+            queued: true,
+            item: itemId,
+            count: parts.length,
+            queue: await hostQueueView(ctl, sessionId),
+          })
+          return
+        }
+
         const result = await Promise.resolve(
           ctl.prompt(
             {
@@ -1801,6 +2639,28 @@ export function apply(ctx: any, rawConfig?: Config): void {
           `200 POST images session=${sessionId} n=${String(parts.length)} bytes=${String(bytes)} mode=${mode} busy=${String(running)} known=${String(known)}`,
         )
         send(res, 200, { ok: true, sessionId, count: parts.length, bytes, mode, running, result: result ?? null })
+        return
+      }
+
+      const queueImgMatch = /^\/api\/sessions\/([^/]+)\/queue-image$/.exec(path)
+      if (queueImgMatch !== null && method === 'GET') {
+        const sessionId = decodeURIComponent(queueImgMatch[1])
+        const itemId = String(url.searchParams.get('item') ?? '')
+        const index = Number.parseInt(String(url.searchParams.get('i') ?? '0'), 10)
+        const ctl = controller()
+        const list = ctl === null ? [] : await hostQueued(ctl, sessionId)
+        const item = list.find((x: any) => String(x.id) === itemId)
+        const parts = item && Array.isArray(item.content) ? item.content : []
+        const images = parts.filter((p: any) => p !== null && typeof p === 'object' && p.type === 'image')
+        const pick = images[Number.isFinite(index) ? index : 0]
+        if (pick === undefined) {
+          send(res, 404, { error: 'queued image not found' })
+          return
+        }
+        const mediaType = String(pick.mediaType ?? 'image/png').toLowerCase()
+        const buf = Buffer.from(String(pick.data ?? ''), 'base64')
+        res.writeHead(200, { 'Content-Type': IMAGE_TYPES.has(mediaType) ? mediaType : 'image/png', 'Content-Length': String(buf.length), 'Cache-Control': 'no-store' })
+        res.end(buf)
         return
       }
 
@@ -1855,6 +2715,21 @@ export function apply(ctx: any, rawConfig?: Config): void {
         const lines = saved.map((s) => `- ${String(s.path)}`)
         const text = `${head === '' ? '（来自手机）' : head}\n\n已保存到这台机器：\n${lines.join('\n')}`
         const { mode, running, known } = await pickMode(ctl, sessionId, body.mode === 'steer' ? 'steer' : 'queue')
+        if (mode === 'queue' && running) {
+          const itemId = await hostEnqueue(ctl, sessionId, [{ type: 'text', text }])
+          await record(logFile, `200 POST files session=${sessionId} mode=queue host=${itemId} n=${String(saved.length)}`)
+          send(res, 200, {
+            ok: true,
+            sessionId,
+            mode: 'queue',
+            queued: true,
+            item: itemId,
+            count: saved.length,
+            files: saved,
+            queue: await hostQueueView(ctl, sessionId),
+          })
+          return
+        }
         const result = await Promise.resolve(
           ctl.prompt(
             {
@@ -1883,6 +2758,198 @@ export function apply(ctx: any, rawConfig?: Config): void {
         return
       }
 
+      const queueMatch = /^\/api\/sessions\/([^/]+)\/queue$/.exec(path)
+      if (queueMatch !== null) {
+        const sessionId = decodeURIComponent(queueMatch[1])
+        if (method === 'GET') {
+          const ctl = controller()
+          send(res, 200, { ok: true, sessionId, queue: await hostQueueView(ctl, sessionId) })
+          return
+        }
+        if (method === 'POST') {
+          const ctl = controller()
+          if (!ctl || typeof ctl.prompt !== 'function') {
+            send(res, 503, { error: 'sessionController.prompt unavailable' })
+            return
+          }
+          const body = await readJson(req)
+          const text = String(body.text ?? '').trim()
+          if (text.length === 0) {
+            send(res, 400, { error: 'text is empty' })
+            return
+          }
+          const itemId = await hostEnqueue(ctl, sessionId, [{ type: 'text', text }])
+          await record(logFile, `200 QUEUE push session=${sessionId} host=${itemId}`)
+          send(res, 200, {
+            ok: true,
+            sessionId,
+            item: itemId,
+            queue: await hostQueueView(ctl, sessionId),
+          })
+          return
+        }
+      }
+
+      // 重排「待发送」：宿主没有 move，只能按目标顺序先全删、再按序重新入队。
+      // 图片字节就存在 queue item 的 content 里，所以能原样搬过去。
+      const queueOrderMatch = /^\/api\/sessions\/([^/]+)\/queue\/reorder$/.exec(path)
+      if (queueOrderMatch !== null && method === 'POST') {
+        const sessionId = decodeURIComponent(queueOrderMatch[1])
+        const ctl = controller()
+        if (!ctl || typeof ctl.prompt !== 'function' || typeof ctl.updateQueue !== 'function') {
+          send(res, 503, { error: 'sessionController queue API unavailable' })
+          return
+        }
+        const body = await readJson(req)
+        const wanted = Array.isArray(body.ids) ? body.ids.map((x: unknown) => String(x)) : []
+        const listed = await hostQueued(ctl, sessionId)
+        const byId = new Map<string, any>()
+        for (const it of listed) {
+          byId.set(String((it as any).id), it)
+        }
+        const unique = new Set<string>(wanted)
+        if (wanted.length !== listed.length || unique.size !== wanted.length
+          || wanted.some((id: string) => !byId.has(id))) {
+          send(res, 400, {
+            error: 'ids must cover every queued item exactly once',
+            queue: await hostQueueView(ctl, sessionId),
+          })
+          return
+        }
+        for (const it of listed) {
+          await hostMutate(ctl, sessionId, String((it as any).id), { kind: 'remove' })
+        }
+        let moved = 0
+        for (const id of wanted) {
+          const it = byId.get(id)
+          const content = it && Array.isArray(it.content) ? it.content : []
+          if (content.length === 0) continue
+          await hostEnqueue(ctl, sessionId, content as Record<string, unknown>[])
+          moved++
+        }
+        await record(logFile, `200 QUEUE reorder session=${sessionId} n=${moved}`)
+        send(res, 200, { ok: true, sessionId, moved, queue: await hostQueueView(ctl, sessionId) })
+        return
+      }
+
+      const queueItemMatch = /^\/api\/sessions\/([^/]+)\/queue\/([^/]+)\/(drop|fire|edit)$/.exec(path)
+      if (queueItemMatch !== null && method === 'POST') {
+        const sessionId = decodeURIComponent(queueItemMatch[1])
+        const itemId = decodeURIComponent(queueItemMatch[2])
+        const action = queueItemMatch[3]
+        const ctl = controller()
+        if (!ctl || typeof ctl.updateQueue !== 'function') {
+          send(res, 503, {
+            error: 'sessionController.updateQueue unavailable',
+            hint: 'restart the DSH host so the queue API is loaded',
+          })
+          return
+        }
+        let mutation: Record<string, unknown>
+        if (action === 'edit') {
+          const body = await readJson(req)
+          const text = String(body.text ?? '').trim()
+          if (text.length === 0) {
+            send(res, 400, { error: 'text is empty' })
+            return
+          }
+          mutation = { kind: 'edit', content: [{ type: 'text', text }] }
+        } else if (action === 'drop') {
+          mutation = { kind: 'remove' }
+        } else {
+          mutation = { kind: 'steer' }
+        }
+        const mutated = await hostMutate(ctl, sessionId, itemId, mutation)
+        await record(logFile, `QUEUE ${action} session=${sessionId} id=${itemId} ok=${String(mutated)}`)
+        if (!mutated) {
+          send(res, 409, {
+            error: 'queue item is no longer pending',
+            queue: await hostQueueView(ctl, sessionId),
+          })
+          return
+        }
+        send(res, 200, {
+          ok: true,
+          sessionId,
+          item: itemId,
+          dropped: action === 'drop',
+          fired: action === 'fire',
+          queue: await hostQueueView(ctl, sessionId),
+        })
+        return
+      }
+
+      const outboxMatch = /^\/api\/sessions\/([^/]+)\/outbox$/.exec(path)
+      if (outboxMatch !== null && method === 'POST') {
+        const ctl = controller()
+        if (!ctl || typeof ctl.prompt !== 'function') {
+          send(res, 503, { error: 'sessionController.prompt unavailable' })
+          return
+        }
+        const body = await readJson(req, MAX_UPLOAD_BYTES)
+        const rawImgs = Array.isArray(body.images) ? body.images : []
+        const rawFiles = Array.isArray(body.files) ? body.files : []
+        if (rawImgs.length > MAX_IMAGES) {
+          send(res, 400, { error: `at most ${String(MAX_IMAGES)} images per request` })
+          return
+        }
+        if (rawFiles.length > MAX_FILES) {
+          send(res, 400, { error: `at most ${String(MAX_FILES)} files per request` })
+          return
+        }
+        const text = String(body.text ?? '').trim()
+        const content: Record<string, unknown>[] = []
+        if (text !== '') content.push({ type: 'text', text })
+        for (const item of rawImgs) {
+          const img = item as Record<string, unknown>
+          const mediaType = String(img.mediaType ?? '').toLowerCase()
+          if (!IMAGE_TYPES.has(mediaType)) {
+            send(res, 400, { error: `unsupported image type: ${mediaType}`, allowed: [...IMAGE_TYPES] })
+            return
+          }
+          const data = String(img.data ?? '')
+          if (data.length === 0) {
+            send(res, 400, { error: 'image data is empty' })
+            return
+          }
+          const part: Record<string, unknown> = { type: 'image', mediaType, data }
+          const name = String(img.name ?? '').trim().slice(0, 80)
+          if (name !== '') part.name = name
+          content.push(part)
+        }
+        const savedFiles = await saveMobileFiles(rawFiles)
+        if (savedFiles.text !== '') content.push({ type: 'text', text: savedFiles.text })
+        if (content.length === 0) {
+          send(res, 400, { error: 'nothing to send' })
+          return
+        }
+        const sessionId = decodeURIComponent(outboxMatch[1])
+        const { mode, running, known } = await pickMode(ctl, sessionId, body.mode === 'steer' ? 'steer' : 'queue')
+        if (mode === 'queue' && running) {
+          const itemId = await hostEnqueue(ctl, sessionId, content)
+          await record(logFile, `200 POST outbox session=${sessionId} mode=queue host=${itemId} parts=${String(content.length)}`)
+          send(res, 200, {
+            ok: true,
+            sessionId,
+            mode: 'queue',
+            queued: true,
+            item: itemId,
+            parts: content.length,
+            queue: await hostQueueView(ctl, sessionId),
+          })
+          return
+        }
+        const result = await Promise.resolve(
+          ctl.prompt(
+            { requestId: randomBytes(16).toString('hex'), sessionId, mode, content },
+            AbortSignal.timeout(120000),
+          ),
+        )
+        await record(logFile, `200 POST outbox session=${sessionId} mode=${mode} parts=${String(content.length)} known=${String(known)}`)
+        send(res, 200, { ok: true, sessionId, mode, running, parts: content.length, result: result ?? null })
+        return
+      }
+
       const sendMatch = /^\/api\/sessions\/([^/]+)\/send$/.exec(path)
       if (sendMatch !== null && method === 'POST') {
         const ctl = controller()
@@ -1898,11 +2965,30 @@ export function apply(ctx: any, rawConfig?: Config): void {
         }
         const requested = body.mode === 'steer' ? 'steer' : 'queue'
         const sessionId = decodeURIComponent(sendMatch[1])
+        // 手机刚在这个会话里发过消息：紧接着模型可能就要提问，先记一笔，
+        // 免得首轮轮询还没跟上就把题卡推给了桌面。
+        phoneSessionAt.set(sessionId, Date.now())
 
         // 空闲会话用 queue 只会得到 accepted:true，什么都不会发生（控制器把消息塞进
         // 一个永远不会被 drain 的邮箱）。实测只有 steer 才会替空闲会话起一轮。
         // 运行中的会话反过来不能用 steer（会打断当前轮），沿用调用方的 mode。
         const { mode: effective, running, known } = await pickMode(ctl, sessionId, requested)
+
+        if (effective === 'queue' && running) {
+          // 交给宿主排队（桌面版输入区能看到「待发送」），手机端改 / 删 / 插队走
+          // sessionController.updateQueue。
+          const itemId = await hostEnqueue(ctl, sessionId, [{ type: 'text', text }])
+          await record(logFile, `200 POST send session=${sessionId} mode=queue host=${itemId}`)
+          send(res, 200, {
+            ok: true,
+            sessionId,
+            mode: 'queue',
+            queued: true,
+            item: itemId,
+            queue: await hostQueueView(ctl, sessionId),
+          })
+          return
+        }
 
         const result = await Promise.resolve(
           ctl.prompt(
@@ -2058,7 +3144,473 @@ export function apply(ctx: any, rawConfig?: Config): void {
         return
       }
 
-      send(res, 404, { error: 'not found', path })
+      // --- Host extras: installed plugins -------------------------------------
+      if (path === '/api/host/plugins' && method === 'GET') {
+        const profilesDir = join(dshHome(), 'profiles')
+        const groups: Array<{ profile: string; items: Array<{ name: string; version: string; enabled: boolean; local: boolean }> }> = []
+        let profiles: string[] = []
+        try {
+          profiles = readdirSync(profilesDir)
+        } catch {
+          profiles = []
+        }
+        for (const profile of profiles) {
+          let raw = ''
+          try {
+            raw = readFileSync(join(profilesDir, profile, 'package.json'), 'utf8')
+          } catch {
+            continue
+          }
+          let bag: Record<string, unknown>
+          try {
+            bag = JSON.parse(raw) as Record<string, unknown>
+          } catch {
+            continue
+          }
+          const deps: Record<string, string> =
+            typeof bag.dependencies === 'object' && bag.dependencies !== null
+              ? (bag.dependencies as Record<string, string>)
+              : {}
+          const dsh: Record<string, unknown> =
+            typeof bag.dsh === 'object' && bag.dsh !== null ? (bag.dsh as Record<string, unknown>) : {}
+          const prof: Record<string, unknown> =
+            typeof dsh.profile === 'object' && dsh.profile !== null ? (dsh.profile as Record<string, unknown>) : {}
+          const bundles = Array.isArray(prof.bundles) ? (prof.bundles as unknown[]).map((x) => String(x)) : []
+          const items = Object.keys(deps).map((dep) => {
+            const version = String(deps[dep] ?? '')
+            return { name: dep, version, enabled: bundles.indexOf(dep) >= 0, local: version.startsWith('link:') }
+          })
+          items.sort((a, b) => (a.enabled === b.enabled ? a.name.localeCompare(b.name) : a.enabled ? -1 : 1))
+          groups.push({ profile, items })
+        }
+        send(res, 200, { ok: true, groups })
+        return
+      }
+
+      // --- Host extras: agent team --------------------------------------------
+      // The Team service has no list method: membership and the task board are
+      // Session-log events, so the log is the only durable source. Latest record
+      // per id wins (tasks carry a revision), and the panel stays read-only.
+      const teamMatch = /^\/api\/sessions\/([^/]+)\/team$/.exec(path)
+      if (teamMatch !== null && method === 'GET') {
+        const sessionId = decodeURIComponent(teamMatch[1])
+        const file = findSessionFile(sessionId)
+        if (file === null) {
+          send(res, 404, { error: 'session log not found' })
+          return
+        }
+        let enabled = false
+        let sawMode = false
+        const members = new Map<string, Record<string, unknown>>()
+        const tasks = new Map<string, Record<string, unknown>>()
+        let lines: string[] = []
+        try {
+          lines = readSessionLines(file)
+        } catch (error) {
+          send(res, 500, { error: `cannot read session log: ${String(error)}` })
+          return
+        }
+        for (const line of lines) {
+          let ev: any
+          try {
+            ev = JSON.parse(line)
+          } catch {
+            continue
+          }
+          const type = String(ev?.type ?? '')
+          if (type === 'team/mode') {
+            sawMode = true
+            enabled = ev?.data?.enabled === true
+            continue
+          }
+          if (type === 'team/member') {
+            const member = ev?.data?.member
+            if (member !== null && typeof member === 'object') {
+              members.set(String(member.id ?? ''), {
+                id: String(member.id ?? ''),
+                name: String(member.name ?? ''),
+                description: String(member.description ?? ''),
+                phase: String(member.phase ?? ''),
+                error: String(member.error ?? '')
+              })
+            }
+            continue
+          }
+          if (type === 'team/task') {
+            const task = ev?.data?.task
+            if (task !== null && typeof task === 'object') {
+              const id = String(task.id ?? '')
+              const seen = tasks.get(id)
+              const revision = Number(task.revision ?? 0)
+              if (seen === undefined || Number(seen.revision ?? -1) <= revision) {
+                tasks.set(id, {
+                  id,
+                  revision,
+                  subject: String(task.subject ?? ''),
+                  description: String(task.description ?? ''),
+                  status: String(task.status ?? 'pending'),
+                  ownerName: String(task.ownerName ?? ''),
+                  ownerId: String(task.ownerId ?? '')
+                })
+              }
+            }
+          }
+        }
+        const taskRows = Array.from(tasks.values())
+          .filter((task) => task.status !== 'deleted')
+          .sort((a, b) => {
+            const rank = (s: unknown): number =>
+              s === 'in_progress' ? 0 : s === 'pending' ? 1 : s === 'completed' ? 2 : 3
+            const delta = rank(a.status) - rank(b.status)
+            return delta !== 0 ? delta : String(a.subject).localeCompare(String(b.subject))
+          })
+        send(res, 200, {
+          ok: true,
+          sessionId,
+          enabled,
+          sawMode,
+          members: Array.from(members.values()),
+          tasks: taskRows
+        })
+        return
+      }
+
+      // Team mode is the one Team write the phone needs. The host service takes
+      // the live root Agent (not a session id) and flushes the Session itself, so
+      // both halves have to run in-process here; a missing Agent is a retryable
+      // 503 rather than a thrown route.
+      const teamModeMatch = /^\/api\/sessions\/([^/]+)\/team\/mode$/.exec(path)
+      if (teamModeMatch !== null && method === 'POST') {
+        let body: Record<string, unknown> = {}
+        try {
+          body = await readJson(req)
+        } catch (error) {
+          send(res, 400, { error: `请求体不是合法 JSON：${error instanceof Error ? error.message : String(error)}` })
+          return
+        }
+        const rawEnabled = body.enabled
+        if (typeof rawEnabled !== 'boolean') {
+          send(res, 400, { error: 'enabled 必须是布尔值' })
+          return
+        }
+        const enabled = rawEnabled
+        const sessionId = decodeURIComponent(teamModeMatch[1])
+        const svc = service('agentTeams')
+        if (svc === null || typeof svc.setEnabled !== 'function') {
+          send(res, 503, { error: '这台电脑没有挂载智能体团队（agentTeams 服务不可用）' })
+          return
+        }
+        const agents = service('agents')
+        const agent: unknown = agents !== null && typeof agents.get === 'function' ? agents.get(sessionId) : null
+        if (agent === null || agent === undefined) {
+          send(res, 503, { error: '这个会话在电脑上没有打开：先在电脑端点开它一次，再回来切换' })
+          return
+        }
+        try {
+          // setEnabled 先追加 team/mode 事件、再 await 宿主自己 flush；flush 不吃
+          // AbortSignal，所以这里不假装有硬超时，等待上限交给手机端 readTimeout。
+          // 它内部用到 this.ctx，必须保留服务实例作为 receiver。
+          const change = svc.setEnabled as (a: unknown, v: boolean) => unknown
+          await Promise.resolve(change.call(svc, agent, enabled))
+        } catch (error) {
+          const code = typeof (error as { code?: unknown }).code === 'string' ? String((error as { code: string }).code) : ''
+          const message = error instanceof Error ? error.message : String(error)
+          // Only the tree root may switch: a subagent Session answers TEAM_LEAD_REQUIRED.
+          const status = code === 'TEAM_LEAD_REQUIRED' ? 409 : 500
+          const readable = code === 'TEAM_LEAD_REQUIRED'
+            ? '这个会话是子智能体，请到它的根会话里切换智能体协作'
+            : `电脑端拒绝了这个切换：${message}`
+          await record(logFile, `${String(status)} POST team-mode session=${sessionId} enabled=${String(enabled)} code=${code} err=${message}`)
+          send(res, status, { error: readable })
+          return
+        }
+        await record(logFile, `200 POST team-mode session=${sessionId} enabled=${String(enabled)}`)
+        send(res, 200, { ok: true, enabled })
+        return
+      }
+
+      // --- Host extras: scheduled tasks ---------------------------------------
+      if (path === '/api/host/schedules' && method === 'GET') {
+        // Both shapes (the live service and the on-disk unit) are normalised here so
+        // the phone renders one stable row type and never guesses at host internals.
+        const normTask = (raw: unknown): Record<string, unknown> => {
+          const bag = (raw !== null && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+          const inner = (bag.record !== null && typeof bag.record === 'object' ? bag.record : bag) as Record<string, unknown>
+          const target = (inner.target !== null && typeof inner.target === 'object' ? inner.target : {}) as Record<string, unknown>
+          const status = String(inner.status ?? '')
+          return {
+            id: String(inner.id ?? bag.id ?? ''),
+            title: String(inner.title ?? inner.name ?? '未命名任务'),
+            kind: String(inner.kind ?? inner.type ?? ''),
+            when: String(inner.nextRunAt ?? inner.nextAt ?? inner.next ?? inner.scheduledAt ?? inner.when ?? ''),
+            active: inner.active === true || status === 'active' || status === 'scheduled',
+            sessionId: String(target.sessionId ?? inner.sessionId ?? ''),
+          }
+        }
+        const svc = service('schedule')
+        if (svc !== null && typeof svc.list === 'function') {
+          const page: unknown = await Promise.resolve((svc.list as (arg: unknown) => unknown)({ limit: 100 }))
+          const bag = (page !== null && typeof page === 'object' ? page : {}) as Record<string, unknown>
+          const rows = Array.isArray(bag.items) ? (bag.items as unknown[]) : []
+          send(res, 200, { ok: true, source: 'service', items: rows.map(normTask) })
+          return
+        }
+        let raw = ''
+        try {
+          raw = readFileSync(join(dshHome(), 'storages', 'schedule.json'), 'utf8')
+        } catch (err) {
+          send(res, 503, { error: `scheduled tasks unavailable: ${err instanceof Error ? err.message : String(err)}` })
+          return
+        }
+        let items: unknown[] = []
+        try {
+          const bag = JSON.parse(raw) as { tables?: { tasks?: Record<string, unknown> } }
+          const table = (bag.tables !== undefined && bag.tables.tasks !== undefined ? bag.tables.tasks : {}) as Record<string, unknown>
+          items = Object.keys(table).map((key) => normTask(table[key]))
+        } catch (err) {
+          send(res, 500, { error: `cannot read scheduled tasks: ${err instanceof Error ? err.message : String(err)}` })
+          return
+        }
+        send(res, 200, { ok: true, source: 'file', items })
+        return
+      }
+
+      // --- Workspace files ----------------------------------------------------
+      // cwd 有两个来源：活着的 Session 对象，以及 sessionController 的列表投影。
+      // 重启之后大部分会话并不在内存里，只有列表里还留着 cwd，所以这里必须问列表。
+      const tidyCwd = (raw: string): string => raw.replace(/\\\\/g, '\\')
+      const cwdOf = async (sid: string): Promise<string> => {
+        const sessions = service('sessions')
+        if (sessions !== null && typeof sessions.get === 'function') {
+          let live: unknown = null
+          try {
+            live = (sessions.get as (id: string) => unknown)(sid)
+          } catch {
+            live = null
+          }
+          if (live !== null && live !== undefined) {
+            const cwd = (live as Record<string, unknown>).cwd
+            if (typeof cwd === 'string' && cwd.length > 0) return tidyCwd(cwd)
+          }
+        }
+        const ctl = controller()
+        if (ctl !== null && typeof ctl.list === 'function') {
+          try {
+            const listed = await Promise.resolve(ctl.list({}, AbortSignal.timeout(10000)))
+            const row = projectSessions(listed).find((r) => r.id === sid)
+            if (row !== undefined && row.cwd.length > 0) return tidyCwd(row.cwd)
+          } catch {
+            // Fall through to the process directory.
+          }
+        }
+        return ''
+      }
+      // 会话没有 cwd 时（比如从手机新建的空会话）退回宿主进程的当前目录，
+      // 并把 fallback 标给 App，界面上说明一句，而不是直接 404。
+      const rootOf = async (sid: string): Promise<{ root: string; fallback: boolean }> => {
+        const cwd = await cwdOf(sid)
+        if (cwd !== '') return { root: cwd, fallback: false }
+        try {
+          return { root: process.cwd(), fallback: true }
+        } catch {
+          return { root: '', fallback: false }
+        }
+      }
+      const underRoot = (root: string, rel: string): string | null => {
+        const base = resolve(root)
+        const target = resolve(base, rel.length === 0 ? '.' : rel)
+        if (target === base) return target
+        return target.startsWith(base + sep) ? target : null
+      }
+
+      const fsMatch = /^\/api\/sessions\/([^/]+)\/fs$/.exec(path)
+      if (fsMatch !== null && method === 'GET') {
+        const sid = decodeURIComponent(fsMatch[1])
+        const picked = await rootOf(sid)
+        const root = picked.root
+        if (root === '') {
+          send(res, 404, { error: `session ${sid} has no working directory` })
+          return
+        }
+        const rel = String(url.searchParams.get('path') ?? '')
+        const target = underRoot(root, rel)
+        if (target === null) {
+          send(res, 400, { error: 'path escapes the working directory' })
+          return
+        }
+        let names: string[] = []
+        try {
+          names = readdirSync(target)
+        } catch (err) {
+          send(res, 404, { error: `cannot read folder: ${err instanceof Error ? err.message : String(err)}` })
+          return
+        }
+        const entries: Array<{ name: string; dir: boolean; size: number; mtime: number }> = []
+        for (const name of names) {
+          if (name === '.git' || name === 'node_modules' || name === '.hvigor' || name === 'oh_modules') continue
+          try {
+            const st = statSync(join(target, name))
+            entries.push({ name, dir: st.isDirectory(), size: st.size, mtime: Math.round(st.mtimeMs) })
+          } catch {
+            // Unreadable entries are simply skipped.
+          }
+        }
+        entries.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1))
+        const trimmed = entries.length > 400 ? entries.slice(0, 400) : entries
+        await record(logFile, `200 GET fs session=${sid} path=${rel} n=${trimmed.length}`)
+        send(res, 200, { ok: true, root, path: rel, entries: trimmed, more: entries.length > trimmed.length, fallback: picked.fallback })
+        return
+      }
+
+      const fsFileMatch = /^\/api\/sessions\/([^/]+)\/fs\/file$/.exec(path)
+      if (fsFileMatch !== null && method === 'GET') {
+        const sid = decodeURIComponent(fsFileMatch[1])
+        const root = (await rootOf(sid)).root
+        const rel = String(url.searchParams.get('path') ?? '')
+        const target = root === '' ? null : underRoot(root, rel)
+        if (root === '' || target === null) {
+          send(res, 400, { error: 'bad path' })
+          return
+        }
+        const LIMIT = 512 * 1024
+        let buf: Buffer
+        try {
+          const st = statSync(target)
+          if (!st.isFile()) {
+            send(res, 400, { error: 'not a file' })
+            return
+          }
+          if (st.size > LIMIT) {
+            send(res, 413, { error: `file is too large to preview (${st.size} bytes)` })
+            return
+          }
+          buf = readFileSync(target)
+        } catch (err) {
+          send(res, 404, { error: `cannot read file: ${err instanceof Error ? err.message : String(err)}` })
+          return
+        }
+        if (buf.indexOf(0) >= 0) {
+          send(res, 415, { error: 'binary file: no text preview' })
+          return
+        }
+        send(res, 200, { ok: true, name: String(rel).split(/[\\/]/).pop() ?? rel, size: buf.length, text: buf.toString('utf8') })
+        return
+      }
+
+      const fsRawMatch = /^\/api\/sessions\/([^/]+)\/fs\/raw$/.exec(path)
+      if (fsRawMatch !== null && method === 'GET') {
+        const sid = decodeURIComponent(fsRawMatch[1])
+        const root = (await rootOf(sid)).root
+        const rel = String(url.searchParams.get('path') ?? '')
+        const target = root === '' ? null : underRoot(root, rel)
+        if (root === '' || target === null) {
+          send(res, 400, { error: 'bad path' })
+          return
+        }
+        const ext = extname(target).toLowerCase()
+        const types: Record<string, string> = {
+          '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+          '.gif': 'image/gif', '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
+        }
+        const type = types[ext]
+        if (type === undefined) {
+          send(res, 415, { error: 'not an image' })
+          return
+        }
+        let body: Buffer
+        try {
+          body = readFileSync(target)
+        } catch (err) {
+          send(res, 404, { error: `cannot read image: ${err instanceof Error ? err.message : String(err)}` })
+          return
+        }
+        res.writeHead(200, { 'content-type': type, 'content-length': String(body.length), 'cache-control': 'private, max-age=60' })
+        res.end(body)
+        return
+      }
+
+      // \u76ee\u6807\uff08goal\uff09\uff1a\u624b\u673a\u7aef\u5728\u8f93\u5165\u6846\u73af\u5f62\u7528\u91cf\u53f3\u4fa7\u70b9\u5f00\u9762\u677f\u67e5\u770b/\u4fee\u6539/\u6682\u505c/\u7ee7\u7eed/\u5b8c\u6210\u3002
+    const goalMatch = /^\/api\/sessions\/([^/]+)\/goal(?:\/(action))?$/.exec(path)
+    if (goalMatch) {
+      const sid = goalMatch[1]
+      const goalSvc = service('goals') as unknown as {
+        get(agent: unknown): unknown
+        pause(agent: unknown, ref: unknown): unknown
+        resume(agent: unknown, ref: unknown): unknown
+        complete(agent: unknown, ref: unknown): unknown
+        clear(agent: unknown, ref: unknown): unknown
+        edit(agent: unknown, ref: unknown, patch: unknown): unknown
+      } | null
+      if (goalSvc === null) {
+        send(res, 503, { error: 'goals are unavailable on this host' })
+        return true
+      }
+      const agent = (service('agents') as unknown as { get(id: string): unknown } | null)?.get(sid)
+      if (agent === undefined || agent === null) {
+        send(res, 503, { error: '\u8fd9\u4e2a\u4f1a\u8bdd\u5728\u7535\u8111\u4e0a\u6ca1\u6709\u6253\u5f00\uff1a\u5148\u5728\u7535\u8111\u70b9\u5f00\u5b83\u4e00\u6b21\uff0c\u518d\u56de\u6765\u770b\u76ee\u6807\u3002' })
+        return true
+      }
+      const viewOf = (v: unknown): Record<string, unknown> | null => {
+        if (v === undefined || v === null || typeof v !== 'object') {
+          return null
+        }
+        const o = v as Record<string, unknown>
+        return { id: o.id, objective: o.objective, phase: o.phase, revision: o.revision, roundsStarted: o.roundsStarted, maxGoalRounds: o.maxGoalRounds, activation: o.activation, updatedAt: o.updatedAt }
+      }
+      if (goalMatch[2] === undefined) {
+        try {
+          send(res, 200, { ok: true, sessionId: sid, goal: viewOf(goalSvc.get(agent)) })
+        } catch (ex) {
+          send(res, 500, { error: String(ex) })
+        }
+        return true
+      }
+      const body = await readJson(req)
+      const action = typeof body.action === 'string' ? body.action : ''
+      let current: Record<string, unknown> | null = null
+      try {
+        current = viewOf(goalSvc.get(agent))
+      } catch (ex) {
+        send(res, 500, { error: String(ex) })
+        return true
+      }
+      if (current === null) {
+        send(res, 404, { error: '\u8fd9\u4e2a\u4f1a\u8bdd\u73b0\u5728\u6ca1\u6709\u76ee\u6807' })
+        return true
+      }
+      const ref = { id: current.id, revision: current.revision }
+      try {
+        if (action === 'pause') {
+          goalSvc.pause(agent, ref)
+        } else if (action === 'resume') {
+          goalSvc.resume(agent, ref)
+        } else if (action === 'complete') {
+          goalSvc.complete(agent, ref)
+        } else if (action === 'clear') {
+          goalSvc.clear(agent, ref)
+        } else if (action === 'edit') {
+          const patch: Record<string, unknown> = {}
+          if (typeof body.objective === 'string' && body.objective !== '') {
+            patch.objective = body.objective
+          }
+          if (typeof body.maxGoalRounds === 'number' && body.maxGoalRounds > 0) {
+            patch.maxGoalRounds = body.maxGoalRounds
+          }
+          goalSvc.edit(agent, ref, patch)
+        } else {
+          send(res, 400, { error: 'action must be pause, resume, complete, clear or edit' })
+          return true
+        }
+        const after = action === 'clear' ? null : viewOf(goalSvc.get(agent))
+        send(res, 200, { ok: true, sessionId: sid, action, goal: after })
+      } catch (ex) {
+        const err = ex as { code?: string; message?: string }
+        send(res, 409, { error: err.message ?? String(ex), code: err.code ?? '' })
+      }
+      return true
+    }
+
+    send(res, 404, { error: 'not found', path })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       await record(logFile, `500 ${method} ${path} ${message}`)
@@ -2212,3 +3764,5 @@ export function apply(ctx: any, rawConfig?: Config): void {
     }
   }, 'mobile listener')
 }
+
+
