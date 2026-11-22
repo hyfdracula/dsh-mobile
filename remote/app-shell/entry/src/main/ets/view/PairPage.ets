@@ -116,7 +116,7 @@ export struct PairPage {
       'dsh plugin --profile desktop add link:<插件目录>');
       await pasteboard.getSystemPasteboard().setData(data);
       Haptics.tap();
-      this.hint = '已复制插件名';
+      this.hint = '已复制命令，把 <插件目录> 换成解压后的路径';
     } catch (e) {
       this.hint = '复制失败，手动记一下：dsh plugin --profile desktop add link:<插件目录>';
     }
@@ -347,7 +347,7 @@ export struct PairPage {
       this.head('先把电脑准备好', '三件事，做完手机就能连上来。')
 
       this.stepCard(1, Tokens.ok, '给电脑装上「DSH 手机连接」插件',
-        '插件包随 App 发布页一起提供。解压后在电脑上执行下面的命令，装完重启 DSH 自动加载。')
+        '插件包在 App 发布页的附件里（dsh-mobile-plugin.zip），下载解压。不用装 npm：打开 DSH 侧栏「插件 → 添加插件」，直接选解压出来的那个目录就行。也可以用下面的命令行装，把 <插件目录> 换成解压后的路径。')
       this.cmdBlock()
       Row().height(10)
 

@@ -1819,27 +1819,30 @@ export struct ChatPage {
 
       // 白胶囊用位移滑过去，正文用同一组时长与曲线淡入淡出：两处都是
       // 200ms EaseOut，看起来是同一个动作，而不是先硬切再淡入。
-      Stack({ alignContent: Alignment.Start }) {
-        Row()
-          .width('50%')
-          .height(34)
-          .borderRadius(Tokens.rPill)
-          .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#FFFFFFFF')
-          .shadow({ radius: 6, color: Tokens.isDark ? '#33000000' : '#1A000000', offsetY: 1 })
-          .translate({ x: this.selRaw ? '100%' : '0%' })
-          .animation({ duration: 200, curve: Curve.EaseOut })
-        Row() {
-          this.selTab('正文', 'body', (): void => { this.selRaw = false; })
-          this.selTab('Markdown 原文', 'raw', (): void => { this.selRaw = true; })
+      Row() {
+        Stack({ alignContent: Alignment.Start }) {
+          Row()
+            .width('50%')
+            .height(34)
+            .borderRadius(Tokens.rPill)
+            .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#FFFFFFFF')
+            .shadow({ radius: 6, color: Tokens.isDark ? '#33000000' : '#1A000000', offsetY: 1 })
+            .translate({ x: this.selRaw ? '100%' : '0%' })
+            .animation({ duration: 200, curve: Curve.EaseOut })
+          Row() {
+            this.selTab('正文', 'body', (): void => { this.selRaw = false; })
+            this.selTab('Markdown 原文', 'raw', (): void => { this.selRaw = true; })
+          }
+          .width('100%')
         }
         .width('100%')
+        .height(40)
+        .padding(3)
+        .backgroundColor(Tokens.isDark ? '#26FFFFFF' : '#14000000')
+        .borderRadius(Tokens.rPill)
       }
       .width('100%')
-      .height(40)
-      .padding(3)
-      .backgroundColor(Tokens.isDark ? '#26FFFFFF' : '#14000000')
-      .borderRadius(Tokens.rPill)
-      .margin({ left: 20, right: 20, top: 8 })
+      .padding({ left: 20, right: 20, top: 8 })
 
       Scroll() {
         if (this.selRaw) {
@@ -2131,6 +2134,7 @@ export struct ChatPage {
     .fontSize(size)
     .lineHeight(lineH)
     .width('100%')
+    .copyOption(CopyOptions.LocalDevice)
   }
 
   /** 表格：首行淡蓝底，单元格细线，可横向滚动 */
@@ -2143,6 +2147,7 @@ export struct ChatPage {
         .lineHeight(26)
         .fontColor(Tokens.fg)
         .textAlign(TextAlign.Center)
+        .copyOption(CopyOptions.LocalDevice)
     }
     .width('100%')
     .justifyContent(FlexAlign.Center)
@@ -2168,6 +2173,7 @@ export struct ChatPage {
             .padding(8)
             .border({ width: 0.5, color: Tokens.line })
             .backgroundColor(Tokens.accentSoft)
+            .copyOption(CopyOptions.LocalDevice)
           }, (h: string, ci: number) => 'th' + ci)
         }
         ForEach(b.rows, (r: string[], ri: number) => {
@@ -2185,6 +2191,7 @@ export struct ChatPage {
               .width(150)
               .padding(8)
               .border({ width: 0.5, color: Tokens.line })
+              .copyOption(CopyOptions.LocalDevice)
             }, (c: string, ci: number) => 'td' + ri + '_' + ci)
           }
         }, (r: string[], ri: number) => 'tr' + ri)
@@ -2245,6 +2252,7 @@ export struct ChatPage {
           .fontFamily('monospace')
           .fontColor(Tokens.fg)
           .width('100%')
+          .copyOption(CopyOptions.LocalDevice)
       }
       .alignItems(HorizontalAlign.Start)
       .padding(12)
@@ -2330,7 +2338,7 @@ export struct ChatPage {
             .height(20)
             .borderRadius(6)
             .objectFit(ImageFit.Cover)
-          Blank()
+          // 状态胶囊贴着头像放在左边，右边留白。
           if (m.turn !== undefined) {
             Row() {
               Circle()
@@ -2342,7 +2350,9 @@ export struct ChatPage {
                 .fontColor(this.turnColor(m.turn))
                 .margin({ left: 5 })
             }
+            .margin({ left: 8 })
           }
+          Blank()
         }
         .width('100%')
         .margin({ bottom: 6 })
@@ -3312,8 +3322,6 @@ export struct ChatPage {
         }
         .width('100%')
         .padding({ left: 2, right: 2, bottom: 10 })
-        .backgroundColor(Tokens.surface2)
-        .zIndex(2)
 
         Scroll() {
           Column({ space: 12 }) {
