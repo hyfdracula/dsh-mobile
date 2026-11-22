@@ -18,7 +18,7 @@
 
 「添加插件」装的是**本地目录**，不是网址，所以「给个地址粘进去」这条路在 DSH 里不存在。现在有两种装法，都不用 npm：
 
-1. 下载发布页附件 `dsh-mobile-plugin-0.1.0.zip` → 解压 → 打开 DSH 侧栏「插件 → 添加插件」→ 选解压出来的 `dsh-mobile-plugin` 目录。
+1. 下载发布页附件 `dsh-mobile-plugin-0.1.0.zip` → 解压 → 打开 DSH 侧栏「插件 → 添加插件」→ 选解压出来的 `dsh-mobile-plugin` 目录。压缩包里已经带上了二维码要用的 `qrcode` 依赖，解压即用，不需要联网装包。
 2. 或者命令行：`dsh plugin --profile desktop add link:<解压后的目录>`。
 
 新手引导第 1 步的文案已经按这个改写。
