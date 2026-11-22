@@ -1,20 +1,28 @@
 ﻿{
-  // 本仓库不保存任何签名材料：用 DevEco Studio 打开项目后，
-  // File -> Project Structure -> Signing Configs 勾选 "Automatically generate signature" 即可。
   "app": {
     "signingConfigs": [],
     "products": [
       {
         "name": "default",
-        "signingConfig": "default",
-        "compatibleSdkVersion": "6.0.0(20)",
-        "targetSdkVersion": "6.0.0(20)",
+        "compatibleSdkVersion": "5.0.0(12)",
         "runtimeOS": "HarmonyOS"
       }
     ],
-    "buildModeSet": [ { "name": "debug" }, { "name": "release" } ]
+    "buildModeSet": [
+      { "name": "debug" },
+      { "name": "release" }
+    ]
   },
   "modules": [
-    { "name": "entry", "srcPath": "./entry", "targets": [ { "name": "default", "applyToProducts": ["default"] } ] }
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": ["default"]
+        }
+      ]
+    }
   ]
 }

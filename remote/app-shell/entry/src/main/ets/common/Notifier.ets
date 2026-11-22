@@ -31,15 +31,17 @@ export class Notifier {
     }
   }
 
-  /** 发一条通知，点它回到应用；同一 id 会覆盖上一条。 */
-  static async done(title: string, body: string, id: number): Promise<void> {
+  /** 发一条通知，点它回到应用；带上 sessionId 时直接打开那个会话。同一 id 会覆盖上一条。 */
+  static async done(title: string, body: string, id: number, sessionId: string = ''): Promise<void> {
     let agent: object | undefined = undefined;
     try {
       const info: wantAgent.WantAgentInfo = {
         wants: [
           {
             bundleName: 'com.dsh.mobile',
-            abilityName: 'EntryAbility'
+            abilityName: 'EntryAbility',
+            // 点通知时把会话 id 带进去，EntryAbility 落到前台后由列表页跳转
+            parameters: { sessionId: sessionId }
           }
         ],
         actionType: wantAgent.OperationType.START_ABILITY,

@@ -91,6 +91,16 @@ export class Marks {
     Marks.bump();
   }
 
+  /** 全部标为已读：一次清空所有结果标记。 */
+  static clearAll(): void {
+    Marks.ensure();
+    if (Marks.mem === null || Marks.mem.size === 0) {
+      return;
+    }
+    Marks.mem.clear();
+    Marks.bump();
+  }
+
   private static bump(): void {
     Marks.ver = Marks.ver + 1;
     AppStorage.setOrCreate('marksVer', Marks.ver);

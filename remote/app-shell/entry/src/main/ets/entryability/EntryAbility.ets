@@ -13,6 +13,33 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, TAG, 'Ability onCreate');
+    this.takeSession(want);
+  }
+
+  /** 通知点击（应用已在后台时走这里） */
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    hilog.info(0x0000, TAG, 'Ability onNewWant');
+    this.takeSession(want);
+  }
+
+  /**
+   * 从通知的 want 里取出会话 id，交给界面跳转。
+   * AppStorage 在 onCreate 早期可能还没建好，所以延后一拍写。
+   */
+  private takeSession(want: Want): void {
+    const params: Record<string, Object> | undefined = want.parameters;
+    if (params === undefined) {
+      return;
+    }
+    const raw: Object | undefined = params.sessionId;
+    const id: string = raw === undefined ? '' : String(raw);
+    if (id === '') {
+      return;
+    }
+    setTimeout(() => {
+      AppStorage.setOrCreate('openSession', id);
+      hilog.info(0x0000, TAG, 'open session from notification: %{public}s', id);
+    }, 200);
   }
 
   /**

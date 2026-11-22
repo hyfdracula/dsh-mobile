@@ -225,7 +225,7 @@ export struct ShellPage {
     }
     this.lastNote.set(id, now);
     console.info('DSH_NOTIFY turn finished session=' + id);
-    Notifier.done('任务完成', '「' + title + '」已经回复，点开看看', this.noteId(id));
+    Notifier.done('任务完成', '「' + title + '」已经回复，点开看看', this.noteId(id), id);
   }
 
   /**

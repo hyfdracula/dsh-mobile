@@ -1,3 +1,5 @@
+import preferences from '@ohos.data.preferences';
+import { common } from '@kit.AbilityKit';
 import curves from '@ohos.curves';
 import pasteboard from '@ohos.pasteboard';
 import { Api, PreviewRow, SessionRow } from '../common/Api';
@@ -300,6 +302,18 @@ export struct SessionList {
   /** 换了电脑（设置 → 连接）或分叉出新会话时，列表整份重读 */
   @StorageLink('listDirty') @Watch('onListDirty') listDirty: number = 0;
 
+  private onOpenSession(): void {
+    const id: string = this.openSession;
+    if (id === '') {
+      return;
+    }
+    this.openSession = '';
+    const row: SessionRow | undefined = this.rows.find((r: SessionRow) => r.id === id);
+    const title: string = row === undefined ? '' : row.title;
+    const p: ChatParam = { id: id, title: title };
+    this.stack.pushPathByName('chat', p);
+  }
+
   private onListDirty(): void {
     if (this.loading) {
       return;
@@ -312,6 +326,12 @@ export struct SessionList {
   onPickMachine: (id: string) => void = () => {};
   @StorageLink('machinesVer') machinesVer: number = 0;
   @State private devOn: boolean = false;
+  // 列表视图设置：分组方式 / 列表状态 / 是否显示归档（照 dsh-console 的分组方式菜单）
+  @State private viewOn: boolean = false;
+  /** 通知点进来时要打开的会话：EntryAbility 写 AppStorage，这里跳转 */
+  @StorageLink('openSession') @Watch('onOpenSession') openSession: string = '';
+  @State private groupBy: string = 'time';
+  @State private listState: string = 'all';
 
   @State private err: string = '';
   @State private q: string = '';
@@ -349,6 +369,7 @@ export struct SessionList {
 
   aboutToAppear(): void {
     console.info('DSH_LIST aboutToAppear');
+    this.loadListView();
     this.load();
     // 列表要能自己更新：会话在跑/跑完/等你回答都会改变卡片颜色，不能只在进页面时读一次
     this.poll = setInterval(() => {
@@ -391,6 +412,7 @@ export struct SessionList {
       }
       this.rowSig = sig;
       this.rows = sorted;
+      this.applyListState();
       console.info('DSH_LIST poll rows=' + sorted.length);
       this.loadPreviews();
     } catch (e) {
@@ -515,6 +537,16 @@ export struct SessionList {
         out.push({ kind: 'row', label: '', key: this.rowKey(r), row: r });
         return;
       }
+      if (this.groupBy === 'ws') {
+        const g = this.groupName(r.cwd);
+        if (g !== lastDay) {
+          lastDay = g;
+          out.push({ kind: 'head', label: g, key: 'h-w-' + g + (this.isFolded(g) ? '-c' : '-o'), row: r });
+        }
+        if (this.isFolded(g)) return;
+        out.push({ kind: 'row', label: '', key: this.rowKey(r), row: r });
+        return;
+      }
       const d = dayKey(r.updatedAt);
       if (d !== lastDay) {
         lastDay = d;
@@ -525,6 +557,113 @@ export struct SessionList {
       out.push({ kind: 'row', label: '', key: this.rowKey(r), row: r });
     });
     return out;
+  }
+
+  /** 工作区分组的组名：路径末段，拿不到就给「其他」 */
+  private groupName(cwd: string): string {
+    const w: string = wsOf(cwd);
+    const parts: string[] = w.split('\\');
+    const last: string = parts.length > 0 ? parts[parts.length - 1] : w;
+    return last !== '' ? last : '其他';
+  }
+
+  /** 按当前设置重算折叠：全打开 / 只开第一组 / 全关 */
+  private applyListState(): void {
+    if (this.listState === 'all') {
+      this.folded = [];
+      return;
+    }
+    const labels: string[] = this.groupLabels();
+    if (this.listState === 'none') {
+      this.folded = labels;
+      return;
+    }
+    const rest: string[] = labels.length > 1 ? labels.slice(1) : [];
+    this.folded = rest;
+  }
+
+  /** 当前分组下所有组标题（不含置顶） */
+  private groupLabels(): string[] {
+    const out: string[] = [];
+    if (this.groupBy === 'ws') {
+      this.rows.forEach((r: SessionRow) => {
+        if (r.pinned === true && !this.archivedView) return;
+        const g: string = this.groupName(r.cwd);
+        if (out.indexOf(g) < 0) {
+          out.push(g);
+        }
+      });
+      return out;
+    }
+    this.rows.forEach((r: SessionRow) => {
+      if (r.pinned === true && !this.archivedView) return;
+      const d: string = dayKey(r.updatedAt);
+      if (out.indexOf(d) < 0) {
+        out.push(d);
+      }
+    });
+    return out;
+  }
+
+  private async loadListView(): Promise<void> {
+    try {
+      const host = getContext() as common.UIAbilityContext;
+      const opts: preferences.Options = { name: 'dsh_mobile_listview' };
+      const p: preferences.Preferences = preferences.getPreferencesSync(host, opts);
+      const g: string = p.getSync('groupBy', 'time') as string;
+      const st: string = p.getSync('listState', 'all') as string;
+      this.groupBy = g === 'ws' ? 'ws' : 'time';
+      this.listState = st === 'first' || st === 'none' ? st : 'all';
+    } catch (e) {
+      console.info('DSH_VIEW load failed: ' + JSON.stringify(e));
+    }
+  }
+
+  private saveListView(): void {
+    try {
+      const host = getContext() as common.UIAbilityContext;
+      const opts: preferences.Options = { name: 'dsh_mobile_listview' };
+      const p: preferences.Preferences = preferences.getPreferencesSync(host, opts);
+      p.putSync('groupBy', this.groupBy);
+      p.putSync('listState', this.listState);
+      p.flushSync();
+    } catch (e) {
+      console.info('DSH_VIEW save failed: ' + JSON.stringify(e));
+    }
+  }
+
+  private setGroupBy(g: string): void {
+    Haptics.tap();
+    this.groupBy = g;
+    this.viewOn = false;
+    this.saveListView();
+    this.applyListState();
+  }
+
+  private setListState(st: string): void {
+    Haptics.tap();
+    this.listState = st;
+    this.viewOn = false;
+    this.saveListView();
+    this.applyListState();
+  }
+
+  private toggleArchivedFromMenu(): void {
+    Haptics.tap();
+    this.viewOn = false;
+    if (this.archivedView) {
+      this.exitArchived();
+      return;
+    }
+    this.archivedView = true;
+    this.loading = true;
+    this.load();
+  }
+
+  private markAllRead(): void {
+    Haptics.tap();
+    this.viewOn = false;
+    Marks.clearAll();
   }
 
   private isFolded(label: string): boolean {
@@ -1155,14 +1294,15 @@ export struct SessionList {
   @Builder
   devSheet() {
     Column() {
+      // 顶部留够空间：系统那个 × 在右上角，标题贴太近会和第一张卡片撞在一起
       Text('切换电脑')
         .fontSize(17)
         .fontWeight(FontWeight.Medium)
         .fontColor(Tokens.fg)
         .width('100%')
-        .padding({ left: 20, right: 20, top: 6, bottom: 10 })
+        .padding({ left: 20, right: 20, top: 34, bottom: 14 })
 
-      List({ space: 8 }) {
+      List({ space: 10 }) {
         ForEach(Machines.list(), (m: Machine) => {
           ListItem() {
             Row() {
@@ -1194,7 +1334,7 @@ export struct SessionList {
               }
             }
             .width('100%')
-            .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+            .padding({ left: 16, right: 16, top: 16, bottom: 16 })
             .backgroundColor(Tokens.surface2)
             .borderRadius(14)
             .alignItems(VerticalAlign.Center)
@@ -1210,17 +1350,99 @@ export struct SessionList {
       }
       .layoutWeight(1)
       .scrollBar(BarState.Off)
-      .padding({ left: 16, right: 16 })
-
-      Text('在 设置 → 电脑 里可以添加、删除电脑。')
-        .fontSize(11)
-        .fontColor(Tokens.dim2)
-        .width('100%')
-        .padding({ left: 20, right: 20, top: 10, bottom: 18 })
+      .padding({ left: 16, right: 12 })
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
     .backgroundColor(Tokens.surface)
+  }
+
+  /** 菜单里的一行：左侧标题，选中时右侧一个勾 */
+  @Builder
+  viewOpt(label: string, on: boolean, act: () => void) {
+    Row() {
+      Text(label)
+        .fontSize(13.5)
+        .fontColor(Tokens.fg)
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+      if (on) {
+        Text('✓')
+          .fontSize(13)
+          .fontColor(Tokens.accent)
+      }
+    }
+    .width('100%')
+    .height(38)
+    .padding({ left: 12, right: 12 })
+    .borderRadius(9)
+    .backgroundColor(on ? (Tokens.isDark ? '#26FFFFFF' : '#99FFFFFF') : Color.Transparent)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+    .onClick(act)
+  }
+
+  @Builder
+  viewHead(label: string) {
+    Text(label)
+      .fontSize(10.5)
+      .fontColor(Tokens.dim2)
+      .width('100%')
+      .padding({ left: 12, top: 8, bottom: 4 })
+  }
+
+  /** 分组方式菜单：结构照 dsh-console */
+  @Builder
+  viewMenu() {
+    Column() {
+      this.viewHead('分组方式')
+      this.viewOpt('按时间排列（今天／昨天／更早）', this.groupBy === 'time', (): void => {
+        this.setGroupBy('time');
+      })
+      this.viewOpt('按工作区', this.groupBy === 'ws', (): void => {
+        this.setGroupBy('ws');
+      })
+      Divider().color(Tokens.lineSoft).margin({ top: 6, bottom: 2 })
+      this.viewHead('筛选会话')
+      this.viewOpt('显示已归档的会话', this.archivedView, (): void => {
+        if (!this.archivedView) {
+          this.toggleArchivedFromMenu();
+        } else {
+          this.viewOn = false;
+        }
+      })
+      this.viewOpt('隐藏已归档的会话', !this.archivedView, (): void => {
+        if (this.archivedView) {
+          this.toggleArchivedFromMenu();
+        } else {
+          this.viewOn = false;
+        }
+      })
+      Divider().color(Tokens.lineSoft).margin({ top: 6, bottom: 2 })
+      this.viewHead('列表状态')
+      this.viewOpt('默认全打开', this.listState === 'all', (): void => {
+        this.setListState('all');
+      })
+      this.viewOpt('默认打开第一列', this.listState === 'first', (): void => {
+        this.setListState('first');
+      })
+      this.viewOpt('默认关闭', this.listState === 'none', (): void => {
+        this.setListState('none');
+      })
+      Divider().color(Tokens.lineSoft).margin({ top: 6, bottom: 2 })
+      this.viewHead('已完成')
+      this.viewOpt('全部标为已读', false, (): void => {
+        this.markAllRead();
+      })
+    }
+    .width(268)
+    .padding({ left: 6, right: 6, top: 8, bottom: 10 })
+    .alignItems(HorizontalAlign.Start)
+    .backgroundColor(Tokens.isDark ? '#E6171B22' : '#F2FFFFFF')
+    .backdropBlur(24)
+    .borderRadius(18)
+    .border({ width: 1, color: Tokens.isDark ? '#33FFFFFF' : '#D9FFFFFF' })
+    .shadow({ radius: 26, color: Tokens.shadow, offsetY: 10 })
   }
 
   /** 下拉刷新区域：整块下移到摄像头开孔以下（默认位置在 0，会被挖孔挡住） */
@@ -1354,9 +1576,9 @@ export struct SessionList {
             }
           })
 
-          // 已归档：点一下直接进归档视图，再点一下回列表（不再有二级菜单）
+          // 分组方式：照 dsh-console 的菜单（分组 / 筛选 / 列表状态 / 全部标为已读）
           Stack() {
-            Image($r('app.media.ic_archive'))
+            Image($r('app.media.ic_group'))
               .width(19)
               .height(19)
               .fillColor(this.archivedView ? Tokens.accent : Tokens.fg)
@@ -1370,16 +1592,26 @@ export struct SessionList {
           .shadow({ radius: 12, color: Tokens.accentGlow, offsetY: 2 })
           .systemMaterial(Mat.whiteOn(this.matOn()))
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-          .accessibilityText(this.archivedView ? '返回会话列表' : '已归档对话')
+          .accessibilityText('分组方式')
           .onClick(() => {
             Haptics.tap();
-            if (this.archivedView) {
-              this.exitArchived();
-              return;
+            this.viewOn = true;
+          })
+          .bindPopup(this.viewOn, {
+            builder: this.viewMenu(),
+            placement: Placement.Bottom,
+            popupColor: Color.Transparent,
+            enableArrow: false,
+            radius: 18,
+            offset: { x: 0, y: 6 },
+            transition: TransitionEffect.OPACITY
+              .combine(TransitionEffect.scale({ x: 0.94, y: 0.94, centerX: '100%', centerY: '0%' }))
+              .animation({ duration: 180, curve: Curve.EaseOut }),
+            onStateChange: (e) => {
+              if (!e.isVisible) {
+                this.viewOn = false;
+              }
             }
-            this.archivedView = true;
-            this.loading = true;
-            this.load();
           })
 
           Stack() {

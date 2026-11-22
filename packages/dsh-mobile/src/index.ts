@@ -232,6 +232,37 @@ async function record(file: string, line: string): Promise<void> {
   }
 }
 
+/**
+ * 宿主的一条定时任务记录归一成手机端认识的形状。
+ *
+ * 两个来源字段名不同：活服务给的是 ScheduleCatalogEntry（`scheduledAt` 加
+ * `status`），磁盘上的 `tables.tasks` 行是旧格式。归一之后手机只渲染一种行，
+ * 列表和「暂停/恢复/删除」两处共用这里，免得各写一份再慢慢走样。
+ * @param raw - 宿主返回的一条任务记录。
+ * @returns 手机端的任务行。
+ */
+function normalizeScheduleTask(raw: unknown): Record<string, unknown> {
+  const bag = (raw !== null && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const inner = (bag.record !== null && typeof bag.record === 'object' ? bag.record : bag) as Record<string, unknown>
+  const target = (inner.target !== null && typeof inner.target === 'object' ? inner.target : {}) as Record<string, unknown>
+  const status = String(inner.status ?? '')
+  return {
+    id: String(inner.id ?? bag.id ?? ''),
+    title: String(inner.title ?? inner.name ?? '未命名任务'),
+    kind: String(inner.kind ?? inner.type ?? ''),
+    when: String(inner.nextRunAt ?? inner.nextAt ?? inner.next ?? inner.scheduledAt ?? inner.when ?? ''),
+    active: inner.active === true || status === 'active' || status === 'scheduled',
+    status,
+    sessionId: String(target.sessionId ?? inner.sessionId ?? ''),
+  }
+}
+
+/** profile 目录名：只许一层普通名字，挡掉 `..` 之类穿越路径。 */
+const PROFILE_DIR_NAME = /^[A-Za-z0-9._-]{1,64}$/
+
+/** 包名（可带 scope）：只用来在 dependencies 里查一项，不做版本解析。 */
+const BUNDLE_NAME = /^(@[A-Za-z0-9._-]{1,64}\/)?[A-Za-z0-9._-]{1,120}$/
+
 /** One session as the phone sees it. */
 interface SessionRow {
   id: string
@@ -3187,6 +3218,95 @@ export function apply(ctx: any, rawConfig?: Config): void {
         return
       }
 
+      // --- Host extras: enable or disable one installed plugin ---------------
+      // 开关写的是 profile 自己的包清单（`dsh.profile.bundles`），宿主只在启动时读
+      // 一次，所以改完必然要重启宿主才生效：响应里 `restartRequired` 明说不含糊，
+      // 手机端照着提示，不假装立刻生效。
+      if (path === '/api/host/plugins/toggle' && method === 'POST') {
+        let body: Record<string, unknown> = {}
+        try {
+          body = await readJson(req)
+        } catch (error) {
+          send(res, 400, { error: `请求体不是合法 JSON：${error instanceof Error ? error.message : String(error)}` })
+          return
+        }
+        const profile = String(body.profile ?? '').trim()
+        const name = String(body.name ?? '').trim()
+        if (!PROFILE_DIR_NAME.test(profile)) {
+          send(res, 400, { error: 'profile 名字不合法' })
+          return
+        }
+        if (!BUNDLE_NAME.test(name)) {
+          send(res, 400, { error: '插件名不合法' })
+          return
+        }
+        if (typeof body.enabled !== 'boolean') {
+          send(res, 400, { error: 'enabled 必须是布尔值' })
+          return
+        }
+        const enabled = body.enabled
+        const file = join(dshHome(), 'profiles', profile, 'package.json')
+        let raw = ''
+        try {
+          raw = readFileSync(file, 'utf8')
+        } catch {
+          send(res, 404, { error: `找不到 profile ${profile} 的 package.json` })
+          return
+        }
+        let bag: Record<string, unknown>
+        try {
+          bag = JSON.parse(raw) as Record<string, unknown>
+        } catch {
+          send(res, 500, { error: `profile ${profile} 的 package.json 不是合法 JSON，先手动修好再开开关` })
+          return
+        }
+        const deps: Record<string, unknown> =
+          typeof bag.dependencies === 'object' && bag.dependencies !== null
+            ? (bag.dependencies as Record<string, unknown>)
+            : {}
+        if (typeof deps[name] !== 'string') {
+          // 只列 dependencies 里的包，所以这里大多意味着别人刚改过清单。
+          send(res, 400, { error: `${name} 不在 profile ${profile} 的依赖里，这里只能开关已安装的插件` })
+          return
+        }
+        const dsh: Record<string, unknown> =
+          typeof bag.dsh === 'object' && bag.dsh !== null ? (bag.dsh as Record<string, unknown>) : {}
+        const prof: Record<string, unknown> =
+          typeof dsh.profile === 'object' && dsh.profile !== null ? (dsh.profile as Record<string, unknown>) : {}
+        const current = Array.isArray(prof.bundles) ? (prof.bundles as unknown[]).map((x) => String(x)) : []
+        const present = current.indexOf(name) >= 0
+        if (present === enabled) {
+          // 已经在要的状态：不碰文件，也不误导用户去重启。
+          await record(logFile, `200 POST plugin-toggle ${profile}/${name} enabled=${String(enabled)} changed=false`)
+          send(res, 200, { ok: true, profile, name, enabled, changed: false, restartRequired: false })
+          return
+        }
+        const nextBundles = enabled ? current.concat([name]) : current.filter((x) => x !== name)
+        // 只换 bundles 这一个字段，其余键与顺序照原样写回。
+        bag.dsh = { ...dsh, profile: { ...prof, bundles: nextBundles } }
+        const text = `${JSON.stringify(bag, null, 2)}\n`
+        const temp = `${file}.${String(process.pid)}.tmp`
+        try {
+          // 先留一份原样备份：手改坏的清单还有得救。
+          writeFileSync(`${file}.bak`, raw, 'utf8')
+          writeFileSync(temp, text, 'utf8')
+          renameSync(temp, file)
+        } catch (error) {
+          try {
+            unlinkSync(temp)
+          } catch {
+            // 临时文件没写成，或已被 rename 消费。
+          }
+          const message = error instanceof Error ? error.message : String(error)
+          await record(logFile, `500 POST plugin-toggle ${profile}/${name} write failed: ${message}`)
+          send(res, 500, { error: `写 profile 清单失败：${message}` })
+          return
+        }
+        await record(logFile, `200 POST plugin-toggle ${profile}/${name} enabled=${String(enabled)} changed=true`)
+        send(res, 200, { ok: true, profile, name, enabled, changed: true, restartRequired: true })
+        return
+      }
+
       // --- Host extras: agent team --------------------------------------------
       // The Team service has no list method: membership and the task board are
       // Session-log events, so the log is the only durable source. Latest record
@@ -3331,28 +3451,14 @@ export function apply(ctx: any, rawConfig?: Config): void {
 
       // --- Host extras: scheduled tasks ---------------------------------------
       if (path === '/api/host/schedules' && method === 'GET') {
-        // Both shapes (the live service and the on-disk unit) are normalised here so
-        // the phone renders one stable row type and never guesses at host internals.
-        const normTask = (raw: unknown): Record<string, unknown> => {
-          const bag = (raw !== null && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
-          const inner = (bag.record !== null && typeof bag.record === 'object' ? bag.record : bag) as Record<string, unknown>
-          const target = (inner.target !== null && typeof inner.target === 'object' ? inner.target : {}) as Record<string, unknown>
-          const status = String(inner.status ?? '')
-          return {
-            id: String(inner.id ?? bag.id ?? ''),
-            title: String(inner.title ?? inner.name ?? '未命名任务'),
-            kind: String(inner.kind ?? inner.type ?? ''),
-            when: String(inner.nextRunAt ?? inner.nextAt ?? inner.next ?? inner.scheduledAt ?? inner.when ?? ''),
-            active: inner.active === true || status === 'active' || status === 'scheduled',
-            sessionId: String(target.sessionId ?? inner.sessionId ?? ''),
-          }
-        }
+        // 两种来源（活服务与磁盘上的单元）都由 normalizeScheduleTask 归一，手机端
+        // 只渲染一种行，不必猜宿主内部结构。
         const svc = service('schedule')
         if (svc !== null && typeof svc.list === 'function') {
           const page: unknown = await Promise.resolve((svc.list as (arg: unknown) => unknown)({ limit: 100 }))
           const bag = (page !== null && typeof page === 'object' ? page : {}) as Record<string, unknown>
           const rows = Array.isArray(bag.items) ? (bag.items as unknown[]) : []
-          send(res, 200, { ok: true, source: 'service', items: rows.map(normTask) })
+          send(res, 200, { ok: true, source: 'service', items: rows.map(normalizeScheduleTask) })
           return
         }
         let raw = ''
@@ -3366,12 +3472,144 @@ export function apply(ctx: any, rawConfig?: Config): void {
         try {
           const bag = JSON.parse(raw) as { tables?: { tasks?: Record<string, unknown> } }
           const table = (bag.tables !== undefined && bag.tables.tasks !== undefined ? bag.tables.tasks : {}) as Record<string, unknown>
-          items = Object.keys(table).map((key) => normTask(table[key]))
+          items = Object.keys(table).map((key) => normalizeScheduleTask(table[key]))
         } catch (err) {
           send(res, 500, { error: `cannot read scheduled tasks: ${err instanceof Error ? err.message : String(err)}` })
           return
         }
         send(res, 200, { ok: true, source: 'file', items })
+        return
+      }
+
+      // --- Host extras: one write on a scheduled task -------------------------
+      // 宿主把四种动作拆在两个方法上：`edit`（更新时带 active 补丁、以及 delete）
+      // 和 `run`（立即执行一次）。不同版本的方法与动词都变过，所以先探测能力，再
+      // 逐条候选试到对得上为止；一条都对不上就回 501 并说明原因，不假装成功。
+      const scheduleActionMatch = /^\/api\/host\/schedules\/([^/]+)\/action$/.exec(path)
+      if (scheduleActionMatch !== null && method === 'POST') {
+        let body: Record<string, unknown> = {}
+        try {
+          body = await readJson(req)
+        } catch (error) {
+          send(res, 400, { error: `请求体不是合法 JSON：${error instanceof Error ? error.message : String(error)}` })
+          return
+        }
+        const action = String(body.action ?? '').trim()
+        if (action !== 'pause' && action !== 'resume' && action !== 'run' && action !== 'delete') {
+          send(res, 400, { error: 'action 只能是 pause、resume、run 或 delete' })
+          return
+        }
+        let id = ''
+        try {
+          id = decodeURIComponent(scheduleActionMatch[1])
+        } catch {
+          send(res, 400, { error: '任务 id 编码不合法' })
+          return
+        }
+        if (id === '') {
+          send(res, 400, { error: '任务 id 不能为空' })
+          return
+        }
+        const svc = service('schedule')
+        if (svc === null) {
+          send(res, 503, { error: '这台电脑没有挂载自动化任务（schedule 服务不可用）' })
+          return
+        }
+        const canEdit = typeof svc.edit === 'function'
+        const canRun = typeof svc.run === 'function'
+        // 每条候选保持服务实例作 receiver（服务内部要用 this.ctx），所以一律
+        // 写成 svc.xxx(...) 的成员调用，不把方法取出来单独存。
+        const attempts: Array<{ label: string; call: () => Promise<unknown> }> = []
+        if (action === 'run') {
+          if (canRun) attempts.push({ label: 'run', call: () => Promise.resolve(svc.run({ id })) })
+          if (canEdit) attempts.push({ label: 'edit.run', call: () => Promise.resolve(svc.edit({ id, action: 'run' })) })
+        } else if (action === 'delete') {
+          if (canEdit) {
+            attempts.push({ label: 'edit.delete', call: () => Promise.resolve(svc.edit({ id, action: 'delete' })) })
+          }
+        } else {
+          const wantResume = action === 'resume'
+          if (canEdit) {
+            // 新版宿主：update 带 active 补丁；老版宿主：直接认 pause/resume 动词。
+            attempts.push({
+              label: 'edit.update',
+              call: () => Promise.resolve(svc.edit({ id, action: 'update', patch: { active: wantResume } })),
+            })
+            attempts.push({ label: `edit.${action}`, call: () => Promise.resolve(svc.edit({ id, action })) })
+          }
+        }
+        if (attempts.length === 0) {
+          await record(logFile, `501 POST schedule-action id=${id} action=${action} unsupported`)
+          send(res, 501, {
+            error: '这台电脑的定时任务服务不支持这个操作（缺少 edit / run 方法），升级 DSH 后再试',
+            action,
+            unsupported: true,
+          })
+          return
+        }
+        let result: unknown = undefined
+        let used = ''
+        const failures: string[] = []
+        for (const attempt of attempts) {
+          try {
+            result = await attempt.call()
+            used = attempt.label
+            break
+          } catch (error) {
+            const coded = typeof (error as { code?: unknown }).code === 'string' ? String((error as { code: string }).code) : ''
+            const message = error instanceof Error ? error.message : String(error)
+            failures.push(`${attempt.label}: ${message}`)
+            // 只有「不认这个参数或动词」才换下一条候选；别的错误换参数只会让同一
+            // 个动作写第二次，所以直接停在这里。
+            const retryable = coded === 'schedule/input-invalid'
+              || /unknown action|invalid|not supported|unsupported/i.test(message)
+            if (!retryable) {
+              const archived = coded === 'schedule/target-archived' || message.indexOf('schedule/target-archived') >= 0
+              const status = archived ? 409 : 500
+              const readable = archived
+                ? '这个任务的目标会话已归档，先在电脑上恢复那个会话再试'
+                : `电脑端拒绝了这个操作：${message}`
+              await record(logFile, `${String(status)} POST schedule-action id=${id} action=${action} code=${coded} err=${message}`)
+              send(res, status, { error: readable, action })
+              return
+            }
+          }
+        }
+        if (used === '') {
+          const detail = failures.length > 0 ? failures[failures.length - 1] : '没有可用的方法'
+          await record(logFile, `501 POST schedule-action id=${id} action=${action} none-of: ${failures.join(' | ')}`)
+          send(res, 501, {
+            error: `这台电脑的定时任务服务没有接受这个操作，升级 DSH 后再试（${detail}）`,
+            action,
+            unsupported: true,
+            tried: failures,
+          })
+          return
+        }
+        const bag = (result !== null && typeof result === 'object' ? result : {}) as Record<string, unknown>
+        const code = typeof bag.code === 'string' ? bag.code : ''
+        if (code === 'schedule_not_found') {
+          await record(logFile, `404 POST schedule-action id=${id} action=${action} not-found`)
+          send(res, 404, { error: '这个任务在电脑上已经不存在了，刷新列表看看', action })
+          return
+        }
+        if (code === 'schedule_conflict') {
+          await record(logFile, `409 POST schedule-action id=${id} action=${action} conflict`)
+          send(res, 409, { error: '任务刚被别处改过，刷新列表再试一次', action })
+          return
+        }
+        if (code === 'schedule_execution_pending') {
+          await record(logFile, `409 POST schedule-action id=${id} action=${action} pending`)
+          send(res, 409, { error: '这个任务正在执行，稍等一会儿再点「立即」', action, pending: true })
+          return
+        }
+        if (bag.deleted === true) {
+          await record(logFile, `200 POST schedule-action id=${id} action=${action} via=${used} deleted`)
+          send(res, 200, { ok: true, action, id, via: used, deleted: true })
+          return
+        }
+        await record(logFile, `200 POST schedule-action id=${id} action=${action} via=${used}`)
+        send(res, 200, { ok: true, action, id, via: used, item: normalizeScheduleTask(result) })
         return
       }
 

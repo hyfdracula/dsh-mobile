@@ -189,6 +189,11 @@ export struct ChatPage {
   @State private bigEditOn: boolean = false;
   @State private attachOn: boolean = false;
   @State private atBottom: boolean = true;
+  // 输入卡实测高度：沉底按钮要靠它上移，否则输入框长高后会压在一起
+  @State private inputH: number = 0;
+  // 长按气泡弹出的操作面板：复制 / 引用 / 分支
+  @State private msgMenuOn: boolean = false;
+  @State private menuMsg: Message | null = null;
   @State private queueItems: QueuedItem[] = [];
   /** 重启/中断后仍没发出去的那几条（本地影子，见 common/Outbox.ets）。 */
   @State private rescue: StashItem[] = [];
@@ -490,9 +495,12 @@ export struct ChatPage {
         this.msgs = grown;
         this.total = r.total;
         this.stats = r.stats ?? null;
-        setTimeout(() => {
-          this.scroller.scrollEdge(Edge.Bottom);
-        }, 80);
+        // 只有原本就贴着底部时才跟随新消息；用户上滑回看时页面保持不动
+        if (this.atBottom) {
+          setTimeout(() => {
+            this.scroller.scrollEdge(Edge.Bottom);
+          }, 80);
+        }
       }
     } catch (e) {
       // 轮询失败不打扰用户，等下一次
@@ -1225,6 +1233,7 @@ export struct ChatPage {
         }, 30);
       }
     }
+    const wasBottom: boolean = this.atBottom;
     try {
       const r = await this.api.messages(this.param.id, 60);
       if (!this.alive || g !== this.gen) return;
@@ -1241,9 +1250,12 @@ export struct ChatPage {
       this.cached = false;
       ChatCache.write(this.param.id, r.messages, r.total, r.running === true, r.lastTurn ?? '');
       this.reconcileRescue(r);
-      setTimeout(() => {
-        this.scroller.scrollEdge(Edge.Bottom);
-      }, 80);
+      // 只在刷新前就停在底部时才滚到底：缓存铺屏后网络补全不再打断回看
+      if (wasBottom) {
+        setTimeout(() => {
+          this.scroller.scrollEdge(Edge.Bottom);
+        }, 80);
+      }
     } catch (e) {
       const msg: string = (e as Error).message;
       // 刚新建的会话，宿主那边日志文件还没落盘，会先 404 一次；这不算错误，
@@ -1536,6 +1548,77 @@ export struct ChatPage {
   }
 
   /** 长按气泡复制：手机上最常见的「我想把这段发给别人」。 */
+  /** 引用：把这条消息前几行塞进草稿，做成引用块 */
+  private quoteMessage(m: Message): void {
+    const t: string = m.text.trim();
+    if (t === '') {
+      return;
+    }
+    const rows: string[] = t.split('\n').slice(0, 6);
+    const quote: string = rows.map((x: string) => '> ' + x).join('\n');
+    this.draft = this.draft === '' ? quote + '\n\n' : this.draft + '\n' + quote + '\n\n';
+    Drafts.set(this.param.id, this.draft);
+  }
+
+  @Builder
+  msgAction(label: string, act: () => void) {
+    Row() {
+      Text(label)
+        .fontSize(15)
+        .fontColor(Tokens.fg)
+        .layoutWeight(1)
+      Text('›')
+        .fontSize(16)
+        .fontColor(Tokens.dim2)
+    }
+    .width('100%')
+    .height(52)
+    .padding({ left: 14, right: 14 })
+    .backgroundColor(Tokens.isDark ? '#26FFFFFF' : '#8CFFFFFF')
+    .borderRadius(14)
+    .border({ width: 1, color: Tokens.isDark ? '#33FFFFFF' : '#B3FFFFFF' })
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+    .onClick(act)
+  }
+
+  /** 长按气泡弹出的操作面板：和选择模型/上下文同一套毛玻璃 */
+  @Builder
+  msgMenu() {
+    Column({ space: 8 }) {
+      Text(this.menuMsg !== null && this.menuMsg.role === 'user' ? '我的消息' : '这条回复')
+        .fontSize(12)
+        .fontColor(Tokens.dim2)
+        .width('100%')
+        .padding({ left: 4, bottom: 2 })
+      this.msgAction('复制文字', (): void => {
+        const mm: Message | null = this.menuMsg;
+        this.msgMenuOn = false;
+        if (mm !== null) {
+          this.copyMessage(mm);
+        }
+      })
+      this.msgAction('引用回复', (): void => {
+        const mm: Message | null = this.menuMsg;
+        this.msgMenuOn = false;
+        if (mm !== null) {
+          this.quoteMessage(mm);
+        }
+      })
+      if (this.menuMsg !== null && this.menuMsg.role === 'assistant' && this.menuMsg.turn !== undefined) {
+        this.msgAction('从这里开新分支', (): void => {
+          const mm: Message | null = this.menuMsg;
+          this.msgMenuOn = false;
+          if (mm !== null) {
+            this.forkAt(mm);
+          }
+        })
+      }
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 20, bottom: 26 })
+    .alignItems(HorizontalAlign.Start)
+  }
+
   private copyMessage(m: Message): void {
     if (m.text === '') return;
     try {
@@ -1829,28 +1912,15 @@ export struct ChatPage {
       .width('100%')
       .justifyContent(FlexAlign.End)
 
-      Row() {
-        Image($r('app.media.ic_copy'))
-          .width(14)
-          .height(14)
-          .fillColor(Tokens.dim2)
-          .objectFit(ImageFit.Contain)
-        Text('复制')
-          .fontSize(11)
-          .fontColor(Tokens.dim2)
-          .margin({ left: 4 })
-      }
-      .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-      .margin({ top: 6 })
-      .borderRadius(10)
-      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-      .onClick(() => {
-        this.copyMessage(m);
-      })
       }
       .width('100%')
       .alignItems(HorizontalAlign.End)
       .margin({ bottom: 20 })
+      .gesture(LongPressGesture({ repeat: false, duration: 380 }).onAction(() => {
+        Haptics.tap();
+        this.menuMsg = m;
+        this.msgMenuOn = true;
+      }))
     } else {
       // 助手气泡：模型名 + 头像在上，正文装在卡片里
       Column() {
@@ -1906,52 +1976,16 @@ export struct ChatPage {
         .border({ width: 1, color: Tokens.lineSoft })
         .width('100%')
 
-        Row({ space: 6 }) {
-          Row() {
-            Image($r('app.media.ic_copy'))
-              .width(14)
-              .height(14)
-              .fillColor(Tokens.dim2)
-              .objectFit(ImageFit.Contain)
-            Text('复制')
-              .fontSize(11)
-              .fontColor(Tokens.dim2)
-              .margin({ left: 4 })
-          }
-          .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-          .borderRadius(10)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-          .onClick(() => {
-            this.copyMessage(m);
-          })
+        Row({ space: 10 }) {
           if (m.turn !== undefined) {
             Text(this.tokenText(m.turn.tokensIn + m.turn.tokensOut) + ' tokens')
               .fontSize(11)
               .fontColor(Tokens.dim2)
-              .margin({ left: 2 })
           }
-          Row() {
-            Image($r('app.media.ic_fork'))
-              .width(13)
-              .height(13)
-              .fillColor(Tokens.dim2)
-              .objectFit(ImageFit.Contain)
-            Text('分支')
-              .fontSize(11)
-              .fontColor(Tokens.dim2)
-              .margin({ left: 4 })
-          }
-          .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-          .borderRadius(10)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-          .onClick(() => {
-            this.forkAt(m);
-          })
           if (m.turn !== undefined && this.clockText(m.turn.finishedAt === undefined ? 0 : m.turn.finishedAt) !== '') {
             Text(this.clockText(m.turn.finishedAt === undefined ? 0 : m.turn.finishedAt))
               .fontSize(11)
               .fontColor(Tokens.dim2)
-              .margin({ left: 4 })
           }
         }
         .margin({ top: 6 })
@@ -1959,6 +1993,11 @@ export struct ChatPage {
       .width('100%')
       .alignItems(HorizontalAlign.Start)
       .margin({ bottom: 20 })
+      .gesture(LongPressGesture({ repeat: false, duration: 380 }).onAction(() => {
+        Haptics.tap();
+        this.menuMsg = m;
+        this.msgMenuOn = true;
+      }))
     }
   }
 
@@ -3564,6 +3603,18 @@ export struct ChatPage {
           })
 
           .hitTestBehavior(HitTestMode.Transparent)
+          // 长按气泡时把操作面板挂在列表上：系统半模态，毛玻璃底
+          .bindSheet($$this.msgMenuOn, this.msgMenu(), {
+            height: 300,
+            dragBar: true,
+            showClose: false,
+            backgroundColor: Tokens.sheetWarm,
+            blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+            maskColor: '#33000000',
+            onDisappear: () => {
+              this.msgMenuOn = false;
+            }
+          })
 
 
           // 顶栏透明（HDS 的滚动模糊被关掉），内容滚上来会和状态栏文字叠在一起，
@@ -3721,6 +3772,7 @@ export struct ChatPage {
                   .layoutWeight(1)
                   .constraintSize({ minHeight: 46, maxHeight: 112 })
                   .maxLines(3)
+                  .barState(BarState.Auto)
                   .enterKeyType(EnterKeyType.Send)
                   .onChange((v: string) => {
                     this.draft = v;
@@ -3886,6 +3938,12 @@ export struct ChatPage {
             .borderRadius(24)
             .border({ width: 1, color: Tokens.isDark ? '#59FFFFFF' : '#F2FFFFFF' })
             .shadow({ radius: 26, color: Tokens.shadow, offsetY: 6 })
+            .onAreaChange((oldValue: Area, newValue: Area) => {
+              const h: number = Number(newValue.height);
+              if (h > 0 && Math.abs(h - this.inputH) > 1) {
+                this.inputH = h;
+              }
+            })
 
             }
             .width('100%')
@@ -3911,7 +3969,8 @@ export struct ChatPage {
           .backdropBlur(18)
           .border({ width: 1, color: Tokens.glassTop })
           .shadow({ radius: 18, color: Tokens.shadow, offsetY: 6 })
-          .position({ right: 18, bottom: this.kbH + 132 + this.pendH })
+          // 输入卡实测高度 + 待发送板高度：按钮永远浮在它们上方，不重合
+          .position({ right: 18, bottom: this.kbH + this.inputH + 24 + this.pendH })
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
           .transition(TransitionEffect.OPACITY.animation({ duration: 160 }))
           .onClick(() => {

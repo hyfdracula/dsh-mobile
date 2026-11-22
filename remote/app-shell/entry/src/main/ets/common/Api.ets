@@ -1,4 +1,4 @@
-﻿import http from '@ohos.net.http';
+import http from '@ohos.net.http';
 import { ImagePart } from './Images';
 import { FilePart } from './Files';
 
@@ -272,6 +272,11 @@ export class Api {
   private nextLanProbe: number = 0;
   /** 局域网探针失败后的冷却截止时间：人在外面时每次都白等 1.5 秒太亏。 */
   private lanDownUntil: number = 0;
+  /**
+   * 这台电脑可能的局域网地址。配对时只知道一个，电脑换了 IP、或者有多个网卡时
+   * 那一个就不通了；每次拿到 /api/info 都把它自报的 address 合进来，逐个试。
+   */
+  private lanCands: string[] = [];
 
   constructor(wanBase: string, token: string, lanBase: string = '') {
     this.wanBase = wanBase.replace(/\/+$/, '');
@@ -320,6 +325,10 @@ export class Api {
   rebase(wanBase: string, token: string, lanBase: string = ''): void {
     this.wanBase = wanBase.replace(/\/+$/, '');
     this.lanBase = lanBase.replace(/\/+$/, '');
+    this.lanCands = [];
+    if (this.lanBase !== '') {
+      this.lanCands.push(this.lanBase);
+    }
     this.token = token;
     this.chosen = '';
     this.lanDownUntil = 0;
@@ -347,6 +356,62 @@ export class Api {
     }
   }
 
+  /** 把 /api/info 自报的地址合进候选（只取 IPv4，跳过回环） */
+  private seedLan(addresses: string[] | undefined, port: number): void {
+    if (addresses === undefined || addresses.length === 0 || port <= 0) {
+      return;
+    }
+    for (let i = 0; i < addresses.length; i++) {
+      const a: string = addresses[i];
+      // 跳过 IPv6（这里只按 IPv4 拼地址，IPv6 需要方括号且家中多半走不通）
+      if (a.indexOf(':') >= 0 || a === '127.0.0.1' || a === '') {
+        continue;
+      }
+      const base: string = 'http://' + a + ':' + String(port);
+      if (this.lanCands.indexOf(base) < 0) {
+        this.lanCands.push(base);
+      }
+    }
+    // 配对时记下的那个排最前：它通常是这台电脑真正在用的网卡
+    if (this.lanBase !== '') {
+      const at: number = this.lanCands.indexOf(this.lanBase);
+      if (at > 0) {
+        this.lanCands.splice(at, 1);
+        this.lanCands.unshift(this.lanBase);
+      }
+    }
+  }
+
+  /**
+   * 挨个试候选地址，返回第一个能用的；都不通返回空串。
+   * 用 /api/info 探（带令牌）：/health 免鉴权，换了令牌时会误判可用。
+   */
+  private async probeLan(timeoutMs: number): Promise<string> {
+    const list: string[] = [];
+    if (this.lanBase !== '') {
+      list.push(this.lanBase);
+    }
+    for (let i = 0; i < this.lanCands.length; i++) {
+      if (list.indexOf(this.lanCands[i]) < 0) {
+        list.push(this.lanCands[i]);
+      }
+    }
+    for (let i = 0; i < list.length; i++) {
+      try {
+        const r = await this.rawGet(list[i] + '/api/info', timeoutMs, true);
+        if (r.code === 200 || r.code === 401 || r.code === 403) {
+          this.lanBase = list[i];
+          this.lanDownUntil = 0;
+          console.info('DSH_BASE lan ' + list[i]);
+          return list[i];
+        }
+      } catch (e) {
+        console.info('DSH_BASE lan miss ' + list[i]);
+      }
+    }
+    return '';
+  }
+
   /** 选一次入口：局域网探得通就走局域网，否则走隧道。 */
   private async ensureBase(): Promise<string> {
     if (this.chosen !== '') {
@@ -357,21 +422,15 @@ export class Api {
       console.info('DSH_BASE wan (forced) ' + this.wanBase);
       return this.chosen;
     }
-    if (this.lanBase !== '' && Date.now() >= this.lanDownUntil) {
-      try {
-        // 探针要带令牌：/health 是免鉴权的，只探它会在换了令牌后误判局域网可用，
-        // 随后每个业务请求都 401。所以用 /api/info 探，200 才算这个入口真能用。
-        const r = await this.rawGet(this.lanBase + '/api/info', 800, true);
-        if (r.code === 200 || r.code === 401 || r.code === 403) {
-          this.chosen = this.lanBase;
-          this.lanDownUntil = 0;
-          console.info('DSH_BASE lan ' + this.lanBase);
-          return this.chosen;
-        }
-      } catch (e) {
-        this.lanDownUntil = Date.now() + 60000;
-        console.info('DSH_BASE lan probe failed: ' + (e as Error).message);
+    if (Date.now() >= this.lanDownUntil) {
+      // 探针要带令牌：/health 是免鉴权的，只探它会在换了令牌后误判局域网可用，
+      // 随后每个业务请求都 401。所以用 /api/info 探，200 才算这个入口真能用。
+      const hit: string = await this.probeLan(800);
+      if (hit !== '') {
+        this.chosen = hit;
+        return this.chosen;
       }
+      this.lanDownUntil = Date.now() + 60000;
     }
     this.chosen = this.wanBase;
     console.info('DSH_BASE wan ' + this.wanBase);
@@ -391,17 +450,12 @@ export class Api {
     this.chosen = '';
     this.lanDownUntil = 0;
     this.nextLanProbe = 0;
-    if (this.autoLan && !this.forceWan && this.lanBase !== '') {
-      try {
-        const r = await this.rawGet(this.lanBase + '/api/info', 900, true);
-        if (r.code === 200) {
-          this.chosen = this.lanBase;
-          console.info('DSH_BASE poke lan ' + this.lanBase);
-          return;
-        }
-        console.info('DSH_BASE poke lan http ' + String(r.code));
-      } catch (e) {
-        console.info('DSH_BASE poke lan failed: ' + (e as Error).message);
+    if (this.autoLan && !this.forceWan) {
+      const hit: string = await this.probeLan(900);
+      if (hit !== '') {
+        this.chosen = hit;
+        console.info('DSH_BASE poke lan ' + hit);
+        return;
       }
     }
     this.chosen = this.wanBase;
@@ -413,7 +467,7 @@ export class Api {
    * 人从外面回到家，下一次请求就会自动换回局域网直连，不用手动重连。
    */
   private scheduleLanProbe(): void {
-    if (!this.autoLan || this.forceWan || this.lanBase === '') {
+    if (!this.autoLan || this.forceWan) {
       return;
     }
     const now = Date.now();
@@ -421,11 +475,11 @@ export class Api {
       return;
     }
     this.nextLanProbe = now + 15000;
-    this.rawGet(this.lanBase + '/api/info', 800, true).then((r) => {
-      if (r.code === 200) {
-        this.chosen = this.lanBase;
+    this.probeLan(700).then((hit: string) => {
+      if (hit !== '') {
+        this.chosen = hit;
         this.lanDownUntil = 0;
-        console.info('DSH_BASE switch lan ' + this.lanBase);
+        console.info('DSH_BASE switch lan ' + hit);
       } else {
         this.lanDownUntil = Date.now() + 60000;
       }
@@ -584,6 +638,8 @@ export class Api {
   }
   async info(): Promise<ApiInfo> {
     const r = await this.call<InfoResp>('/api/info', 'GET');
+    // 电脑自报的地址比配对时记的那一个更全：换了 IP / 多网卡时靠它兜底
+    this.seedLan(r.addresses, r.port);
     return { ok: r.ok, version: r.version, host: r.host, port: r.port };
   }
 
@@ -811,6 +867,27 @@ export class Api {
   async hostSchedules(): Promise<HostTaskRow[]> {
     const r = await this.call<HostSchedulesResp>('/api/host/schedules', 'GET');
     return r.items === undefined ? [] : r.items;
+  }
+
+  /**
+   * 对一条自动化任务做动作：
+   * pause 暂停、resume 恢复、run 立即执行、delete 删除。
+   * 电脑端不支持时抛错（HTTP 501 会带原因），调用方把消息显示出来即可。
+   */
+  async scheduleAction(id: string, action: string): Promise<void> {
+    const body: HostTaskActionBody = { action: action };
+    await this.call<object>(
+      '/api/host/schedules/' + encodeURIComponent(id) + '/action', 'POST', JSON.stringify(body));
+  }
+
+  /**
+   * 开关某个 profile 里的插件，电脑端会写回 package.json 的 dsh.profile.bundles。
+   * 返回 true 表示清单真的改了（需要重启宿主才生效），false 表示本来就是那个状态。
+   */
+  async pluginToggle(profile: string, name: string, enabled: boolean): Promise<boolean> {
+    const body: HostPluginToggleBody = { profile: profile, name: name, enabled: enabled };
+    const r = await this.call<HostPluginToggleResp>('/api/host/plugins/toggle', 'POST', JSON.stringify(body));
+    return r.changed === true;
   }
 
   /** 会话工作目录下的一层文件。 */
@@ -1078,6 +1155,29 @@ interface HostSchedulesResp {
   ok?: boolean;
   source?: string;
   items?: HostTaskRow[];
+}
+
+/** 任务动作的请求体：action 只认 pause / resume / run / delete。 */
+interface HostTaskActionBody {
+  action: string;
+}
+
+/** 插件开关的请求体。 */
+interface HostPluginToggleBody {
+  profile: string;
+  name: string;
+  enabled: boolean;
+}
+
+interface HostPluginToggleResp {
+  ok?: boolean;
+  profile?: string;
+  name?: string;
+  enabled?: boolean;
+  /** 清单是否真的被改写；没改说明本来就是那个状态 */
+  changed?: boolean;
+  /** 改写后必须重启宿主才生效 */
+  restartRequired?: boolean;
 }
 
 export interface FsEntry {
