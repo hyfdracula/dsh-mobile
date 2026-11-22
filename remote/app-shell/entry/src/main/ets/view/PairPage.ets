@@ -347,7 +347,7 @@ export struct PairPage {
       this.head('先把电脑准备好', '三件事，做完手机就能连上来。')
 
       this.stepCard(1, Tokens.ok, '给电脑装上「DSH 手机连接」插件',
-        '插件包在 App 发布页的附件里（dsh-mobile-plugin.zip），下载解压。不用装 npm：打开 DSH 侧栏「插件 → 添加插件」，直接选解压出来的那个目录就行。也可以用下面的命令行装，把 <插件目录> 换成解压后的路径。')
+        '插件包在 App 发布页的附件里（dsh-mobile-plugin-*.zip），下载解压。不用装 npm：打开 DSH 侧栏「插件 → 添加插件」，直接选解压出来的那个目录就行。也可以用下面的命令行装，把 <插件目录> 换成解压后的路径。')
       this.cmdBlock()
       Row().height(10)
 
