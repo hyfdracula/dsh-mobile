@@ -850,7 +850,7 @@ function historyOf(file) {
 			const text = textOf(ev.data?.message?.content);
 			const usage = ev.data?.usage;
 			if (usage !== null && typeof usage === "object") {
-				turnIn = Number(usage.inputTokens ?? 0) || 0;
+				turnIn = (Number(usage.inputTokens ?? 0) || 0) + (Number(usage.cacheReadTokens ?? usage.cachedInputTokens ?? 0) || 0);
 				turnOut += Number(usage.outputTokens ?? 0) || 0;
 			}
 			if (text.length === 0) continue;

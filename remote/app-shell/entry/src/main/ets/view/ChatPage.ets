@@ -3427,8 +3427,12 @@ export struct ChatPage {
                 .height(60)
                 .width('100%')
               } else {
-                this.mixRow(Tokens.accent, '消息（含附件）', this.msgTokens(), this.mixUnit())
-                this.mixRow('#7AA2FF', '系统与工具', this.baseTokens(), this.mixUnit())
+                if (this.baseTokens() > 0 && this.baseTokens() < this.ctx.used) {
+                  this.mixRow(Tokens.accent, '消息（含附件）', this.msgTokens(), this.mixUnit())
+                  this.mixRow('#7AA2FF', '系统与工具', this.baseTokens(), this.mixUnit())
+                } else {
+                  this.mixRow(Tokens.accent, '全部上下文', this.ctx.used, this.mixUnit())
+                }
                 if (this.mixScope === 'window') {
                   this.mixRow(Tokens.surface3, '剩余', Math.max(0, this.ctx.window - this.ctx.used), this.mixUnit())
                 }
@@ -3436,7 +3440,7 @@ export struct ChatPage {
                 this.metaRow('上下文合计', fmtNum(this.ctx.used) + ' / ' + fmtNum(this.ctx.window) + ' token', true)
               }
 
-              Text('数值是本地估算：系统与工具取首轮 prompt，消息部分是上一次请求减掉这个基线；以宿主的 token-meter 为准。')
+              Text('数值是本地估算：系统与工具取首轮 prompt（含缓存命中），消息部分是当前上下文减掉这个基线；以宿主的 token-meter 为准。')
                 .fontSize(11.5)
                 .fontColor(Tokens.dim2)
                 .lineHeight(17)

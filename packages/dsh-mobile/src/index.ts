@@ -1157,7 +1157,11 @@ function historyOf(file: string): {
       if (usage !== null && typeof usage === 'object') {
         // 每一跳的 inputTokens 都是「整段上下文」，累加会翻好几倍；取最后一跳的输入，
         // 输出按跳累加，才是这一轮真实读了多少、写了多少。
-        turnIn = Number(usage.inputTokens ?? 0) || 0
+        // inputTokens 只是没命中缓存的那部分，命中缓存的量在 cacheReadTokens 里；
+        // 两者相加才是这一跳真正的 prompt 大小（否则手机端会看到「163 tokens」这种假数）。
+        const freshIn = Number(usage.inputTokens ?? 0) || 0
+        const cachedIn = Number(usage.cacheReadTokens ?? usage.cachedInputTokens ?? 0) || 0
+        turnIn = freshIn + cachedIn
         turnOut += Number(usage.outputTokens ?? 0) || 0
       }
       if (text.length === 0) continue

@@ -112,12 +112,13 @@ export struct PairPage {
 
   private async copyCmd(): Promise<void> {
     try {
-      const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, 'dsh-mobile');
+      const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN,
+      'dsh plugin --profile desktop add link:<插件目录>');
       await pasteboard.getSystemPasteboard().setData(data);
       Haptics.tap();
       this.hint = '已复制插件名';
     } catch (e) {
-      this.hint = '复制失败，手动记一下：dsh-mobile';
+      this.hint = '复制失败，手动记一下：dsh plugin --profile desktop add link:<插件目录>';
     }
   }
 
@@ -245,8 +246,8 @@ export struct PairPage {
         .fontSize(12)
         .fontColor(Tokens.ok)
         .fontFamily('monospace')
-      Text('  dsh-mobile')
-        .fontSize(12)
+      Text('  dsh plugin --profile desktop\n  add link:<插件目录>')
+        .fontSize(11.5)
         .fontColor(Tokens.fg)
         .fontFamily('monospace')
         .layoutWeight(1)
@@ -345,8 +346,8 @@ export struct PairPage {
     Column() {
       this.head('先把电脑准备好', '三件事，做完手机就能连上来。')
 
-      this.stepCard(1, Tokens.ok, '安装 DSH 手机连接插件',
-        '点开 DSH 侧栏「插件」→「添加插件」，粘贴下方名称。装完重启即自动加载。')
+      this.stepCard(1, Tokens.ok, '给电脑装上「DSH 手机连接」插件',
+        '插件包随 App 发布页一起提供。解压后在电脑上执行下面的命令，装完重启 DSH 自动加载。')
       this.cmdBlock()
       Row().height(10)
 
@@ -355,7 +356,7 @@ export struct PairPage {
       Row().height(10)
 
       this.stepCard(3, Tokens.surface3, '打开电脑上的连接面板',
-        '从侧栏进入「设置 → 手机连接」，面板里有二维码和 6 位配对码。')
+        '在 DSH 里打开「设置 → 手机连接」，面板里有二维码和 6 位一次性配对码。')
 
       this.primaryBtn('next', () => {
         Haptics.tap();
@@ -454,7 +455,7 @@ export struct PairPage {
       this.primaryBtn('code', () => {
         this.doClaim(this.manual !== '' ? this.manual : this.defaultBase, this.code);
       })
-      Text('打开插件面板输入 6 位配对码，公网配对输入异地配对码。')
+      Text('把电脑端「设置 → 手机连接」面板上显示的 6 位码填到上面。')
         .fontSize(11)
         .fontColor(Tokens.dim2)
         .width('100%')
@@ -514,8 +515,8 @@ export struct PairPage {
       }
 
       Text('· 手机和电脑连的是同一个 WiFi（别用手机流量）；同一 WiFi 也可能互相隔离\n' +
-        '· 电脑 DSH 需常驻，配对码 15 分钟过期，重新看一一眼面板\n' +
-        '· 异地首次配对：需要先在电脑端插件面板打开「允许异地配对」\n' +
+        '· 电脑 DSH 需常驻；配对码用过一次就作废，过期回面板重新看\n' +
+        '· 异地首次配对：先在电脑端「设置 → 手机连接」里打开「公网访问」\n' +
         '· 想在家门外也能用：配对完进 设置 → 连接，里面写了怎么开隧道')
         .fontSize(11)
         .fontColor(Tokens.dim2)
