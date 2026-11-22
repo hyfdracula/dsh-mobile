@@ -422,13 +422,20 @@ struct Index {
     }
   }
 
+  /** 连点开关时只让最后一次落盘，避免旧值后到覆盖新值 */
+  private hapticsSeq: number = 0;
+
   private async saveHaptics(v: boolean): Promise<void> {
     this.haptics = v;
     Haptics.enabled = v;
+    const seq: number = ++this.hapticsSeq;
     if (v) Haptics.soft();
-    console.info('DSH_HAP enabled=' + v);
+    console.info('DSH_HAP enabled=' + v + ' seq=' + seq);
     try {
       const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      if (seq !== this.hapticsSeq) {
+        return;
+      }
       await p.put('haptics', v ? '1' : '0');
       await p.flush();
     } catch (e) {

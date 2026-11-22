@@ -196,6 +196,8 @@ export struct ChatPage {
   @State private menuMsg: Message | null = null;
   /** 选择文本面板看的是渲染后的正文，还是 Markdown 原文 */
   @State private selRaw: boolean = false;
+  /** 当前展开的是哪一条「!」说明 */
+  @State private setPop: string = '';
   /** 消息流里的错误卡：这一轮的原始报错（422 那种长 body 要能看全、能复制） */
   @State private errCard: string = '';
   @State private errCardCode: string = '';
@@ -981,9 +983,13 @@ export struct ChatPage {
     const ids: string[] = [];
     for (const r of moved) {
       if (r.kind === 'img') {
-        imgs.push(this.pendImgs[r.idx]);
+        if (r.idx >= 0 && r.idx < this.pendImgs.length) {
+          imgs.push(this.pendImgs[r.idx]);
+        }
       } else if (r.kind === 'file') {
-        files.push(this.pendFiles[r.idx]);
+        if (r.idx >= 0 && r.idx < this.pendFiles.length) {
+          files.push(this.pendFiles[r.idx]);
+        }
       } else {
         ids.push(r.id);
       }
@@ -1006,10 +1012,28 @@ export struct ChatPage {
       });
   }
 
+  /**
+   * 按 id 取队列项。
+   * 行里的 idx 是「渲染那一刻」的下标：删掉一条之后旧行的点击回调仍可能触发，
+   * 直接 queueItems[idx] 会拿到 undefined，再读 .id 就是一次 JS 崩溃。
+   */
+  private queueById(id: string): QueuedItem | null {
+    for (let i = 0; i < this.queueItems.length; i++) {
+      if (this.queueItems[i].id === id) {
+        return this.queueItems[i];
+      }
+    }
+    return null;
+  }
+
   /** 单条「立即」：队列里的插队到当前轮前面，本地的那一条立刻发出去 */
   private fireRow(r: PendRow): void {
     if (r.kind === 'queue') {
-      this.doQueueFire(this.queueItems[r.idx]);
+      const q: QueuedItem | null = this.queueById(r.id);
+      if (q === null) {
+        return;
+      }
+      this.doQueueFire(q);
       return;
     }
     this.fireLocal(r.kind, r.idx);
@@ -1047,7 +1071,11 @@ export struct ChatPage {
 
   private dropRow(r: PendRow): void {
     if (r.kind === 'queue') {
-      this.doQueueDrop(this.queueItems[r.idx]);
+      const q: QueuedItem | null = this.queueById(r.id);
+      if (q === null) {
+        return;
+      }
+      this.doQueueDrop(q);
       return;
     }
     Haptics.tap();
@@ -1595,6 +1623,9 @@ export struct ChatPage {
   }
 
   private dropImg(i: number): void {
+    if (i < 0 || i >= this.pendImgs.length) {
+      return;
+    }
     const next: ImagePart[] = [];
     for (let k = 0; k < this.pendImgs.length; k++) {
       if (k !== i) next.push(this.pendImgs[k]);
@@ -1603,6 +1634,9 @@ export struct ChatPage {
   }
 
   private dropFile(i: number): void {
+    if (i < 0 || i >= this.pendFiles.length) {
+      return;
+    }
     const next: FilePart[] = [];
     for (let k = 0; k < this.pendFiles.length; k++) {
       if (k !== i) next.push(this.pendFiles[k]);
@@ -1665,6 +1699,65 @@ export struct ChatPage {
    * 选中态必须在这里读 this.selRaw：@Builder 的布尔值参数是「首帧快照」，
    * 外面传 !this.selRaw 进来之后就一直不会变，切换时白胶囊会停在原来那一格。
    */
+  /** 标题后的小感叹号：说明性文字不再压在标题下面当小字。 */
+  @Builder
+  hintDot(key: string, text: string) {
+    Text('!')
+      .fontSize(9.5)
+      .fontWeight(FontWeight.Medium)
+      .fontColor(Tokens.dim2)
+      .textAlign(TextAlign.Center)
+      .width(15)
+      .height(15)
+      .borderRadius(8)
+      .border({ width: 1, color: Tokens.isDark ? '#59FFFFFF' : '#33000000' })
+      .margin({ left: 6 })
+      .bindPopup(this.setPop === key, {
+        builder: this.hintPop(text),
+        placement: Placement.Bottom,
+        popupColor: Color.Transparent,
+        enableArrow: false,
+        radius: 16,
+        offset: { x: 0, y: 4 },
+        onStateChange: (e) => {
+          if (!e.isVisible && this.setPop === key) {
+            this.setPop = '';
+          }
+        }
+      })
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+      .onClick(() => {
+        Haptics.tap();
+        this.setPop = this.setPop === key ? '' : key;
+      })
+  }
+
+  @Builder
+  hintPop(text: string) {
+    Text(text)
+      .fontSize(12)
+      .lineHeight(18)
+      .fontColor(Tokens.fg)
+      .width(232)
+      .padding(12)
+      .backgroundColor(Tokens.isDark ? '#F21B1F27' : '#F7FFFFFF')
+      .borderRadius(14)
+      .backdropBlur(20)
+      .border({ width: 1, color: Tokens.isDark ? '#33FFFFFF' : '#D9FFFFFF' })
+      .shadow({ radius: 20, color: Tokens.isDark ? '#40000000' : '#26000000', offsetY: 6 })
+  }
+
+  @Builder
+  hintTitle(title: string, text: string, key: string) {
+    Row() {
+      Text(title)
+        .fontSize(13.5)
+        .fontColor(Tokens.fg)
+      this.hintDot(key, text)
+    }
+    .alignItems(VerticalAlign.Center)
+  }
+
   @Builder
   selTab(label: string, which: string, act: () => void) {
     Text(label)
@@ -1675,8 +1768,8 @@ export struct ChatPage {
       .layoutWeight(1)
       .height(34)
       .borderRadius(Tokens.rPill)
-      .backgroundColor(((which === 'raw') === this.selRaw)
-        ? (Tokens.isDark ? '#3DFFFFFF' : '#FFFFFFFF') : Color.Transparent)
+      .backgroundColor(Color.Transparent)
+      .animation({ duration: 200, curve: Curve.EaseOut })
       .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
       .onClick(act)
   }
@@ -1724,11 +1817,25 @@ export struct ChatPage {
       .width('100%')
       .padding({ left: 20, right: 10, top: 12, bottom: 2 })
 
-      Row() {
-        this.selTab('正文', 'body', (): void => { this.selRaw = false; })
-        this.selTab('Markdown 原文', 'raw', (): void => { this.selRaw = true; })
+      // 白胶囊用位移滑过去，正文用同一组时长与曲线淡入淡出：两处都是
+      // 200ms EaseOut，看起来是同一个动作，而不是先硬切再淡入。
+      Stack({ alignContent: Alignment.Start }) {
+        Row()
+          .width('50%')
+          .height(34)
+          .borderRadius(Tokens.rPill)
+          .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#FFFFFFFF')
+          .shadow({ radius: 6, color: Tokens.isDark ? '#33000000' : '#1A000000', offsetY: 1 })
+          .translate({ x: this.selRaw ? '100%' : '0%' })
+          .animation({ duration: 200, curve: Curve.EaseOut })
+        Row() {
+          this.selTab('正文', 'body', (): void => { this.selRaw = false; })
+          this.selTab('Markdown 原文', 'raw', (): void => { this.selRaw = true; })
+        }
+        .width('100%')
       }
       .width('100%')
+      .height(40)
       .padding(3)
       .backgroundColor(Tokens.isDark ? '#26FFFFFF' : '#14000000')
       .borderRadius(Tokens.rPill)
@@ -1743,6 +1850,7 @@ export struct ChatPage {
             .width('100%')
             .textAlign(TextAlign.Start)
             .copyOption(CopyOptions.LocalDevice)
+            .transition(TransitionEffect.OPACITY.animation({ duration: 200, curve: Curve.EaseOut }))
         } else {
           Column() {
             ForEach(parseMd(this.selText()), (b: MdBlock, i: number) => {
@@ -1751,6 +1859,7 @@ export struct ChatPage {
           }
           .width('100%')
           .alignItems(HorizontalAlign.Start)
+          .transition(TransitionEffect.OPACITY.animation({ duration: 200, curve: Curve.EaseOut }))
         }
       }
       .layoutWeight(1)
@@ -2515,16 +2624,10 @@ export struct ChatPage {
       .alignItems(VerticalAlign.Center)
 
       Row() {
-        Column() {
-          Text('智能体协作')
-            .fontSize(13.5)
-            .fontColor(Tokens.fg)
-          Text('开启后本轮可以派多个子智能体并行干活')
-            .fontSize(10.5)
-            .fontColor(Tokens.dim2)
-            .margin({ top: 2 })
+        Row() {
+          this.hintTitle('智能体协作', '开启后本轮可以派多个子智能体并行干活。', 'team')
         }
-        .alignItems(HorizontalAlign.Start)
+        .alignItems(VerticalAlign.Center)
         .layoutWeight(1)
         Toggle({ type: ToggleType.Switch, isOn: this.teamOn })
           .selectedColor(Tokens.accent)
@@ -2953,9 +3056,9 @@ export struct ChatPage {
           .fontWeight(FontWeight.Medium)
           .fontColor(Tokens.fg)
           .layoutWeight(1)
-        Text('完成')
+        Text(this.queueEditId === '' ? '完成' : '取消')
           .fontSize(13.5)
-          .fontColor(Tokens.accent)
+          .fontColor(this.queueEditId === '' ? Tokens.accent : Tokens.dim)
           .padding({ left: 12, right: 4, top: 8, bottom: 8 })
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
           .onClick(() => {
@@ -3831,7 +3934,10 @@ export struct ChatPage {
           .justifyContent(FlexAlign.Center)
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
           .onClick(() => {
-            this.doQueueEdit(this.queueItems[r.idx]);
+            const q: QueuedItem | null = this.queueById(r.id);
+            if (q !== null) {
+              this.doQueueEdit(q);
+            }
           })
         }
 

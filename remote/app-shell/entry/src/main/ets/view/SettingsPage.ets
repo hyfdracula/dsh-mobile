@@ -26,7 +26,6 @@ interface KVParam {
 
 interface NavRow {
   id: string;
-  icon: string;
   name: string;
   hint: string;
   /** 图标底色：CubeAgent 那种实色小方块 */
@@ -46,10 +45,10 @@ const THEMES: ThemeOpt[] = [
 ];
 
 const NAV_ROWS: NavRow[] = [
-  { id: 'connect', icon: '⌂', name: '电脑', hint: '', color: '#2F6BFF' },
-  { id: 'appearance', icon: '◐', name: '外观', hint: '', color: '#8E6BFF' },
-  { id: 'notify', icon: '◔', name: '通知', hint: '', color: '#F2A23C' },
-  { id: 'storage', icon: '◫', name: '存储空间', hint: '', color: '#2EC27E' }
+  { id: 'connect', name: '电脑', hint: '', color: '#2F6BFF' },
+  { id: 'appearance', name: '外观', hint: '', color: '#8E6BFF' },
+  { id: 'notify', name: '通知', hint: '', color: '#F2A23C' },
+  { id: 'storage', name: '存储空间', hint: '', color: '#2EC27E' }
 ];
 
 /**
@@ -162,10 +161,20 @@ export struct SettingsPage {
   forceWan: boolean = false;
   /** 设置 → 连接：「自动切换局域网」（@Prop：父组件改了这个开关要能跟着刷新） */
   @Prop autoLan: boolean = true;
-  haptics: boolean = true;
+  // @Watch：父级那份真实值一变就把本地显示同步过来。
+  // 只在 aboutToAppear 里抄一次的话，从别的页面改过之后回到这里显示的就是旧值。
+  @Prop @Watch('onHapticsProp') haptics: boolean = true;
   // Toggle 是受控组件：只读父级传进来的 haptics 的话，用户点一下界面不会变，
   // 离开再回来又被父级初值顶回去（用户报的「关了以后出来再回去又显示打开」）。
   @State private hapticsUi: boolean = true;
+
+  private onHapticsProp(): void {
+    if (this.hapticsUi !== this.haptics) {
+      this.hapticsUi = this.haptics;
+    }
+  }
+  /** 当前展开的是哪一条「!」说明（同一时刻只开一个） */
+  @State private popId: string = '';
   onHaptics: (v: boolean) => void = () => {};
   hdsOn: boolean = true;
   onHds: (v: boolean) => void = () => {};
@@ -484,17 +493,46 @@ export struct SettingsPage {
       .margin({ left: 6, bottom: 8 })
   }
 
+  /** 每个设置分组一个手绘矢量图标：字形符号在不同字体下粗细乱跳，索性自己画。 */
+  @Builder
+  navIcon(id: string) {
+    if (id === 'connect') {
+      Image($r('app.media.ic_set_pc'))
+        .width(18)
+        .height(18)
+        .fillColor('#FFFFFF')
+        .objectFit(ImageFit.Contain)
+    } else if (id === 'appearance') {
+      Image($r('app.media.ic_set_look'))
+        .width(18)
+        .height(18)
+        .fillColor('#FFFFFF')
+        .objectFit(ImageFit.Contain)
+    } else if (id === 'notify') {
+      Image($r('app.media.ic_set_bell'))
+        .width(18)
+        .height(18)
+        .fillColor('#FFFFFF')
+        .objectFit(ImageFit.Contain)
+    } else {
+      Image($r('app.media.ic_set_disk'))
+        .width(18)
+        .height(18)
+        .fillColor('#FFFFFF')
+        .objectFit(ImageFit.Contain)
+    }
+  }
+
   @Builder
   navRow(r: NavRow, last: boolean) {
     Row() {
-      Text(r.icon)
-        .fontSize(15)
-        .fontColor('#FFFFFF')
-        .width(30)
-        .height(30)
-        .textAlign(TextAlign.Center)
-        .backgroundColor(r.color)
-        .borderRadius(9)
+      Stack() {
+        this.navIcon(r.id)
+      }
+      .width(30)
+      .height(30)
+      .borderRadius(9)
+      .backgroundColor(r.color)
       Text(r.name)
         .fontSize(14.5)
         .fontColor(Tokens.fg)
@@ -586,6 +624,70 @@ export struct SettingsPage {
     .alignItems(HorizontalAlign.Start)
   }
 
+  // ---------- 标题注解：小感叹号 + 点击弹出说明 ----------
+
+  /**
+   * 标题后的小感叹号。以前解释性文字压在标题下面当小字，占地方又抢视线；
+   * 现在收进一个「!」，想知道的点一下，不点也看得懂标题。
+   */
+  @Builder
+  hintDot(key: string, text: string) {
+    Text('!')
+      .fontSize(9.5)
+      .fontWeight(FontWeight.Medium)
+      .fontColor(Tokens.dim2)
+      .textAlign(TextAlign.Center)
+      .width(15)
+      .height(15)
+      .borderRadius(8)
+      .border({ width: 1, color: Tokens.isDark ? '#59FFFFFF' : '#33000000' })
+      .margin({ left: 6 })
+      .bindPopup(this.popId === key, {
+        builder: this.hintPop(text),
+        placement: Placement.Bottom,
+        popupColor: Color.Transparent,
+        enableArrow: false,
+        radius: 16,
+        offset: { x: 0, y: 4 },
+        onStateChange: (e) => {
+          if (!e.isVisible && this.popId === key) {
+            this.popId = '';
+          }
+        }
+      })
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+      .onClick(() => {
+        Haptics.tap();
+        this.popId = this.popId === key ? '' : key;
+      })
+  }
+
+  @Builder
+  hintPop(text: string) {
+    Text(text)
+      .fontSize(12)
+      .lineHeight(18)
+      .fontColor(Tokens.fg)
+      .width(232)
+      .padding(12)
+      .backgroundColor(Tokens.isDark ? '#F21B1F27' : '#F7FFFFFF')
+      .borderRadius(14)
+      .backdropBlur(20)
+      .border({ width: 1, color: Tokens.isDark ? '#33FFFFFF' : '#D9FFFFFF' })
+      .shadow({ radius: 20, color: Tokens.isDark ? '#40000000' : '#26000000', offsetY: 6 })
+  }
+
+  @Builder
+  hintTitle(title: string, text: string, key: string, dim: boolean) {
+    Row() {
+      Text(title)
+        .fontSize(13.5)
+        .fontColor(dim ? Tokens.dim : Tokens.fg)
+      this.hintDot(key, text)
+    }
+    .alignItems(VerticalAlign.Center)
+  }
+
   // ---------- 二级：外观 ----------
 
   @Builder
@@ -619,16 +721,10 @@ export struct SettingsPage {
         .alignItems(VerticalAlign.Center)
         Divider().color(Tokens.lineSoft).margin({ left: 16 })
         Row() {
-          Column() {
-            Text('触感反馈')
-              .fontSize(13.5)
-              .fontColor(Tokens.dim)
-            Text('点击、归档、发送时轻振')
-              .fontSize(10.5)
-              .fontColor(Tokens.dim2)
-              .margin({ top: 2 })
+          Row() {
+            this.hintTitle('触感反馈', '点击、归档、发送时轻轻振一下。', 'haptics', true)
           }
-          .alignItems(HorizontalAlign.Start)
+          .alignItems(VerticalAlign.Center)
           .layoutWeight(1)
           Toggle({ type: ToggleType.Switch, isOn: this.hapticsUi })
             .selectedColor(Tokens.accent)
@@ -719,14 +815,14 @@ export struct SettingsPage {
   @Builder
   addMachineSheet() {
     Column() {
-      Text('添加电脑')
-        .fontSize(17)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(Tokens.fg)
-      Text('填这台电脑的地址和令牌；同一台电脑不用重复加')
-        .fontSize(11)
-        .fontColor(Tokens.dim2)
-        .margin({ top: 4, bottom: 14 })
+      Row() {
+        Text('添加电脑')
+          .fontSize(17)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Tokens.fg)
+        this.hintDot('add', '填这台电脑的地址和令牌；同一台电脑不用重复加。')
+      }
+      .margin({ bottom: 14 })
 
       TextInput({ text: this.addName, placeholder: '名字（可留空）' })
         .height(44)
@@ -902,6 +998,50 @@ export struct SettingsPage {
 
       this.machineBlock()
 
+      // 这两项以前塞在「公网地址」卡片里、地址和令牌下面，不填公网信息就像用不了。
+      // 其实它们跟公网无关，独立成一张卡，任何时候都能切。
+      Column() {
+        Row() {
+          Row() {
+            this.hintTitle('自动切换局域网', '同一个 Wi-Fi 下优先走局域网直连：最快，也不耗公网流量；关掉就只走公网隧道。', 'lan', false)
+          }
+          .layoutWeight(1)
+          .alignItems(VerticalAlign.Center)
+          Toggle({ type: ToggleType.Switch, isOn: this.autoLan })
+            .selectedColor(Tokens.accent)
+            .onChange((on: boolean) => {
+              this.onAutoLan(on);
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+        .alignItems(VerticalAlign.Center)
+
+        Divider().color(Tokens.lineSoft).margin({ left: 16 })
+
+        Column() {
+          Row() {
+            this.hintTitle('谁来回答提问', '手机为主：你在手机上时选择题直接弹到手机；电脑为主：始终由电脑回答，手机不接选择题。', 'answer', false)
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          Row() {
+            this.modeChip('手机为主', 'phone')
+            this.modeChip('电脑为主', 'desktop')
+          }
+          .width('100%')
+          .margin({ top: 10 })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width('100%')
+      .backgroundColor(Tokens.surface)
+      .borderRadius(Tokens.rGroup)
+      .clip(true)
+      .margin({ top: 12 })
+
       Text('公网地址')
         .fontSize(10.5)
         .fontColor(Tokens.dim2)
@@ -934,55 +1074,6 @@ export struct SettingsPage {
             .onChange((v: string) => {
               this.editToken = v;
             })
-          Row() {
-            Column() {
-              Text('自动切换局域网')
-                .fontSize(13.5)
-                .fontColor(Tokens.fg)
-                .width('100%')
-              Text(this.autoLan ? '同一个 Wi-Fi 下优先走局域网，最快' : '只走公网隧道，不再试探局域网')
-                .fontSize(11)
-                .fontColor(Tokens.dim2)
-                .width('100%')
-                .margin({ top: 3 })
-            }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start)
-            Toggle({ type: ToggleType.Switch, isOn: this.autoLan })
-              .selectedColor(Tokens.accent)
-              .onChange((on: boolean) => {
-                this.onAutoLan(on);
-              })
-          }
-          .width('100%')
-          .margin({ top: 14 })
-          .alignItems(VerticalAlign.Center)
-
-          Divider().color(Tokens.lineSoft).margin({ top: 14, bottom: 2 })
-
-          Column() {
-            Text('谁来回答提问')
-              .fontSize(13.5)
-              .fontColor(Tokens.fg)
-              .width('100%')
-            Text(this.answerMode === 'phone'
-              ? '手机在线时，选择题直接弹在手机上'
-              : '始终由电脑回答，手机不接选择题')
-              .fontSize(11)
-              .fontColor(Tokens.dim2)
-              .width('100%')
-              .margin({ top: 3 })
-            Row() {
-              this.modeChip('手机为主', 'phone')
-              this.modeChip('电脑为主', 'desktop')
-            }
-            .width('100%')
-            .margin({ top: 10 })
-          }
-          .width('100%')
-          .margin({ top: 12 })
-          .alignItems(HorizontalAlign.Start)
-
           Row() {
             Text(this.saved)
               .fontSize(11.5)
@@ -1418,19 +1509,14 @@ export struct SettingsPage {
         Divider().color(Tokens.lineSoft).margin({ left: 16 })
 
         Row() {
-          Column() {
+          Row() {
             Text('清除未读提醒')
               .fontSize(14)
               .fontColor(Tokens.accent)
-              .width('100%')
-            Text('清掉通知栏里没点开的消息，与桌面角标数字')
-              .fontSize(11)
-              .fontColor(Tokens.dim2)
-              .width('100%')
-              .margin({ top: 3 })
+            this.hintDot('unread', '清掉通知栏里没点开的消息，以及桌面图标上的角标数字。')
           }
           .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start)
+          .alignItems(VerticalAlign.Center)
           Text('›')
             .fontSize(18)
             .fontColor(Tokens.dim2)
