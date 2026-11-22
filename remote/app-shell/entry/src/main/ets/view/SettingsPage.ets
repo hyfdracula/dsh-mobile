@@ -766,7 +766,6 @@ export struct SettingsPage {
     .padding({ left: 18, right: 18, top: 18, bottom: 18 })
   }
 
-  @Builder
   /** 「这台电脑」：名称/地址/插件版本/会话数 + 重连 + 移除。 */
   @Builder
   deviceBlock() {

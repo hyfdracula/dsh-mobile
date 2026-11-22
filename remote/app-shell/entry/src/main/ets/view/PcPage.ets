@@ -27,6 +27,9 @@ export struct PcPage {
   @State private lanIp: string = '';
   @State private publicUrl: string = '';
   @State private lan: boolean = false;
+  /** 手动「重新探测局域网」的过程与结果，直接显示在行尾 */
+  @State private probing: boolean = false;
+  @State private probeNote: string = '';
   @State private ms: number = 0;
   @State private count: number = 0;
   @State private loading: boolean = true;
@@ -94,6 +97,38 @@ export struct PcPage {
       this.ms = 0;
     } finally {
       this.loading = false;
+    }
+  }
+
+  /**
+   * 手动重探局域网。
+   * 用户在同一个 Wi-Fi 下却一直显示「公网」时，这一下能立刻验证到底是
+   * 手机没连上同一网段、还是候选地址过期——比等后台 15 秒一轮快得多。
+   */
+  private async probeLanNow(): Promise<void> {
+    if (this.probing) {
+      return;
+    }
+    Haptics.soft();
+    if (!this.api.autoLan) {
+      this.probeNote = '自动切换已关闭';
+      return;
+    }
+    if (this.api.forceWan) {
+      this.probeNote = '已强制走公网';
+      return;
+    }
+    this.probing = true;
+    this.probeNote = '';
+    try {
+      const hit: string = await this.api.probeNow();
+      this.lan = this.api.isLan();
+      this.base = this.api.currentBase();
+      this.probeNote = hit !== '' ? ('已连上 ' + hit.replace('http://', '')) : '没探到局域网地址';
+    } catch (e) {
+      this.probeNote = '探测失败：' + (e as Error).message;
+    } finally {
+      this.probing = false;
     }
   }
 
@@ -192,7 +227,11 @@ export struct PcPage {
       return { k: '公网', v: this.wanBase !== '' ? this.wanBase.replace('https://', '') : '未配置' };
     }
     if (id === 'lan') {
-      return { k: '局域网', v: this.lan ? '加密连接使用中' : '未使用（走公网）' };
+      const n: number = this.api.lanCandidates().length;
+      if (this.lan) {
+        return { k: '局域网', v: '直连中 · ' + this.base.replace('http://', '').replace('https://', '') };
+      }
+      return { k: '局域网', v: n > 0 ? ('未使用 · 候选 ' + n + ' 个') : '未使用 · 没有候选地址' };
     }
     if (id === 'count') {
       return { k: '会话数', v: this.count + ' 个' };
@@ -309,6 +348,27 @@ export struct PcPage {
       .onClick(() => {
         Haptics.soft();
         this.reload();
+      })
+      Divider().color(Tokens.lineSoft).margin({ left: 16 })
+      Row() {
+        Text('重新探测局域网')
+          .fontSize(13.5)
+          .fontColor(Tokens.fg)
+          .layoutWeight(1)
+        Text(this.probing ? '探测中…' : (this.probeNote !== '' ? this.probeNote : '›'))
+          .fontSize(this.probeNote !== '' ? 11.5 : 18)
+          .fontColor(this.probeNote !== '' ? Tokens.dim2 : Tokens.dim2)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ left: 12 })
+          .constraintSize({ maxWidth: 190 })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+      .alignItems(VerticalAlign.Center)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+      .onClick(() => {
+        void this.probeLanNow();
       })
     }
     .width('100%')

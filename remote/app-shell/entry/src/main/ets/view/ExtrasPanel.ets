@@ -1,6 +1,8 @@
+import { common } from '@kit.AbilityKit';
 import { Api, FsEntry, HostPluginGroup, HostPluginRow, HostTaskRow, TeamMemberRow, TeamTaskRow } from '../common/Api';
 import { Tokens } from '../common/Tokens';
 import { Haptics } from '../common/Haptics';
+import { Saver } from '../common/Saver';
 
 /**
  * 聊天页右上角的三块「电脑侧」信息：插件、自动化任务、工作区文件。
@@ -30,9 +32,13 @@ export struct ExtrasPanel {
   @State private more: boolean = false;
   @State private viewerOn: boolean = false;
   @State private viewerName: string = '';
+  /** 正在看的文本文件在工作区里的相对路径：保存时要拿它拼下载直链 */
+  @State private viewerPath: string = '';
   @State private viewerText: string = '';
   @State private imageOn: boolean = false;
   @State private imagePath: string = '';
+  /** 正在保存到手机：发一次请求就锁住按钮，避免连点堆出多个下载任务 */
+  @State private saving: boolean = false;
   /** 跟设置二级页同一套：顶部渐变用当前页面底色，深浅色切换时跟着变 */
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
   /** 正在请求的任务 id：同一时刻只让一条任务显示「处理中」 */
@@ -49,6 +55,7 @@ export struct ExtrasPanel {
   onMode(): void {
     this.viewerOn = false;
     this.imageOn = false;
+    this.saving = false;
     this.err = '';
     this.load();
   }
@@ -215,19 +222,53 @@ export struct ExtrasPanel {
     if (this.isImage(e.name)) {
       this.imagePath = full;
       this.imageOn = true;
+      this.saving = false;
       return;
     }
     this.busy = true;
     try {
       const f = await this.api.fsFile(this.sessionId, full);
       this.viewerName = f.name;
+      this.viewerPath = full;
       this.viewerText = f.text;
       this.viewerOn = true;
+      this.saving = false;
       this.err = '';
     } catch (err) {
       this.err = (err as Error).message;
     } finally {
       this.busy = false;
+    }
+  }
+
+  /** 取路径里的文件名，两种分隔符都认：电脑那边给的是反斜杠。 */
+  private fileName(p: string): string {
+    const cut: number = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+    return cut >= 0 ? p.substring(cut + 1) : p;
+  }
+
+  /** 把正在看的文件存到手机：先下到沙箱缓存，再交给系统选择器挑保存位置。 */
+  private async saveFile(targetPath: string, targetName: string): Promise<void> {
+    if (this.saving || targetPath === '') {
+      return;
+    }
+    Haptics.tap();
+    this.saving = true;
+    this.err = '';
+    try {
+      const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+      const url: string = this.api.fsDownloadUrl(this.sessionId, targetPath);
+      const saved: boolean = await Saver.save(ctx, url, targetName);
+      if (saved) {
+        this.getUIContext().getPromptAction().showToast({ message: '已保存到手机', duration: 1600 });
+      }
+    } catch (e) {
+      // 查看器盖在面板上面，光写 this.err 用户看不见，同时弹一条提示
+      const reason: string = (e as Error).message;
+      this.err = reason;
+      this.getUIContext().getPromptAction().showToast({ message: reason, duration: 2600 });
+    } finally {
+      this.saving = false;
     }
   }
 
@@ -900,6 +941,35 @@ export struct ExtrasPanel {
     .backgroundColor(this.themeBg)
   }
 
+  /** 查看器右上角的「保存」胶囊；保存中换成转圈并自己把点击锁住。 */
+  @Builder
+  private saveButton(label: string, targetPath: string, targetName: string) {
+    Row() {
+      if (this.saving) {
+        LoadingProgress()
+          .width(13)
+          .height(13)
+          .color(Tokens.dim2)
+        Text('保存中')
+          .fontSize(12.5)
+          .fontColor(Tokens.dim2)
+          .margin({ left: 4 })
+      } else {
+        Text(label)
+          .fontSize(12.5)
+          .fontColor(Tokens.fg)
+      }
+    }
+    .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+    .backgroundColor(this.saving ? Tokens.surface2 : Tokens.chip)
+    .borderRadius(Tokens.rPill)
+    .margin({ right: 8 })
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+    .onClick(() => {
+      this.saveFile(targetPath, targetName);
+    })
+  }
+
   @Builder
   private viewerOverlay() {
     Column() {
@@ -910,6 +980,7 @@ export struct ExtrasPanel {
           .layoutWeight(1)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
+        this.saveButton('保存', this.viewerPath, this.viewerName)
         Text('关闭')
           .fontSize(13)
           .fontColor(Tokens.accent)
@@ -945,11 +1016,35 @@ export struct ExtrasPanel {
   @Builder
   private imageOverlay() {
     Column() {
+      Row() {
+        Text(this.fileName(this.imagePath))
+          .fontSize(13)
+          .fontColor(Tokens.dim2)
+          .layoutWeight(1)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        this.saveButton('保存到手机', this.imagePath, this.fileName(this.imagePath))
+        Text('关闭')
+          .fontSize(13)
+          .fontColor(Tokens.dim2)
+          .padding({ left: 10, right: 4, top: 8, bottom: 8 })
+          .onClick(() => {
+            this.imageOn = false;
+          })
+      }
+      .width('100%')
+      .padding({ top: 48, left: 18, right: 12, bottom: 6 })
+
+      // 点图片关闭：整块都挂点击会连保存一起关掉，所以只挂在图片上
       Image(this.api.fsRawUrl(this.sessionId, this.imagePath))
         .width('100%')
         .layoutWeight(1)
         .objectFit(ImageFit.Contain)
-      Text('点任意处关闭')
+        .onClick(() => {
+          this.imageOn = false;
+        })
+
+      Text('点图片关闭')
         .fontSize(12)
         .fontColor(Tokens.dim2)
         .padding({ top: 10, bottom: 24 })
@@ -957,8 +1052,5 @@ export struct ExtrasPanel {
     .width('100%')
     .height('100%')
     .backgroundColor('#000000')
-    .onClick(() => {
-      this.imageOn = false;
-    })
   }
 }

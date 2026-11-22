@@ -139,6 +139,13 @@ export interface AskState {
   settled: Object[];
 }
 
+/** 最后一轮失败的原因（插件从会话日志的 turn/end 里抠出来的）。 */
+export interface TurnErr {
+  code: string;
+  text: string;
+  time: number;
+}
+
 export interface MessagesResult {
   total: number;
   messages: Message[];
@@ -148,6 +155,8 @@ export interface MessagesResult {
   running?: boolean;
   /** 最后一轮的结束原因（completed / aborted / interrupted / error …） */
   lastTurn?: string;
+  /** 最后一轮失败时的原始报错，手机端要在消息流里显示完整 body */
+  lastErr?: TurnErr | null;
   queue?: QueuedItem[];
   questions?: AskState;
 }
@@ -205,6 +214,7 @@ interface MessagesResp {
   running?: boolean;
   firstSeq?: number;
   lastTurn?: string;
+  lastErr?: TurnErr;
   queue?: QueuedItem[];
   questions?: AskState;
 }
@@ -312,7 +322,69 @@ export class Api {
   }
 
   isLan(): boolean {
-    return this.lanBase !== '' && this.chosen === this.lanBase;
+    // 候选地址可能有多个（多网卡 / 电脑换过 IP），从第二个候选连上时 chosen 不等于 lanBase，
+    // 旧写法会把它当成公网入口，连接超时被拉到 18 秒。这里只区分「是不是隧道」。
+    if (this.chosen === '') {
+      return false;
+    }
+    if (this.chosen !== this.wanBase) {
+      return true;
+    }
+    // 没有公网隧道时 wanBase 本身就是局域网地址（配对只给出内网 IP），
+    // 那时 chosen === wanBase 也仍然是直连，不能算成隧道，否则超时按 18 秒算。
+    return Api.looksLan(this.wanBase);
+  }
+
+  /** 地址看着像内网直连（10./192.168./172.16-31.、回环，或没有点的主机名）。 */
+  private static looksLan(base: string): boolean {
+    if (base === '') {
+      return false;
+    }
+    const noScheme: string = base.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '');
+    const cut: number = noScheme.indexOf('/');
+    const hostPort: string = cut >= 0 ? noScheme.substring(0, cut) : noScheme;
+    const colon: number = hostPort.indexOf(':');
+    const host: string = colon >= 0 ? hostPort.substring(0, colon) : hostPort;
+    if (host === '') {
+      return false;
+    }
+    if (host === 'localhost') {
+      return true;
+    }
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+      if (host.startsWith('10.') || host.startsWith('192.168.') || host.startsWith('127.')) {
+        return true;
+      }
+      const m: RegExpMatchArray | null = host.match(/^172\.(\d+)\./);
+      if (m !== null) {
+        const n: number = Number.parseInt(m[1], 10);
+        return n >= 16 && n <= 31;
+      }
+      return false;
+    }
+    return host.indexOf('.') < 0;
+  }
+
+  /** 当前这台电脑已知的局域网候选地址，供设置页展示与排查。 */
+  lanCandidates(): string[] {
+    const out: string[] = [];
+    if (this.lanBase !== '') {
+      out.push(this.lanBase);
+    }
+    for (let i = 0; i < this.lanCands.length; i++) {
+      if (out.indexOf(this.lanCands[i]) < 0) {
+        out.push(this.lanCands[i]);
+      }
+    }
+    return out;
+  }
+
+  /** 正在走的入口是不是隧道（界面用来显示「局域网直连 / 公网隧道」）。 */
+  onWan(): boolean {
+    if (this.chosen === '') {
+      return true;
+    }
+    return !this.isLan();
   }
 
   /**
@@ -322,12 +394,19 @@ export class Api {
    * @param lanBase - 已配对电脑自己报的局域网地址；留空表示不再拿旧地址试探，
    *   否则换一台电脑后会把新令牌先发给原来那个 IP 上的设备。
    */
-  rebase(wanBase: string, token: string, lanBase: string = ''): void {
+  rebase(wanBase: string, token: string, lanBase: string = '', lanList: string[] = []): void {
     this.wanBase = wanBase.replace(/\/+$/, '');
     this.lanBase = lanBase.replace(/\/+$/, '');
     this.lanCands = [];
     if (this.lanBase !== '') {
       this.lanCands.push(this.lanBase);
+    }
+    // 旧候选一起带过来：只留一个地址的话，电脑换了 IP 就再也没机会试新的了。
+    for (let i = 0; i < lanList.length; i++) {
+      const one: string = lanList[i].replace(/\/+$/, '');
+      if (one !== '' && this.lanCands.indexOf(one) < 0) {
+        this.lanCands.push(one);
+      }
     }
     this.token = token;
     this.chosen = '';
@@ -387,29 +466,76 @@ export class Api {
    * 用 /api/info 探（带令牌）：/health 免鉴权，换了令牌时会误判可用。
    */
   private async probeLan(timeoutMs: number): Promise<string> {
-    const list: string[] = [];
-    if (this.lanBase !== '') {
-      list.push(this.lanBase);
+    const list: string[] = this.lanCandidates();
+    if (list.length === 0) {
+      return '';
     }
-    for (let i = 0; i < this.lanCands.length; i++) {
-      if (list.indexOf(this.lanCands[i]) < 0) {
-        list.push(this.lanCands[i]);
+    // 并发探，但第一个命中就立刻返回：串行时第一个候选（常常是电脑换 IP 前的旧地址）
+    // 要等满超时；而等全部落地又会因为某个候选超时白等到超时，用户已经在走隧道了。
+    let settle: (hit: string) => void = (hit: string): void => {
+      // 占位，真正的 resolver 在 Promise 构造里赋值
+    };
+    const firstHit: Promise<string> = new Promise<string>((resolve: (hit: string) => void): void => {
+      settle = resolve;
+    });
+    let left: number = list.length;
+    let done: boolean = false;
+    const finish = (hit: string): void => {
+      if (!done) {
+        done = true;
+        settle(hit);
       }
-    }
+    };
+    const leave = (): void => {
+      left--;
+      if (left === 0) {
+        finish('');
+      }
+    };
     for (let i = 0; i < list.length; i++) {
-      try {
-        const r = await this.rawGet(list[i] + '/api/info', timeoutMs, true);
-        if (r.code === 200 || r.code === 401 || r.code === 403) {
-          this.lanBase = list[i];
-          this.lanDownUntil = 0;
-          console.info('DSH_BASE lan ' + list[i]);
-          return list[i];
-        }
-      } catch (e) {
-        console.info('DSH_BASE lan miss ' + list[i]);
-      }
+      const one: string = list[i];
+      this.rawGet(one + '/api/info', timeoutMs, true)
+        .then((r: RawResult): void => {
+          if (r.code === 200 || r.code === 401 || r.code === 403) {
+            finish(one);
+          }
+          leave();
+        })
+        .catch((): void => {
+          leave();
+        });
     }
+    const hit: string = await firstHit;
+    if (hit !== '') {
+      this.lanBase = hit;
+      this.lanDownUntil = 0;
+      const at: number = this.lanCands.indexOf(hit);
+      if (at > 0) {
+        this.lanCands.splice(at, 1);
+        this.lanCands.unshift(hit);
+      }
+      console.info('DSH_BASE lan ' + hit);
+      return hit;
+    }
+    console.info('DSH_BASE lan miss all n=' + String(list.length));
     return '';
+  }
+
+  /**
+   * 手动重新探测局域网一次（设置页的「重新探测」用）。
+   * 与 poke 的区别：无视冷却、无限等待前把 wan 先记住，探完返回结果供界面展示。
+   * @returns 命中的局域网地址，空串表示这次没探到
+   */
+  async probeNow(): Promise<string> {
+    if (this.wanBase === '' || this.forceWan || !this.autoLan) {
+      return '';
+    }
+    const hit: string = await this.probeLan(2000);
+    this.chosen = hit !== '' ? hit : this.wanBase;
+    if (hit === '') {
+      this.scheduleLanProbe();
+    }
+    return hit;
   }
 
   /** 选一次入口：局域网探得通就走局域网，否则走隧道。 */
@@ -425,7 +551,7 @@ export class Api {
     if (Date.now() >= this.lanDownUntil) {
       // 探针要带令牌：/health 是免鉴权的，只探它会在换了令牌后误判局域网可用，
       // 随后每个业务请求都 401。所以用 /api/info 探，200 才算这个入口真能用。
-      const hit: string = await this.probeLan(800);
+      const hit: string = await this.probeLan(1500);
       if (hit !== '') {
         this.chosen = hit;
         return this.chosen;
@@ -451,7 +577,7 @@ export class Api {
     this.lanDownUntil = 0;
     this.nextLanProbe = 0;
     if (this.autoLan && !this.forceWan) {
-      const hit: string = await this.probeLan(900);
+      const hit: string = await this.probeLan(2000);
       if (hit !== '') {
         this.chosen = hit;
         console.info('DSH_BASE poke lan ' + hit);
@@ -460,6 +586,9 @@ export class Api {
     }
     this.chosen = this.wanBase;
     console.info('DSH_BASE poke wan ' + this.wanBase);
+    // 没探到也要留一条后台重探的路：否则 chosen 非空，ensureBase 直接返回，
+    // 这一次前台就再也不会试局域网（用户切回 WiFi 也不会自愈）。
+    this.scheduleLanProbe();
   }
 
   /**
@@ -475,7 +604,7 @@ export class Api {
       return;
     }
     this.nextLanProbe = now + 15000;
-    this.probeLan(700).then((hit: string) => {
+    this.probeLan(1500).then((hit: string) => {
       if (hit !== '') {
         this.chosen = hit;
         this.lanDownUntil = 0;
@@ -659,21 +788,21 @@ export class Api {
   async messages(id: string, limit: number): Promise<MessagesResult> {
     const r = await this.call<MessagesResp>(
       '/api/sessions/' + encodeURIComponent(id) + '/messages?limit=' + limit, 'GET');
-    return { total: r.total, messages: r.messages ?? [], stats: r.stats, context: r.context, running: r.running, firstSeq: r.firstSeq, lastTurn: r.lastTurn, queue: r.queue, questions: r.questions };
+    return { total: r.total, messages: r.messages ?? [], stats: r.stats, context: r.context, running: r.running, firstSeq: r.firstSeq, lastTurn: r.lastTurn, lastErr: r.lastErr, queue: r.queue, questions: r.questions };
   }
 
   /** 只取 seq 大于 since 的新消息；轮询用，避免每次都搬几十 KB。 */
   async messagesSince(id: string, since: number): Promise<MessagesResult> {
     const r = await this.call<MessagesResp>(
       '/api/sessions/' + encodeURIComponent(id) + '/messages?since=' + since, 'GET');
-    return { total: r.total, messages: r.messages ?? [], stats: r.stats, context: r.context, running: r.running, firstSeq: r.firstSeq, lastTurn: r.lastTurn, queue: r.queue, questions: r.questions };
+    return { total: r.total, messages: r.messages ?? [], stats: r.stats, context: r.context, running: r.running, firstSeq: r.firstSeq, lastTurn: r.lastTurn, lastErr: r.lastErr, queue: r.queue, questions: r.questions };
   }
 
   /** 取比 before 更早的一页，用于向上翻历史。 */
   async messagesBefore(id: string, before: number, limit: number = 60): Promise<MessagesResult> {
     const r = await this.call<MessagesResp>(
       '/api/sessions/' + encodeURIComponent(id) + '/messages?before=' + before + '&limit=' + limit, 'GET');
-    return { total: r.total, messages: r.messages ?? [], stats: r.stats, context: r.context, running: r.running, firstSeq: r.firstSeq, lastTurn: r.lastTurn, queue: r.queue, questions: r.questions };
+    return { total: r.total, messages: r.messages ?? [], stats: r.stats, context: r.context, running: r.running, firstSeq: r.firstSeq, lastTurn: r.lastTurn, lastErr: r.lastErr, queue: r.queue, questions: r.questions };
   }
 
   /**
@@ -947,6 +1076,12 @@ export class Api {
   /** 图片文件的直链（带令牌，<Image> 可直接用）。 */
   fsRawUrl(id: string, path: string): string {
     return this.currentBase() + '/api/sessions/' + encodeURIComponent(id) + '/fs/raw?path=' +
+      encodeURIComponent(path) + '&t=' + encodeURIComponent(this.token);
+  }
+
+  /** 任意文件的下载直链（带令牌，交给 request.downloadFile 直接落盘）。 */
+  fsDownloadUrl(id: string, path: string): string {
+    return this.currentBase() + '/api/sessions/' + encodeURIComponent(id) + '/fs/download?path=' +
       encodeURIComponent(path) + '&t=' + encodeURIComponent(this.token);
   }
 }

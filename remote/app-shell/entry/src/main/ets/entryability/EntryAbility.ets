@@ -37,7 +37,10 @@ export default class EntryAbility extends UIAbility {
       return;
     }
     setTimeout(() => {
-      AppStorage.setOrCreate('openSession', id);
+      // 用单独的键：openSession 表示「当前正开着哪个会话」（聊天页写、外壳读，用来压掉自己那条完成通知），
+      // 两件事共用一个键会让每次进会话都被列表当成一次跳转请求，栈里叠出好几层聊天页。
+      // 带时间戳是为了同一条通知连点两次也能重新触发。
+      AppStorage.setOrCreate('openSessionReq', id + '|' + Date.now());
       hilog.info(0x0000, TAG, 'open session from notification: %{public}s', id);
     }, 200);
   }

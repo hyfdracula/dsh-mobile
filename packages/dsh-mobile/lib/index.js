@@ -1,5 +1,5 @@
 import { randomBytes, randomInt, timingSafeEqual } from "node:crypto";
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir, hostname, networkInterfaces } from "node:os";
@@ -759,7 +759,8 @@ function historyOf(file) {
 	if (cached !== void 0 && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return {
 		messages: cached.messages,
 		stats: cached.stats,
-		lastTurn: cached.lastTurn
+		lastTurn: cached.lastTurn,
+		lastErr: cached.lastErr
 	};
 	const messages = [];
 	const stepAt = /* @__PURE__ */ new Map();
@@ -775,6 +776,7 @@ function historyOf(file) {
 		}
 	};
 	let lastTurn = "";
+	let lastErr = null;
 	let turnStart = 0;
 	let turnIn = 0;
 	let turnOut = 0;
@@ -796,6 +798,19 @@ function historyOf(file) {
 			turnReplyAt = -1;
 		} else if (ev.type === "turn/end") {
 			lastTurn = String(ev.data?.reason?.kind ?? "");
+			const rawErr = ev.data?.reason?.error;
+			let errCode = "";
+			let errText = "";
+			if (rawErr !== null && typeof rawErr === "object") {
+				errCode = String(rawErr.code ?? "");
+				errText = String(rawErr.message ?? "");
+			} else if (typeof rawErr === "string") errText = rawErr;
+			if (errText !== "") lastErr = {
+				code: errCode,
+				text: errText,
+				time: Number(ev.time ?? 0)
+			};
+			else lastErr = null;
 			const row = turnReplyAt >= 0 ? messages[turnReplyAt] : void 0;
 			if (row !== void 0) {
 				const endAt = Number(ev.time ?? 0);
@@ -807,6 +822,10 @@ function historyOf(file) {
 					atSeq: Number(ev.seq ?? 0),
 					finishedAt: endAt > 0 ? endAt : Date.now()
 				};
+				if (errText !== "") {
+					row.turn.errCode = errCode;
+					row.turn.errText = errText;
+				}
 			}
 		} else if (ev.type === "step/start") stats.steps += 1;
 		else if (ev.type === "tool/call") stats.toolCalls += 1;
@@ -858,12 +877,14 @@ function historyOf(file) {
 		mtimeMs: stat.mtimeMs,
 		messages,
 		stats,
-		lastTurn
+		lastTurn,
+		lastErr
 	});
 	return {
 		messages,
 		stats,
-		lastTurn
+		lastTurn,
+		lastErr
 	};
 }
 /** Fold one attempt's usage counters into the running totals, if it carries any. */
@@ -1900,7 +1921,7 @@ function apply(ctx, rawConfig) {
 				const since = Number.isFinite(sinceRaw) ? Math.max(Math.trunc(sinceRaw), 0) : 0;
 				const beforeRaw = Number(url.searchParams.get("before") ?? "0");
 				const before = Number.isFinite(beforeRaw) ? Math.max(Math.trunc(beforeRaw), 0) : 0;
-				const { messages: all, stats, lastTurn } = historyOf(file);
+				const { messages: all, stats, lastTurn, lastErr } = historyOf(file);
 				let tokens = stats.tokens;
 				let running = false;
 				let context = null;
@@ -1928,6 +1949,7 @@ function apply(ctx, rawConfig) {
 						tokens
 					},
 					lastTurn,
+					lastErr,
 					context,
 					running,
 					queue: await hostQueueView(ctl, sessionId),
@@ -3354,8 +3376,14 @@ function apply(ctx, rawConfig) {
 			const underRoot = (root, rel) => {
 				const base = resolve(root);
 				const target = resolve(base, rel.length === 0 ? "." : rel);
-				if (target === base) return target;
-				return target.startsWith(base + sep) ? target : null;
+				if (!(target === base || target.startsWith(base + sep))) return null;
+				try {
+					const realBase = realpathSync(base);
+					const realTarget = realpathSync(target);
+					return realTarget === realBase || realTarget.startsWith(realBase + sep) ? realTarget : null;
+				} catch {
+					return existsSync(target) ? null : target;
+				}
 			};
 			const fsMatch = /^\/api\/sessions\/([^/]+)\/fs$/.exec(path);
 			if (fsMatch !== null && method === "GET") {
@@ -3476,6 +3504,44 @@ function apply(ctx, rawConfig) {
 					"content-type": type,
 					"content-length": String(body.length),
 					"cache-control": "private, max-age=60"
+				});
+				res.end(body);
+				return;
+			}
+			const fsDownloadMatch = /^\/api\/sessions\/([^/]+)\/fs\/download$/.exec(path);
+			if (fsDownloadMatch !== null && method === "GET") {
+				const sid = decodeURIComponent(fsDownloadMatch[1]);
+				const root = (await rootOf(sid)).root;
+				const rel = String(url.searchParams.get("path") ?? "");
+				const target = root === "" ? null : underRoot(root, rel);
+				if (root === "" || target === null) {
+					send(res, 400, { error: "bad path" });
+					return;
+				}
+				const LIMIT = 64 * 1024 * 1024;
+				let body;
+				try {
+					const st = statSync(target);
+					if (!st.isFile()) {
+						send(res, 400, { error: "not a file" });
+						return;
+					}
+					if (st.size > LIMIT) {
+						send(res, 413, { error: `file is too large to download (${st.size} bytes)` });
+						return;
+					}
+					body = readFileSync(target);
+				} catch (err) {
+					send(res, 404, { error: `cannot read file: ${err instanceof Error ? err.message : String(err)}` });
+					return;
+				}
+				const name = String(rel).split(/[\\/]/).pop() ?? rel;
+				await record(logFile, `200 GET fs/download session=${sid} path=${rel} n=${body.length}`);
+				res.writeHead(200, {
+					"content-type": "application/octet-stream",
+					"content-length": String(body.length),
+					"content-disposition": "attachment; filename*=UTF-8''" + encodeURIComponent(name),
+					"cache-control": "private, max-age=0"
 				});
 				res.end(body);
 				return;

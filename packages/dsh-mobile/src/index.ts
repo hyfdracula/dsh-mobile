@@ -30,7 +30,7 @@
  */
 
 import { randomBytes, randomInt, timingSafeEqual } from 'node:crypto'
-import { chmodSync, closeSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { networkInterfaces, homedir, hostname } from 'node:os'
@@ -774,6 +774,22 @@ interface TurnInfo {
   atSeq: number
   /** 这一轮结束的墙上时间（epoch ms），手机端在气泡底部显示「21:32」。 */
   finishedAt: number
+  /** 失败时的错误码（宿主 reason.error.code，如 INVALID_REQUEST）。 */
+  errCode?: string
+  /** 失败时的原文（宿主 reason.error.message）。手机端要能整段看到并复制。 */
+  errText?: string
+}
+
+/**
+ * 一次失败的原文，供手机端在消息流里渲染可复制的错误卡片。
+ *
+ * 宿主 `turn/end` 的 `reason.error` 里带着真正的失败原因（上游 422 的 JSON、
+ * 上下文超限说明等），而手机端以前只拿到 `kind`，所以用户只看到「处理失败」。
+ */
+interface TurnErr {
+  code: string
+  text: string
+  time: number
 }
 
 /** One image part, resolved to the attachment object the host keeps on disk. */
@@ -803,7 +819,14 @@ const MAX_SESSION_BYTES = 160 * 1024 * 1024
 /** Decoded history keyed by path, invalidated by size+mtime. */
 const historyCache = new Map<
   string,
-  { size: number; mtimeMs: number; messages: ChatMessage[]; stats: SessionStats; lastTurn: string }
+  {
+    size: number
+    mtimeMs: number
+    messages: ChatMessage[]
+    stats: SessionStats
+    lastTurn: string
+    lastErr: TurnErr | null
+  }
 >()
 
 /**
@@ -1028,11 +1051,21 @@ function imagesOf(content: unknown): ImageRef[] {
  * @param file - absolute path.
  * @returns the transcript in order.
  */
-function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats; lastTurn: string } {
+function historyOf(file: string): {
+  messages: ChatMessage[]
+  stats: SessionStats
+  lastTurn: string
+  lastErr: TurnErr | null
+} {
   const stat = statSync(file)
   const cached = historyCache.get(file)
   if (cached !== undefined && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
-    return { messages: cached.messages, stats: cached.stats, lastTurn: cached.lastTurn }
+    return {
+      messages: cached.messages,
+      stats: cached.stats,
+      lastTurn: cached.lastTurn,
+      lastErr: cached.lastErr,
+    }
   }
 
   const messages: ChatMessage[] = []
@@ -1044,6 +1077,8 @@ function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats
     tokens: { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
   }
   let lastTurn = ''
+  // 最近一次失败的原文；手机端把它渲染成可复制的错误卡片。
+  let lastErr: TurnErr | null = null
   // Per-turn bookkeeping for the reply footer: when it started, what it spent,
   // and which row is the turn's final visible reply.
   let turnStart = 0
@@ -1070,6 +1105,22 @@ function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats
     // 手机端靠它区分「完成」与「中断」，宿主没有单独的 interrupted 状态。
     else if (ev.type === 'turn/end') {
       lastTurn = String(ev.data?.reason?.kind ?? '')
+      // 失败原因藏在 reason.error 里；以前整个丢掉，手机端就只剩「处理失败」。
+      const rawErr = ev.data?.reason?.error
+      let errCode = ''
+      let errText = ''
+      if (rawErr !== null && typeof rawErr === 'object') {
+        errCode = String((rawErr as Record<string, unknown>).code ?? '')
+        errText = String((rawErr as Record<string, unknown>).message ?? '')
+      } else if (typeof rawErr === 'string') {
+        errText = rawErr
+      }
+      if (errText !== '') {
+        lastErr = { code: errCode, text: errText, time: Number(ev.time ?? 0) }
+      } else {
+        // 后来这一轮成功了：最后一条报错不再代表这个会话的现状。
+        lastErr = null
+      }
       const row = turnReplyAt >= 0 ? messages[turnReplyAt] : undefined
       if (row !== undefined) {
         const endAt = Number(ev.time ?? 0)
@@ -1080,6 +1131,10 @@ function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats
           tokensOut: turnOut,
           atSeq: Number(ev.seq ?? 0),
           finishedAt: endAt > 0 ? endAt : Date.now(),
+        }
+        if (errText !== '') {
+          row.turn.errCode = errCode
+          row.turn.errText = errText
         }
       }
     } else if (ev.type === 'step/start') stats.steps += 1
@@ -1124,8 +1179,15 @@ function historyOf(file: string): { messages: ChatMessage[]; stats: SessionStats
       }
     }
   }
-  historyCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, messages, stats, lastTurn })
-  return { messages, stats, lastTurn }
+  historyCache.set(file, {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    messages,
+    stats,
+    lastTurn,
+    lastErr,
+  })
+  return { messages, stats, lastTurn, lastErr }
 }
 
 /** Fold one attempt's usage counters into the running totals, if it carries any. */
@@ -2288,7 +2350,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
         // 手机端一次只拿最近 60 条，向上翻时才补更早的，避免一次拖 2000 多条。
         const beforeRaw = Number(url.searchParams.get('before') ?? '0')
         const before = Number.isFinite(beforeRaw) ? Math.max(Math.trunc(beforeRaw), 0) : 0
-        const { messages: all, stats, lastTurn } = historyOf(file)
+        const { messages: all, stats, lastTurn, lastErr } = historyOf(file)
         let tokens = stats.tokens
         let running = false
         let context: ContextUsage | null = null
@@ -2322,6 +2384,8 @@ export function apply(ctx: any, rawConfig?: Config): void {
           stats: { ...stats, tokens },
           // 最后一轮的结束原因：completed / aborted / interrupted / error …
           lastTurn,
+          // 最近一次失败的原文（code + 整段 message），手机端据此渲染可复制的错误卡片
+          lastErr,
           context,
           running,
           queue: await hostQueueView(ctl, sessionId),
@@ -3657,8 +3721,17 @@ export function apply(ctx: any, rawConfig?: Config): void {
       const underRoot = (root: string, rel: string): string | null => {
         const base = resolve(root)
         const target = resolve(base, rel.length === 0 ? '.' : rel)
-        if (target === base) return target
-        return target.startsWith(base + sep) ? target : null
+        if (!(target === base || target.startsWith(base + sep))) return null
+        // 字面校验挡不住符号链接 / junction：解析真实路径再比一次，否则工作区里的一个链接
+        // 就能把 /fs/file、/fs/raw、/fs/download 引到工作区之外读任意文件。
+        try {
+          const realBase = realpathSync(base)
+          const realTarget = realpathSync(target)
+          return realTarget === realBase || realTarget.startsWith(realBase + sep) ? realTarget : null
+        } catch {
+          // 解析失败：路径不存在就按原样交给调用方报 404，存在却解析不了则一律拒绝。
+          return existsSync(target) ? null : target
+        }
       }
 
       const fsMatch = /^\/api\/sessions\/([^/]+)\/fs$/.exec(path)
@@ -3763,6 +3836,45 @@ export function apply(ctx: any, rawConfig?: Config): void {
           return
         }
         res.writeHead(200, { 'content-type': type, 'content-length': String(body.length), 'cache-control': 'private, max-age=60' })
+        res.end(body)
+        return
+      }
+
+      const fsDownloadMatch = /^\/api\/sessions\/([^/]+)\/fs\/download$/.exec(path)
+      if (fsDownloadMatch !== null && method === 'GET') {
+        const sid = decodeURIComponent(fsDownloadMatch[1])
+        const root = (await rootOf(sid)).root
+        const rel = String(url.searchParams.get('path') ?? '')
+        const target = root === '' ? null : underRoot(root, rel)
+        if (root === '' || target === null) {
+          send(res, 400, { error: 'bad path' })
+          return
+        }
+        const LIMIT = 64 * 1024 * 1024
+        let body: Buffer
+        try {
+          const st = statSync(target)
+          if (!st.isFile()) {
+            send(res, 400, { error: 'not a file' })
+            return
+          }
+          if (st.size > LIMIT) {
+            send(res, 413, { error: `file is too large to download (${st.size} bytes)` })
+            return
+          }
+          body = readFileSync(target)
+        } catch (err) {
+          send(res, 404, { error: `cannot read file: ${err instanceof Error ? err.message : String(err)}` })
+          return
+        }
+        const name = String(rel).split(/[\\/]/).pop() ?? rel
+        await record(logFile, `200 GET fs/download session=${sid} path=${rel} n=${body.length}`)
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-length': String(body.length),
+          'content-disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(name),
+          'cache-control': 'private, max-age=0',
+        })
         res.end(body)
         return
       }

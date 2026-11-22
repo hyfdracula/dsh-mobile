@@ -1,7 +1,7 @@
 import curves from '@ohos.curves';
 import { inputMethod } from '@kit.IMEKit';
 import { BlurStrategy, HdsNavDestination, HdsNavigationTitleBarOptions, HdsNavigationBackgroundStyle, HdsNavigationTitleBarStyle, ScrollEffectOptions, ScrollEffectType, SystemMaterialParams, TitleBarContentOptions, TitleBarStyleOptions, hdsMaterial } from '@kit.UIDesignKit';
-import { Api, AskAnswer, AskOption, AskQuestion, AskState, ContextUsage, Message, PendingAsk, QueuedItem, QueueImage, SessionStats, TokenUsage, CatalogGroup, CatalogModel, EffortRef, ModelRef, ImageRef, AgentRef, MessagesResult, TurnInfo, GoalView } from '../common/Api';
+import { Api, AskAnswer, AskOption, AskQuestion, AskState, ContextUsage, Message, PendingAsk, QueuedItem, QueueImage, SessionStats, TokenUsage, CatalogGroup, CatalogModel, EffortRef, ModelRef, ImageRef, AgentRef, MessagesResult, TurnInfo, TurnErr, GoalView } from '../common/Api';
 import { Outbox, StashItem, StashImage } from '../common/Outbox';
 import { ChatCache, ChatSnapshot } from '../common/Cache';
 import { ImagePart, pickImages, fromUris } from '../common/Images';
@@ -191,9 +191,14 @@ export struct ChatPage {
   @State private atBottom: boolean = true;
   // 输入卡实测高度：沉底按钮要靠它上移，否则输入框长高后会压在一起
   @State private inputH: number = 0;
-  // 长按气泡弹出的操作面板：复制 / 引用 / 分支
+  // 长按气泡弹出的「选择文本」面板
   @State private msgMenuOn: boolean = false;
   @State private menuMsg: Message | null = null;
+  /** 选择文本面板看的是渲染后的正文，还是 Markdown 原文 */
+  @State private selRaw: boolean = false;
+  /** 消息流里的错误卡：这一轮的原始报错（422 那种长 body 要能看全、能复制） */
+  @State private errCard: string = '';
+  @State private errCardCode: string = '';
   @State private queueItems: QueuedItem[] = [];
   /** 重启/中断后仍没发出去的那几条（本地影子，见 common/Outbox.ets）。 */
   @State private rescue: StashItem[] = [];
@@ -480,6 +485,7 @@ export struct ChatPage {
       // 请求飞行途中用户可能已经退出（或换了一轮），此时既不能写状态也不能再排拍子
       if (!this.alive || g !== this.gen) return;
       this.running = r.running === true;
+      this.takeLastErr(r.lastErr);
       this.applyQueue(r.queue === undefined ? [] : r.queue);
         const qs: AskState | undefined = r.questions;
         this.asks = qs === undefined || qs.active === undefined ? [] : qs.active;
@@ -1228,9 +1234,12 @@ export struct ChatPage {
         this.hasMore = snap.messages.length < snap.total;
         this.cached = true;
         this.loading = false;
-        setTimeout(() => {
-          this.scroller.scrollEdge(Edge.Bottom);
-        }, 30);
+        // 只有本来就在底部才跟着走：回看历史时重新进来不该被拽到最下面
+        if (this.atBottom) {
+          setTimeout(() => {
+            this.scroller.scrollEdge(Edge.Bottom);
+          }, 30);
+        }
       }
     }
     const wasBottom: boolean = this.atBottom;
@@ -1247,6 +1256,7 @@ export struct ChatPage {
         this.asks = qs === undefined || qs.active === undefined ? [] : qs.active;
       this.hasMore = r.messages.length < r.total;
       this.err = '';
+      this.takeLastErr(r.lastErr);
       this.cached = false;
       ChatCache.write(this.param.id, r.messages, r.total, r.running === true, r.lastTurn ?? '');
       this.reconcileRescue(r);
@@ -1274,6 +1284,7 @@ export struct ChatPage {
         console.info('DSH_CACHE stale ' + this.param.id + ' ' + msg);
       } else {
         this.err = msg;
+        this.showErrCard('', msg, Date.now());
       }
     } finally {
       this.loading = false;
@@ -1356,6 +1367,7 @@ export struct ChatPage {
       await this.load();
     } catch (e) {
       this.err = (e as Error).message;
+      this.showErrCard('', this.err, Date.now());
     } finally {
       this.sending = false;
     }
@@ -1560,77 +1572,290 @@ export struct ChatPage {
     Drafts.set(this.param.id, this.draft);
   }
 
-  @Builder
-  msgAction(label: string, act: () => void) {
-    Row() {
-      Text(label)
-        .fontSize(15)
-        .fontColor(Tokens.fg)
-        .layoutWeight(1)
-      Text('›')
-        .fontSize(16)
-        .fontColor(Tokens.dim2)
-    }
-    .width('100%')
-    .height(52)
-    .padding({ left: 14, right: 14 })
-    .backgroundColor(Tokens.isDark ? '#26FFFFFF' : '#8CFFFFFF')
-    .borderRadius(14)
-    .border({ width: 1, color: Tokens.isDark ? '#33FFFFFF' : '#B3FFFFFF' })
-    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
-    .onClick(act)
+  /** 选择文本面板里要显示的那段文字 */
+  private selText(): string {
+    const m: Message | null = this.menuMsg;
+    return m === null ? '' : m.text;
   }
 
-  /** 长按气泡弹出的操作面板：和选择模型/上下文同一套毛玻璃 */
   @Builder
-  msgMenu() {
-    Column({ space: 8 }) {
-      Text(this.menuMsg !== null && this.menuMsg.role === 'user' ? '我的消息' : '这条回复')
-        .fontSize(12)
-        .fontColor(Tokens.dim2)
-        .width('100%')
-        .padding({ left: 4, bottom: 2 })
-      this.msgAction('复制文字', (): void => {
-        const mm: Message | null = this.menuMsg;
-        this.msgMenuOn = false;
-        if (mm !== null) {
-          this.copyMessage(mm);
+  selTab(label: string, on: boolean, act: () => void) {
+    Text(label)
+      .fontSize(13.5)
+      .fontColor(on ? Tokens.fg : Tokens.dim)
+      .fontWeight(on ? FontWeight.Medium : FontWeight.Normal)
+      .textAlign(TextAlign.Center)
+      .layoutWeight(1)
+      .height(34)
+      .borderRadius(Tokens.rPill)
+      .backgroundColor(on ? (Tokens.isDark ? '#3DFFFFFF' : '#FFFFFFFF') : Color.Transparent)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+      .onClick(act)
+  }
+
+  @Builder
+  selBtn(label: string, primary: boolean, act: () => void) {
+    Text(label)
+      .fontSize(13.5)
+      .fontColor(primary ? Tokens.accentInk : Tokens.fg)
+      .textAlign(TextAlign.Center)
+      .layoutWeight(1)
+      .height(42)
+      .borderRadius(Tokens.rPill)
+      .backgroundColor(primary ? Tokens.accentStrong : (Tokens.isDark ? '#26FFFFFF' : '#99FFFFFF'))
+      .border({ width: 1, color: primary ? Tokens.accentStrong : (Tokens.isDark ? '#33FFFFFF' : '#B3FFFFFF') })
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+      .onClick(act)
+  }
+
+  /**
+   * 长按消息弹出的「选择文本」面板。
+   * 以前是三条 52 高的小行，报错和长回答根本看不全；现在整屏铺开、可以长按选中，
+   * 上面还能切「正文 / Markdown 原文」，和 CubeAgent 那套选择文本一致。
+   */
+  @Builder
+  selectSheet() {
+    Column() {
+      Row() {
+        Text('选择文本')
+          .fontSize(20)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.fg)
+          .layoutWeight(1)
+        Text('×')
+          .fontSize(22)
+          .fontColor(Tokens.dim2)
+          .width(40)
+          .height(40)
+          .textAlign(TextAlign.Center)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+          .onClick(() => {
+            this.msgMenuOn = false;
+          })
+      }
+      .width('100%')
+      .padding({ left: 20, right: 10, top: 12, bottom: 2 })
+
+      Row() {
+        this.selTab('正文', !this.selRaw, (): void => { this.selRaw = false; })
+        this.selTab('Markdown 原文', this.selRaw, (): void => { this.selRaw = true; })
+      }
+      .width('100%')
+      .padding(3)
+      .backgroundColor(Tokens.isDark ? '#26FFFFFF' : '#14000000')
+      .borderRadius(Tokens.rPill)
+      .margin({ left: 20, right: 20, top: 8 })
+
+      Row() {
+        Blank()
+        Text('复制全部')
+          .fontSize(13.5)
+          .fontColor(Tokens.accent)
+          .padding({ left: 10, right: 4, top: 8, bottom: 6 })
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+          .onClick(() => {
+            this.copyText(this.selText(), '已复制全文');
+          })
+      }
+      .width('100%')
+      .padding({ right: 16 })
+
+      Scroll() {
+        if (this.selRaw) {
+          Text(this.selText())
+            .fontSize(14)
+            .lineHeight(22)
+            .fontColor(Tokens.fg)
+            .width('100%')
+            .textAlign(TextAlign.Start)
+            .copyOption(CopyOptions.LocalDevice)
+        } else {
+          Column() {
+            ForEach(parseMd(this.selText()), (b: MdBlock, i: number) => {
+              this.mdBlock(b, i)
+            }, (b: MdBlock, i: number) => '' + i)
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
         }
-      })
-      this.msgAction('引用回复', (): void => {
-        const mm: Message | null = this.menuMsg;
-        this.msgMenuOn = false;
-        if (mm !== null) {
-          this.quoteMessage(mm);
-        }
-      })
-      if (this.menuMsg !== null && this.menuMsg.role === 'assistant' && this.menuMsg.turn !== undefined) {
-        this.msgAction('从这里开新分支', (): void => {
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 4, bottom: 10 })
+      .scrollBar(BarState.Auto)
+      .align(Alignment.Top)
+
+      Row({ space: 10 }) {
+        this.selBtn('复制全文', true, (): void => {
+          this.copyText(this.selText(), '已复制全文');
+        })
+        this.selBtn('引用全文', false, (): void => {
           const mm: Message | null = this.menuMsg;
           this.msgMenuOn = false;
           if (mm !== null) {
-            this.forkAt(mm);
+            this.quoteMessage(mm);
           }
         })
+        if (this.menuMsg !== null && this.menuMsg.role === 'assistant' && this.menuMsg.turn !== undefined) {
+          this.selBtn('开新分支', false, (): void => {
+            const mm: Message | null = this.menuMsg;
+            this.msgMenuOn = false;
+            if (mm !== null) {
+              this.forkAt(mm);
+            }
+          })
+        }
       }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 4, bottom: 22 })
     }
     .width('100%')
-    .padding({ left: 16, right: 16, top: 20, bottom: 26 })
-    .alignItems(HorizontalAlign.Start)
+    .height('100%')
   }
 
   private copyMessage(m: Message): void {
-    if (m.text === '') return;
+    this.copyText(m.text, '已复制');
+  }
+
+  private copyText(t: string, ok: string): void {
+    if (t === '') return;
     try {
-      const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, m.text);
+      const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, t);
       pasteboard.getSystemPasteboard().setData(data).then(() => {
-        promptAction.showToast({ message: '已复制', duration: 1400 });
+        promptAction.showToast({ message: ok, duration: 1400 });
       }).catch(() => {
         promptAction.showToast({ message: '复制失败', duration: 1600 });
       });
     } catch (e) {
       promptAction.showToast({ message: '复制失败', duration: 1600 });
     }
+  }
+
+  /**
+   * 把这一轮的原始报错留在消息流里。
+   * 以前只弹一个两行就截断的 toast/红字条，422 那种长 body 根本看不到，
+   * 用户拿着「处理失败」三个字什么也查不了。
+   */
+  private showErrCard(code: string, text: string, at: number): void {
+    if (text === '') {
+      return;
+    }
+    this.errCardCode = code;
+    this.errCard = text;
+    console.info('DSH_ERRCARD code=' + code + ' len=' + text.length + ' at=' + at);
+  }
+
+  private dismissErrCard(): void {
+    this.errCard = '';
+    this.errCardCode = '';
+  }
+
+  /** 从 /messages 的 lastErr 同步错误卡；新的一轮已经在跑就把上一轮的报错收起来。 */
+  private takeLastErr(le: TurnErr | null | undefined): void {
+    if (this.running) {
+      if (this.errCard !== '') {
+        this.dismissErrCard();
+      }
+      return;
+    }
+    if (le === undefined || le === null || le.text === '') {
+      return;
+    }
+    if (le.text === this.errCard) {
+      return;
+    }
+    // 插件侧的 lastErr 是「日志里最后一条 turn/end 的报错」，不管后面有没有成功。
+    // 所以这里再判一次时间：错完之后又聊成了的会话，不该一打开就顶一张旧报错卡。
+    let lastMark = 0;
+    for (let i = 0; i < this.msgs.length; i++) {
+      const t = this.msgs[i].time;
+      if (t > lastMark) {
+        lastMark = t;
+      }
+    }
+    if (lastMark > 0 && le.time > 0 && le.time < lastMark) {
+      if (this.errCard !== '') {
+        this.dismissErrCard();
+      }
+      return;
+    }
+    this.showErrCard(le.code, le.text, le.time);
+  }
+
+  /** 消息流末尾的错误卡：状态码 + 完整 body + 一键复制 */
+  @Builder
+  errCardView() {
+    Column({ space: 8 }) {
+      Row() {
+        Text('这一轮出错了')
+          .fontSize(12.5)
+          .fontColor(Tokens.err)
+          .layoutWeight(1)
+        if (this.errCardCode !== '') {
+          Text(this.errCardCode)
+            .fontSize(10)
+            .fontColor(Tokens.dim)
+            .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+            .backgroundColor(Tokens.isDark ? '#1FFFFFFF' : '#14000000')
+            .borderRadius(6)
+            .maxLines(1)
+        }
+        Text('×')
+          .fontSize(15)
+          .fontColor(Tokens.dim2)
+          .width(28)
+          .height(22)
+          .textAlign(TextAlign.Center)
+          .margin({ left: 2 })
+          .onClick(() => {
+            this.dismissErrCard();
+          })
+      }
+      .width('100%')
+
+      Scroll() {
+        Text(this.errCard)
+          .fontSize(11.5)
+          .lineHeight(17)
+          .fontColor(Tokens.dim)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+          .copyOption(CopyOptions.LocalDevice)
+      }
+      .width('100%')
+      .constraintSize({ maxHeight: 190 })
+      .scrollBar(BarState.Auto)
+      .align(Alignment.Top)
+
+      Row({ space: 8 }) {
+        Text('复制报错')
+          .fontSize(11.5)
+          .fontColor(Tokens.accent)
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .backgroundColor(Tokens.accentSoft)
+          .borderRadius(Tokens.rPill)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+          .onClick(() => {
+            this.copyText(this.errCard, '已复制报错');
+          })
+        Text('收起')
+          .fontSize(11.5)
+          .fontColor(Tokens.dim2)
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .borderRadius(Tokens.rPill)
+          .border({ width: 1, color: Tokens.lineSoft })
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+          .onClick(() => {
+            this.dismissErrCard();
+          })
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .padding(13)
+    .backgroundColor(Tokens.isDark ? '#14FF5C5C' : '#0FFF3B30')
+    .borderRadius(16)
+    .border({ width: 1, color: Tokens.isDark ? '#3DFF5C5C' : '#26FF3B30' })
   }
 
   /** 这一轮怎么结束的：一句人话。 */
@@ -1919,6 +2144,7 @@ export struct ChatPage {
       .gesture(LongPressGesture({ repeat: false, duration: 380 }).onAction(() => {
         Haptics.tap();
         this.menuMsg = m;
+        this.selRaw = false;
         this.msgMenuOn = true;
       }))
     } else {
@@ -1996,6 +2222,7 @@ export struct ChatPage {
       .gesture(LongPressGesture({ repeat: false, duration: 380 }).onAction(() => {
         Haptics.tap();
         this.menuMsg = m;
+        this.selRaw = false;
         this.msgMenuOn = true;
       }))
     }
@@ -2406,38 +2633,62 @@ export struct ChatPage {
     this.extrasMode = mode;
   }
 
-  /** ⋯ 菜单：自绘小卡片，展开原点固定在按钮所在的右上角，动画方向不再交给系统。 */
+  /** 弹窗里的一行 */
   @Builder
-  menuRow(label: string, act: () => void) {
+  menuOpt(label: string, act: () => void) {
     Row() {
       Text(label)
-        .fontSize(15)
+        .fontSize(13.5)
         .fontColor(Tokens.fg)
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
     .width('100%')
-    .height(46)
-    .padding({ left: 16, right: 16 })
-    .alignItems(VerticalAlign.Center)
+    .height(38)
+    .padding({ left: 12, right: 12 })
+    .borderRadius(9)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
     .onClick(() => {
       this.menuOn = false;
       act();
     })
   }
 
-  /** …… 菜单：交给系统原生 Menu（弹出方向与过渡都由系统控制）。 */
   @Builder
-  chatMenu() {
-    Menu() {
-      MenuItem({ content: '插件' }).onClick(() => { this.openExtras('plugins'); })
-      MenuItem({ content: '自动化任务' }).onClick(() => { this.openExtras('schedules'); })
-      MenuItem({ content: '工作区文件' }).onClick(() => { this.openExtras('files'); })
-      MenuItem({ content: '智能体团队' }).onClick(() => { this.openExtras('team'); })
-      MenuItem({ content: '预设与权限' }).onClick(() => {
+  menuHead(label: string) {
+    Text(label)
+      .fontSize(10.5)
+      .fontColor(Tokens.dim2)
+      .width('100%')
+      .padding({ left: 12, top: 8, bottom: 4 })
+  }
+
+  /** ⋯ 面板：电脑侧那几块 + 会话操作，样式照首页「分组方式」 */
+  @Builder
+  chatMenuPanel() {
+    Column() {
+      this.menuHead('电脑侧')
+      this.menuOpt('插件', (): void => { this.openExtras('plugins'); })
+      this.menuOpt('自动化任务', (): void => { this.openExtras('schedules'); })
+      this.menuOpt('工作区文件', (): void => { this.openExtras('files'); })
+      this.menuOpt('智能体团队', (): void => { this.openExtras('team'); })
+      Divider().color(Tokens.lineSoft).margin({ top: 6, bottom: 2 })
+      this.menuHead('会话')
+      this.menuOpt('预设与权限', (): void => {
         const p: ChatParam = { id: this.param.id, title: this.param.title };
         this.stack.pushPathByName('presets', p);
       })
-      MenuItem({ content: '刷新' }).onClick(() => { this.load(); })
+      this.menuOpt('刷新', (): void => { this.load(); })
     }
+    .width(268)
+    .padding({ left: 6, right: 6, top: 8, bottom: 10 })
+    .alignItems(HorizontalAlign.Start)
+    .backgroundColor(Tokens.isDark ? '#E6171B22' : '#F2FFFFFF')
+    .backdropBlur(24)
+    .borderRadius(18)
+    .border({ width: 1, color: Tokens.isDark ? '#33FFFFFF' : '#D9FFFFFF' })
+    .shadow({ radius: 26, color: Tokens.shadow, offsetY: 10 })
   }
 
   /** 重命名的小弹窗：系统菜单里塞不了输入框，单独来一块。 */
@@ -3220,9 +3471,28 @@ export struct ChatPage {
           }
         })
         .onClick(() => {
+          Haptics.tap();
           this.menuOn = true;
         })
-        .bindMenu(this.chatMenu())
+        // 和首页「分组方式」同一套自绘弹窗：宽度、圆角、行的密度都和那边一致。
+        // 顺带修掉「进会话要按两次才退出」：以前 menuOn 置真后没有任何地方收回，
+        // onBackPressed 里那句 if (this.menuOn) 每次都先吞掉一次返回。
+        .bindPopup(this.menuOn, {
+          builder: this.chatMenuPanel(),
+          placement: Placement.Bottom,
+          popupColor: Color.Transparent,
+          enableArrow: false,
+          radius: 18,
+          offset: { x: 0, y: 6 },
+          transition: TransitionEffect.OPACITY
+            .combine(TransitionEffect.scale({ x: 0.94, y: 0.94, centerX: '100%', centerY: '0%' }))
+            .animation({ duration: 180, curve: Curve.EaseOut }),
+          onStateChange: (e) => {
+            if (!e.isVisible) {
+              this.menuOn = false;
+            }
+          }
+        })
       }
       .width('100%')
       .justifyContent(FlexAlign.SpaceBetween)
@@ -3374,7 +3644,9 @@ export struct ChatPage {
       const h: number = Number(newValue.height);
       if (h > 0 && Math.abs(h - this.pendH) > 2) {
         this.pendH = h;
-        setTimeout(() => { this.scroller.scrollEdge(Edge.Bottom); }, 40);
+        if (this.atBottom) {
+          setTimeout(() => { this.scroller.scrollEdge(Edge.Bottom); }, 40);
+        }
       }
     })
   }
@@ -3582,6 +3854,11 @@ export struct ChatPage {
               .transition(TransitionEffect.OPACITY
                 .animation({ duration: 200, curve: Curve.EaseOut }))
             }
+            if (this.errCard !== '') {
+              ListItem() {
+                this.errCardView()
+              }
+            }
             // 底部留白同理，让最后一条也能滚到输入区玻璃底下
             ListItem() {
               Row()
@@ -3594,19 +3871,21 @@ export struct ChatPage {
           .padding({ left: 14, right: 14 })
           .scrollBar(BarState.Off)
           .edgeEffect(EdgeEffect.Spring)
+          // 只有滚动位置真的到底才跟随新消息。以前 catch 里直接置 true，
+          // 一取不到位置就把之后收到的每条消息都往底部拽 = 「强制跳底」。
           .onScroll(() => {
             try {
               this.atBottom = this.scroller.isAtEnd();
             } catch (e) {
-              this.atBottom = true;
+              console.info('DSH_SCROLL probe skipped');
             }
           })
 
           .hitTestBehavior(HitTestMode.Transparent)
           // 长按气泡时把操作面板挂在列表上：系统半模态，毛玻璃底
-          .bindSheet($$this.msgMenuOn, this.msgMenu(), {
-            height: 300,
-            dragBar: true,
+          .bindSheet($$this.msgMenuOn, this.selectSheet(), {
+            height: '92%',
+            dragBar: false,
             showClose: false,
             backgroundColor: Tokens.sheetWarm,
             blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
@@ -3762,16 +4041,18 @@ export struct ChatPage {
               }
 
               Row() {
-                // 多行：默认一行，输入多了自动长高，最多三行
+                // 多行：高度跟着内容长，长到六行左右封顶，再多就在框内滚。
+                // 不能设 maxLines：设了就把可视行数钉死，第四行起只能在框里挤，
+                // 卡片不长高、文字又贴死在顶部，看起来就是「超过三行看不见」。
                 TextArea({ placeholder: '发消息或问点什么…', text: this.draft })
                   .placeholderColor(Tokens.dim2)
                   .fontColor(Tokens.fg)
                   .fontSize(15)
+                  .lineHeight(21)
                   .padding({ left: 12, right: 4, top: 12, bottom: 12 })
                   .backgroundColor(Color.Transparent)
                   .layoutWeight(1)
-                  .constraintSize({ minHeight: 46, maxHeight: 112 })
-                  .maxLines(3)
+                  .constraintSize({ minHeight: 46, maxHeight: 172 })
                   .barState(BarState.Auto)
                   .enterKeyType(EnterKeyType.Send)
                   .onChange((v: string) => {
@@ -4004,7 +4285,6 @@ export struct ChatPage {
     .hideTitleBar(this.bigEditOn || this.extrasMode !== '')
     .titleBar(this.hdsTitle())
     .padding({ top: 0 })
-    .padding({ top: 0 })
     .onBackPressed(() => {
       // 面板打开时，返回键先关面板，而不是退出到会话列表
       if (this.extrasMode !== '') {
@@ -4022,6 +4302,12 @@ export struct ChatPage {
       }
       if (this.bigEditOn) {
         this.bigEditOn = false;
+        return true;
+      }
+      // 交给系统默认返回在这里不一定会 pop（实测第一下没反应，要按两下才退出），
+      // 所以自己出栈，返回 true 表示已经处理掉了。栈里只剩这一页时不动，让系统去退应用。
+      if (this.stack.size() >= 1) {
+        this.stack.pop();
         return true;
       }
       return false;

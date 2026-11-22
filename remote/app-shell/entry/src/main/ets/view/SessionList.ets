@@ -299,18 +299,38 @@ export struct SessionList {
   @State private rows: SessionRow[] = [];
   @State private previews: PreviewRow[] = [];
   @State private loading: boolean = true;
+  /**
+   * 下拉刷新的阶段。刷新圆环只在「正在下拉」和「正在刷新」时画：
+   * 以前 refreshArea 无条件渲染，再靠 translate({y:92}) 推到挖孔下面，
+   * ArkUI 不裁剪溢出，于是那个转圈永远挂在列表上方 = 用户说的「小地球一直显示」。
+   */
+  @State private pullState: RefreshStatus = RefreshStatus.Inactive;
+  /** 首屏 6 秒还没回来就换成可点的提示，避免一直看着「读取会话…」 */
+  @State private loadSlow: boolean = false;
+  /** 首屏请求的起始时刻，轮询据此判断是否已被卡死 */
+  private loadStart: number = 0;
+  private slowTimer: number = -1;
+  private loadGen: number = 0;
   /** 换了电脑（设置 → 连接）或分叉出新会话时，列表整份重读 */
   @StorageLink('listDirty') @Watch('onListDirty') listDirty: number = 0;
 
-  private onOpenSession(): void {
-    const id: string = this.openSession;
+  /** 通知点击要求直达某个会话：id|时间戳，消费后清空。 */
+  @StorageLink('openSessionReq') @Watch('onOpenReq') openReq: string = '';
+
+  private onOpenReq(): void {
+    const raw: string = this.openReq;
+    if (raw === '') {
+      return;
+    }
+    this.openReq = '';
+    const cut: number = raw.lastIndexOf('|');
+    const id: string = cut > 0 ? raw.substring(0, cut) : raw;
     if (id === '') {
       return;
     }
-    this.openSession = '';
     const row: SessionRow | undefined = this.rows.find((r: SessionRow) => r.id === id);
-    const title: string = row === undefined ? '' : row.title;
-    const p: ChatParam = { id: id, title: title };
+    const p: ChatParam = { id: id, title: row === undefined ? '' : row.title };
+    console.info('DSH_PUSH notify id=' + id);
     this.stack.pushPathByName('chat', p);
   }
 
@@ -329,7 +349,6 @@ export struct SessionList {
   // 列表视图设置：分组方式 / 列表状态 / 是否显示归档（照 dsh-console 的分组方式菜单）
   @State private viewOn: boolean = false;
   /** 通知点进来时要打开的会话：EntryAbility 写 AppStorage，这里跳转 */
-  @StorageLink('openSession') @Watch('onOpenSession') openSession: string = '';
   @State private groupBy: string = 'time';
   @State private listState: string = 'all';
 
@@ -398,7 +417,15 @@ export struct SessionList {
 
   /** 静默轮询：状态变了才换数据，切到别的页面时也不打扰用户。 */
   private async pollRows(): Promise<void> {
-    if (this.loading || this.renameOn || this.creating) {
+    // 首屏请求卡在隧道里时（半死的长连接），这里要能接管，否则列表永远转圈。
+    if (this.loading) {
+      if (Date.now() - this.loadStart < 9000) {
+        return;
+      }
+      this.loading = false;
+      this.loadSlow = false;
+    }
+    if (this.renameOn || this.creating) {
       return;
     }
     try {
@@ -421,9 +448,18 @@ export struct SessionList {
   }
 
   private async load(): Promise<void> {
+    // 6 秒兜底的重试可能与首次请求并发：只让最后一次发出的请求写界面，
+    // 否则晚到的失败会把已经成功的列表覆盖成错误页。
+    this.loadGen++;
+    const gen: number = this.loadGen;
+    this.loadStart = Date.now();
+    this.armSlow(gen);
     try {
       this.err = '';
       const rows = await this.api.sessions();
+      if (gen !== this.loadGen) {
+        return;
+      }
       const want = this.archivedView;
       const live = rows.filter((r: SessionRow) => (r.archived === true) === want);
       this.rows = live.sort((a: SessionRow, b: SessionRow) => b.updatedAt - a.updatedAt);
@@ -431,11 +467,34 @@ export struct SessionList {
       console.info('DSH_LIST rows=' + this.rows.length);
       this.loadPreviews();
     } catch (e) {
+      if (gen !== this.loadGen) {
+        return;
+      }
       this.err = (e as Error).message;
       console.error('DSH_LIST fail :: ' + this.err);
     } finally {
-      this.loading = false;
+      if (gen === this.loadGen) {
+        this.loading = false;
+        this.loadSlow = false;
+        if (this.slowTimer !== -1) {
+          clearTimeout(this.slowTimer);
+          this.slowTimer = -1;
+        }
+      }
     }
+  }
+
+  /** 6 秒还没回来就把「读取会话…」换成能点的重试，别让用户干等 */
+  private armSlow(gen: number): void {
+    if (this.slowTimer !== -1) {
+      clearTimeout(this.slowTimer);
+    }
+    this.slowTimer = setTimeout(() => {
+      this.slowTimer = -1;
+      if (gen === this.loadGen) {
+        this.loadSlow = true;
+      }
+    }, 6000);
   }
 
   private async loadPreviews(): Promise<void> {
@@ -1449,13 +1508,17 @@ export struct SessionList {
   @Builder
   refreshArea() {
     Row({ space: 8 }) {
-      LoadingProgress()
-        .width(20)
-        .height(20)
-        .color(Tokens.dim2)
-      Text(this.refreshing ? '正在刷新' : '松开刷新')
-        .fontSize(11.5)
-        .fontColor(Tokens.dim2)
+      // 关键：空闲时这里什么都不画。Refresh 的 builder 区域是常驻节点，
+      // 画了就一直在（再叠加下面的 translate 位移，就变成列表上方那个不走的圆环）。
+      if (this.refreshing || this.pullState !== RefreshStatus.Inactive) {
+        LoadingProgress()
+          .width(20)
+          .height(20)
+          .color(Tokens.dim2)
+        Text(this.refreshing ? '正在刷新' : '松开刷新')
+          .fontSize(11.5)
+          .fontColor(Tokens.dim2)
+      }
     }
     .width('100%')
     // Refresh 给指示器的高度就是下拉距离，超过就被裁掉；所以用位移把它整体推到挖孔下方。
@@ -1704,11 +1767,29 @@ export struct SessionList {
         // 头部（工作区/搜索/统计）改成浮层，见 headerBlock()
 
         if (this.loading) {
-          Row({ space: 8 }) {
-            LoadingProgress().width(20).height(20).color(Tokens.accent)
-            Text('读取会话…')
-              .fontSize(12.5)
-              .fontColor(Tokens.dim2)
+          Column({ space: 10 }) {
+            Row({ space: 8 }) {
+              LoadingProgress().width(20).height(20).color(Tokens.accent)
+              Text(this.loadSlow ? '还没连上电脑' : '读取会话…')
+                .fontSize(12.5)
+                .fontColor(Tokens.dim2)
+            }
+            .justifyContent(FlexAlign.Center)
+            if (this.loadSlow) {
+              Text('点这里重试')
+                .fontSize(13)
+                .fontColor(Tokens.accent)
+                .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+                .borderRadius(Tokens.rPill)
+                .backgroundColor(Tokens.surface2)
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+                .onClick(() => {
+                  Haptics.tap();
+                  this.loading = true;
+                  this.loadSlow = false;
+                  void this.load();
+                })
+            }
           }
           .width('100%')
           .justifyContent(FlexAlign.Center)
@@ -1820,6 +1901,9 @@ export struct SessionList {
           .width('100%')
           .height('100%')
           .layoutWeight(1)
+          .onStateChange((st: RefreshStatus) => {
+            this.pullState = st;
+          })
           .onRefreshing(() => {
             this.refreshing = true;
             this.load().finally(() => {

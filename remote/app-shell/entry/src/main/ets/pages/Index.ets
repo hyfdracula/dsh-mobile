@@ -1,4 +1,4 @@
-﻿import preferences from '@ohos.data.preferences';
+import preferences from '@ohos.data.preferences';
 import ConfigurationConstant from '@ohos.app.ability.ConfigurationConstant';
 import common from '@ohos.app.ability.common';
 import { Configuration } from '@ohos.app.ability.Configuration';
@@ -56,12 +56,39 @@ struct Index {
     AppStorage.setOrCreate('notifyProbe', Date.now());
     this.startPresence();
     // 回到前台先重选一次入口：从外面回到家、或切了 Wi-Fi，这一步就能立刻换回局域网
-    void this.api.poke();
+    void this.refreshLan();
     AppStorage.setOrCreate('fgProbe', Date.now());
   }
 
   onPageHide(): void {
     this.stopPresence(true);
+  }
+
+  /**
+   * 回前台时的入口自愈：先探一次局域网；走隧道时顺手问一次 /api/info，
+   * 把电脑自报的地址合进候选再探一次——电脑换了 IP 只有这条路能学到，
+   * 以前 info() 只在「电脑」页里调，用户不进那页就永远停在公网上。
+   */
+  private async refreshLan(): Promise<void> {
+    await this.api.poke();
+    if (!this.autoLan || this.forceWan || this.token === '') {
+      return;
+    }
+    // 已经在局域网直连就不用再折腾
+    if (this.api.isLan()) {
+      return;
+    }
+    try {
+      await this.api.info();
+    } catch (e) {
+      return;
+    }
+    if (!this.autoLan || this.forceWan) {
+      return;
+    }
+    if (!this.api.isLan() && this.api.lanCandidates().length > 0) {
+      await this.api.poke();
+    }
   }
 
   /**
@@ -207,7 +234,7 @@ struct Index {
       if (b !== '' && t !== '') {
         this.wanBase = b;
         this.token = t;
-        this.api.rebase(b, t, lanSaved);
+        this.api.rebase(b, t, lanSaved, cur !== null ? cur.lan : (lanSaved !== '' ? [lanSaved] : []));
         this.api.setForceWan(this.forceWan);
         this.api.setAutoLan(this.autoLan);
         this.machineName = Machines.displayName();
@@ -238,10 +265,32 @@ struct Index {
     if (wan === '' && lanOne !== '') {
       wan = lanOne;
     }
+    // 局域网候选要「只增不减」：保存地址时调用方传的是空数组，
+    // 旧实现会把候选整组清掉，之后 probeLan 没有地址可试，手机就永久停在公网了。
+    // 但候选只属于一台电脑：换电脑（令牌不同）时把上一台的地址带过去，
+    // 探针就会带着新令牌去敲旧地址，甚至直接选中旧电脑，所以只在同一台机器上沿用。
+    const prev = Machines.active();
+    const lanAll: string[] = [];
+    if (lanOne !== '') {
+      lanAll.push(lanOne);
+    }
+    if (prev !== null && t !== '' && prev.token === t) {
+      for (let i = 0; i < prev.lan.length; i++) {
+        if (lanAll.indexOf(prev.lan[i]) < 0) {
+          lanAll.push(prev.lan[i]);
+        }
+      }
+      const known: string[] = this.api.lanCandidates();
+      for (let i = 0; i < known.length; i++) {
+        if (lanAll.indexOf(known[i]) < 0) {
+          lanAll.push(known[i]);
+        }
+      }
+    }
     this.wanBase = wan;
     this.token = t;
-    this.api.rebase(wan, t, lanOne);
-    this.machineName = Machines.upsert(wan, t, lanOne !== '' ? [lanOne] : [], name, true).name;
+    this.api.rebase(wan, t, lanOne, lanAll);
+    this.machineName = Machines.upsert(wan, t, lanAll, name, true).name;
     AppStorage.setOrCreate('listDirty', Date.now());
     this.api.setForceWan(this.forceWan);
     this.api.setAutoLan(this.autoLan);
@@ -266,7 +315,7 @@ struct Index {
     this.wanBase = m.wan;
     this.token = m.token;
     this.machineName = m.name;
-    this.api.rebase(m.wan, m.token, m.lan.length > 0 ? m.lan[0] : '');
+    this.api.rebase(m.wan, m.token, m.lan.length > 0 ? m.lan[0] : '', m.lan);
     this.api.setForceWan(this.forceWan);
     this.api.setAutoLan(this.autoLan);
     try {
