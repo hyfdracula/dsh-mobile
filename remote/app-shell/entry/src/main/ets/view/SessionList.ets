@@ -1510,7 +1510,8 @@ export struct SessionList {
     Row({ space: 8 }) {
       // 关键：空闲时这里什么都不画。Refresh 的 builder 区域是常驻节点，
       // 画了就一直在（再叠加下面的 translate 位移，就变成列表上方那个不走的圆环）。
-      if (this.refreshing || this.pullState !== RefreshStatus.Inactive) {
+      if (this.refreshing || this.pullState === RefreshStatus.Drag ||
+        this.pullState === RefreshStatus.OverDrag) {
         LoadingProgress()
           .width(20)
           .height(20)
@@ -1908,6 +1909,8 @@ export struct SessionList {
             this.refreshing = true;
             this.load().finally(() => {
               this.refreshing = false;
+              // 收尾可能是 Done 而不是 Inactive，不归位的话指示器条件会一直成立
+              this.pullState = RefreshStatus.Inactive;
             });
           })
         }

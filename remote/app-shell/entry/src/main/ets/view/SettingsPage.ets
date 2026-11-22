@@ -163,6 +163,9 @@ export struct SettingsPage {
   /** 设置 → 连接：「自动切换局域网」（@Prop：父组件改了这个开关要能跟着刷新） */
   @Prop autoLan: boolean = true;
   haptics: boolean = true;
+  // Toggle 是受控组件：只读父级传进来的 haptics 的话，用户点一下界面不会变，
+  // 离开再回来又被父级初值顶回去（用户报的「关了以后出来再回去又显示打开」）。
+  @State private hapticsUi: boolean = true;
   onHaptics: (v: boolean) => void = () => {};
   hdsOn: boolean = true;
   onHds: (v: boolean) => void = () => {};
@@ -205,6 +208,7 @@ export struct SettingsPage {
   private subStack: NavPathStack = new NavPathStack();
 
   aboutToAppear(): void {
+    this.hapticsUi = this.haptics;
     this.readVersion();
     AppStorage.setOrCreate('settingsSub', this.sub);
     this.refreshNotifyState();
@@ -626,10 +630,11 @@ export struct SettingsPage {
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
-          Toggle({ type: ToggleType.Switch, isOn: this.haptics })
+          Toggle({ type: ToggleType.Switch, isOn: this.hapticsUi })
             .selectedColor(Tokens.accent)
             .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
             .onChange((v: boolean) => {
+              this.hapticsUi = v;
               this.onHaptics(v);
             })
         }

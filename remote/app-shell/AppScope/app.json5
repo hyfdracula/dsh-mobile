@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.dsh.mobile",
     "vendor": "dsh",
-    "versionCode": 1000180,
-    "versionName": "1.1.8",
+    "versionCode": 1000190,
+    "versionName": "1.1.9",
     "icon": "$media:app_icon",
     "label": "$string:app_name"
   }
