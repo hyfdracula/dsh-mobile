@@ -1243,6 +1243,8 @@ export struct ChatPage {
       }
     }
     const wasBottom: boolean = this.atBottom;
+    const beforeTail: string = this.msgs.length === 0 ? '' :
+      String(this.msgs[this.msgs.length - 1].seq) + ':' + String(this.msgs[this.msgs.length - 1].text.length);
     try {
       const r = await this.api.messages(this.param.id, 60);
       if (!this.alive || g !== this.gen) return;
@@ -1260,8 +1262,13 @@ export struct ChatPage {
       this.cached = false;
       ChatCache.write(this.param.id, r.messages, r.total, r.running === true, r.lastTurn ?? '');
       this.reconcileRescue(r);
-      // 只在刷新前就停在底部时才滚到底：缓存铺屏后网络补全不再打断回看
-      if (wasBottom) {
+      // 只在「本来就在底部」且这一屏确实变了时才补一次滚底。
+      // 以前只要在底部就无条件再滚一次，缓存铺屏 + 网络返回连着滚两下 = 界面抽搐。
+      // 判据不能只看条数：末条回复在流式变长时条数不变，但内容会顶出视口。
+      const afterTail: string = r.messages.length === 0 ? '' :
+        String(r.messages[r.messages.length - 1].seq) + ':' +
+          String(r.messages[r.messages.length - 1].text.length);
+      if (wasBottom && afterTail !== beforeTail) {
         setTimeout(() => {
           this.scroller.scrollEdge(Edge.Bottom);
         }, 80);
@@ -1306,6 +1313,81 @@ export struct ChatPage {
   }
 
   /** 向上补一页更早的历史，接在现有消息前面。 */
+  /**
+   * 菜单里的「刷新」：把最新内容补进来，但不重建这一列。
+   * 直接调 load() 会把 msgs 整个换掉 —— 列表重建、滚动位置丢、在底部时又被拽下去，
+   * 用户看到的就是「一刷新就抽搐并沉底」。这里按 seq 就地合并：老消息不动，
+   * 新的追加到尾部（界面自然往下延伸），同一条被重写的就地替换，全程不碰滚动条。
+   */
+  private async refreshSoft(): Promise<void> {
+    const g: number = this.gen;
+    Haptics.tap();
+    try {
+      const r = await this.api.messages(this.param.id, 60);
+      if (!this.alive || g !== this.gen) return;
+      // 先确认服务端这一页还能接得上本地：
+      //  - srvLast < localLast：日志被截断/重写过，本地这份已经不属于这个会话了
+      //  - srvFirst > localLast + 1：中间有洞（离线太久，服务端只给最新 60 条，补不回来）
+      // 两种都交给 load() 整体重建，别把旧内容留在缓存里继续拖下去。
+      if (this.msgs.length > 0 && r.messages.length > 0) {
+        const localLast: number = this.msgs[this.msgs.length - 1].seq;
+        const srvFirst: number = r.messages[0].seq;
+        const srvLast: number = r.messages[r.messages.length - 1].seq;
+        const stale: boolean = srvLast < localLast;
+        const gap: boolean = srvFirst > localLast + 1;
+        if (stale || gap) {
+          console.info('DSH_REFRESH reload stale=' + String(stale) + ' gap=' + String(gap));
+          this.load();
+          return;
+        }
+      }
+      const out: Message[] = this.msgs.slice();
+      for (let i = 0; i < r.messages.length; i++) {
+        const n: Message = r.messages[i];
+        if (out.length === 0) {
+          out.push(n);
+          continue;
+        }
+        const last: Message = out[out.length - 1];
+        if (n.seq === last.seq) {
+          out[out.length - 1] = n;
+          continue;
+        }
+        if (n.seq > last.seq) {
+          out.push(n);
+          continue;
+        }
+        for (let j = out.length - 1; j >= 0; j--) {
+          if (out[j].seq === n.seq) {
+            out[j] = n;
+            break;
+          }
+        }
+      }
+      const grew: boolean = out.length !== this.msgs.length;
+      this.msgs = out;
+      this.total = r.total;
+      this.stats = r.stats ?? null;
+      this.ctx = r.context === undefined ? null : r.context;
+      this.running = r.running === true;
+      this.applyQueue(r.queue === undefined ? [] : r.queue);
+      const qs: AskState | undefined = r.questions;
+      this.asks = qs === undefined || qs.active === undefined ? [] : qs.active;
+      this.hasMore = out.length < r.total;
+      this.err = '';
+      this.takeLastErr(r.lastErr);
+      this.cached = false;
+      ChatCache.write(this.param.id, out, r.total, r.running === true, r.lastTurn ?? '');
+      this.reconcileRescue(r);
+      console.info('DSH_REFRESH soft n=' + String(out.length) + ' grew=' + String(grew));
+    } catch (e) {
+      const msg: string = (e as Error).message;
+      if (!this.alive || g !== this.gen) return;
+      this.err = msg;
+      this.showErrCard('', msg, Date.now());
+    }
+  }
+
   private async loadOlder(): Promise<void> {
     if (this.loadingMore || this.msgs.length === 0) return;
     this.loadingMore = true;
@@ -1578,17 +1660,23 @@ export struct ChatPage {
     return m === null ? '' : m.text;
   }
 
+  /**
+   * 分段控件里的一格。
+   * 选中态必须在这里读 this.selRaw：@Builder 的布尔值参数是「首帧快照」，
+   * 外面传 !this.selRaw 进来之后就一直不会变，切换时白胶囊会停在原来那一格。
+   */
   @Builder
-  selTab(label: string, on: boolean, act: () => void) {
+  selTab(label: string, which: string, act: () => void) {
     Text(label)
       .fontSize(13.5)
-      .fontColor(on ? Tokens.fg : Tokens.dim)
-      .fontWeight(on ? FontWeight.Medium : FontWeight.Normal)
+      .fontColor(((which === 'raw') === this.selRaw) ? Tokens.fg : Tokens.dim)
+      .fontWeight(((which === 'raw') === this.selRaw) ? FontWeight.Medium : FontWeight.Normal)
       .textAlign(TextAlign.Center)
       .layoutWeight(1)
       .height(34)
       .borderRadius(Tokens.rPill)
-      .backgroundColor(on ? (Tokens.isDark ? '#3DFFFFFF' : '#FFFFFFFF') : Color.Transparent)
+      .backgroundColor(((which === 'raw') === this.selRaw)
+        ? (Tokens.isDark ? '#3DFFFFFF' : '#FFFFFFFF') : Color.Transparent)
       .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
       .onClick(act)
   }
@@ -1637,28 +1725,14 @@ export struct ChatPage {
       .padding({ left: 20, right: 10, top: 12, bottom: 2 })
 
       Row() {
-        this.selTab('正文', !this.selRaw, (): void => { this.selRaw = false; })
-        this.selTab('Markdown 原文', this.selRaw, (): void => { this.selRaw = true; })
+        this.selTab('正文', 'body', (): void => { this.selRaw = false; })
+        this.selTab('Markdown 原文', 'raw', (): void => { this.selRaw = true; })
       }
       .width('100%')
       .padding(3)
       .backgroundColor(Tokens.isDark ? '#26FFFFFF' : '#14000000')
       .borderRadius(Tokens.rPill)
       .margin({ left: 20, right: 20, top: 8 })
-
-      Row() {
-        Blank()
-        Text('复制全部')
-          .fontSize(13.5)
-          .fontColor(Tokens.accent)
-          .padding({ left: 10, right: 4, top: 8, bottom: 6 })
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
-          .onClick(() => {
-            this.copyText(this.selText(), '已复制全文');
-          })
-      }
-      .width('100%')
-      .padding({ right: 16 })
 
       Scroll() {
         if (this.selRaw) {
@@ -2679,7 +2753,7 @@ export struct ChatPage {
         const p: ChatParam = { id: this.param.id, title: this.param.title };
         this.stack.pushPathByName('presets', p);
       })
-      this.menuOpt('刷新', (): void => { this.load(); })
+      this.menuOpt('刷新', (): void => { this.refreshSoft(); })
     }
     .width(268)
     .padding({ left: 6, right: 6, top: 8, bottom: 10 })
@@ -4041,9 +4115,8 @@ export struct ChatPage {
               }
 
               Row() {
-                // 多行：高度跟着内容长，长到六行左右封顶，再多就在框内滚。
-                // 不能设 maxLines：设了就把可视行数钉死，第四行起只能在框里挤，
-                // 卡片不长高、文字又贴死在顶部，看起来就是「超过三行看不见」。
+                // 多行：高度跟着内容长，三行封顶，再多就靠框内滚动（barState Auto 的滑轨）。
+                // 不能设 maxLines：设了就把可视行数钉死、卡片不再长高，文字还会贴死在顶部。
                 TextArea({ placeholder: '发消息或问点什么…', text: this.draft })
                   .placeholderColor(Tokens.dim2)
                   .fontColor(Tokens.fg)
@@ -4052,7 +4125,7 @@ export struct ChatPage {
                   .padding({ left: 12, right: 4, top: 12, bottom: 12 })
                   .backgroundColor(Color.Transparent)
                   .layoutWeight(1)
-                  .constraintSize({ minHeight: 46, maxHeight: 172 })
+                  .constraintSize({ minHeight: 46, maxHeight: 87 })
                   .barState(BarState.Auto)
                   .enterKeyType(EnterKeyType.Send)
                   .onChange((v: string) => {

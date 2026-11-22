@@ -35,6 +35,8 @@ export struct ExtrasPanel {
   /** 正在看的文本文件在工作区里的相对路径：保存时要拿它拼下载直链 */
   @State private viewerPath: string = '';
   @State private viewerText: string = '';
+  /** 二进制文件没有文本预览：只显示说明 + 保存按钮 */
+  @State private viewerBinary: boolean = false;
   @State private imageOn: boolean = false;
   @State private imagePath: string = '';
   /** 正在保存到手机：发一次请求就锁住按钮，避免连点堆出多个下载任务 */
@@ -225,17 +227,44 @@ export struct ExtrasPanel {
       this.saving = false;
       return;
     }
+    // 宿主的文本预览只到 512 KiB，超了直接 413，请求也没意义：先按大小判断，
+    // 免得用户先吃一条红条、再点一次才拿到保存面板。
+    if (e.size > 512 * 1024) {
+      this.viewerName = this.shortName(full);
+      this.viewerPath = full;
+      this.viewerText = '';
+      this.viewerBinary = true;
+      this.viewerOn = true;
+      this.saving = false;
+      this.err = '';
+      return;
+    }
     this.busy = true;
     try {
       const f = await this.api.fsFile(this.sessionId, full);
       this.viewerName = f.name;
       this.viewerPath = full;
       this.viewerText = f.text;
+      this.viewerBinary = false;
       this.viewerOn = true;
       this.saving = false;
       this.err = '';
     } catch (err) {
-      this.err = (err as Error).message;
+      const msg: string = (err as Error).message;
+      // 415 = 宿主那边判定这不是文本（.pyc、.zip、图片之外的二进制）。
+      // 以前只把红条糊在列表上，用户既看不到也存不下来；现在开一个只有保存的面板。
+      if (msg.indexOf('415') >= 0 || msg.indexOf('413') >= 0 || msg.indexOf('binary') >= 0 ||
+        msg.indexOf('二进制') >= 0 || msg.indexOf('too large') >= 0) {
+        this.viewerName = this.shortName(full);
+        this.viewerPath = full;
+        this.viewerText = '';
+        this.viewerBinary = true;
+        this.viewerOn = true;
+        this.saving = false;
+        this.err = '';
+      } else {
+        this.err = msg;
+      }
     } finally {
       this.busy = false;
     }
@@ -980,7 +1009,9 @@ export struct ExtrasPanel {
           .layoutWeight(1)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-        this.saveButton('保存', this.viewerPath, this.viewerName)
+        if (!this.viewerBinary) {
+          this.saveButton('保存', this.viewerPath, this.viewerName)
+        }
         Text('关闭')
           .fontSize(13)
           .fontColor(Tokens.accent)
@@ -992,19 +1023,61 @@ export struct ExtrasPanel {
       .width('100%')
       .padding({ top: 88, left: 18, right: 12, bottom: 8 })
 
-      Scroll() {
-        Text(this.viewerText)
-          .fontSize(12)
-          .fontColor(Tokens.fg)
-          .width('100%')
-          .copyOption(CopyOptions.LocalDevice)
-          .textAlign(TextAlign.Start)
+      if (this.viewerBinary) {
+        Column({ space: 14 }) {
+          Blank()
+          Text('这个文件没法在手机里预览')
+            .fontSize(15)
+            .fontColor(Tokens.fg)
+          Text('它不是文本文件，可以保存到手机再用别的应用打开')
+            .fontSize(12.5)
+            .fontColor(Tokens.dim2)
+            .textAlign(TextAlign.Center)
+            .padding({ left: 24, right: 24 })
+          Row() {
+            if (this.saving) {
+              LoadingProgress()
+                .width(15)
+                .height(15)
+                .color(Tokens.dim2)
+              Text('保存中')
+                .fontSize(13.5)
+                .fontColor(Tokens.dim2)
+                .margin({ left: 6 })
+            } else {
+              Text('保存到手机')
+                .fontSize(13.5)
+                .fontColor(Tokens.accentInk)
+            }
+          }
+          .height(44)
+          .padding({ left: 22, right: 22 })
+          .backgroundColor(this.saving ? Tokens.surface2 : Tokens.accentStrong)
+          .borderRadius(Tokens.rPill)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+          .onClick(() => {
+            this.saveFile(this.viewerPath, this.viewerName);
+          })
+          Blank()
+        }
+        .layoutWeight(1)
+        .width('100%')
+        .justifyContent(FlexAlign.Center)
+      } else {
+        Scroll() {
+          Text(this.viewerText)
+            .fontSize(12)
+            .fontColor(Tokens.fg)
+            .width('100%')
+            .copyOption(CopyOptions.LocalDevice)
+            .textAlign(TextAlign.Start)
+        }
+        .layoutWeight(1)
+        .width('100%')
+        .padding({ left: 18, right: 18, bottom: 20 })
+        .align(Alignment.Top)
+        .scrollBar(BarState.Auto)
       }
-      .layoutWeight(1)
-      .width('100%')
-      .padding({ left: 18, right: 18, bottom: 20 })
-      .align(Alignment.Top)
-      .scrollBar(BarState.Auto)
     }
     .width('100%')
     .height('100%')

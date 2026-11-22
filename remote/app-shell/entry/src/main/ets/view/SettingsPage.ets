@@ -286,8 +286,33 @@ export struct SettingsPage {
 
   /** 二级页顶部同色渐变：滚上来的内容在浮动标题下面淡出，不留硬边。 */
   /** 悬浮标题行：父级已经留好状态栏高度，这里不再加外边距。 */
+  /** 扫码钮：和返回键同款玻璃，放在标题行右端，随标题一起悬浮，不跟着内容滚走。 */
   @Builder
-  floatingHeader(title: string) {
+  headerScanButton() {
+    Stack() {
+      Image($r('app.media.ic_scan'))
+        .width(20)
+        .height(20)
+        .fillColor(Tokens.fg)
+        .objectFit(ImageFit.Contain)
+    }
+    .width(38)
+    .height(38)
+    .borderRadius(999)
+    .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#8CFFFFFF')
+    .backdropBlur(22)
+    .border({ width: 1, color: Tokens.isDark ? '#40FFFFFF' : '#D9FFFFFF' })
+    .shadow({ radius: 14, color: Tokens.isDark ? '#40000000' : '#26000000', offsetY: 4 })
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+    .onClick(() => {
+      Haptics.tap();
+      this.pairEntry = 'scan';
+      this.subStack.pushPathByName('pair', null);
+    })
+  }
+
+  @Builder
+  floatingHeader(title: string, scan: boolean) {
     Row() {
       Stack() {
         Image($r('app.media.ic_back'))
@@ -314,6 +339,9 @@ export struct SettingsPage {
         .fontColor(Tokens.fg)
         .margin({ left: 12 })
       Blank()
+      if (scan) {
+        this.headerScanButton()
+      }
     }
     .width('100%')
     .height(56)
@@ -643,8 +671,6 @@ export struct SettingsPage {
     .width('100%')
 
     Row() {
-      this.addMachineChip('配对码', 'code')
-      this.addMachineChip('扫一扫', 'scan')
       this.addMachineChip('新手引导', 'guide')
       this.addMachineChip('手动添加', 'manual')
     }
@@ -1481,7 +1507,7 @@ export struct SettingsPage {
             .padding({ top: 56 })
 
             this.subFade()
-            this.floatingHeader('电脑')
+            this.floatingHeader('电脑', true)
           }
           .width('100%')
           .height('100%')
