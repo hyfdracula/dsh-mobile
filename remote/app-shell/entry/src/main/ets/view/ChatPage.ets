@@ -1879,15 +1879,6 @@ export struct ChatPage {
             this.quoteMessage(mm);
           }
         })
-        if (this.menuMsg !== null && this.menuMsg.role === 'assistant' && this.menuMsg.turn !== undefined) {
-          this.selBtn('开新分支', false, (): void => {
-            const mm: Message | null = this.menuMsg;
-            this.msgMenuOn = false;
-            if (mm !== null) {
-              this.forkAt(mm);
-            }
-          })
-        }
       }
       .width('100%')
       .padding({ left: 20, right: 20, top: 4, bottom: 22 })
@@ -2395,6 +2386,28 @@ export struct ChatPage {
             Text(this.clockText(m.turn.finishedAt === undefined ? 0 : m.turn.finishedAt))
               .fontSize(11)
               .fontColor(Tokens.dim2)
+          }
+          if (m.turn !== undefined) {
+            // 开新分支放回气泡底下：脚注行上一枚小胶囊，点一下就从这条回复分叉
+            Row() {
+              Image($r('app.media.ic_fork'))
+                .width(11)
+                .height(11)
+                .fillColor(Tokens.dim2)
+                .draggable(false)
+              Text('从这里开新分支')
+                .fontSize(11)
+                .fontColor(Tokens.dim2)
+                .margin({ left: 4 })
+            }
+            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+            .borderRadius(Tokens.rPill)
+            .backgroundColor(Tokens.isDark ? '#1FFFFFFF' : '#0F000000')
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+            .onClick(() => {
+              Haptics.tap();
+              this.forkAt(m);
+            })
           }
         }
         .margin({ top: 6 })
@@ -4414,7 +4427,8 @@ export struct ChatPage {
           .hitTestBehavior(HitTestMode.Transparent)
 
 
-        if (!this.atBottom && !this.queueOpen && this.pendingTotal() === 0) {
+        // 只要不在底部就给出口，待发送板/队列展开时也照常显示；位置由 pendH 让开
+        if (!this.atBottom) {
           Stack() {
             Image($r('app.media.ic_down'))
               .width(17)
