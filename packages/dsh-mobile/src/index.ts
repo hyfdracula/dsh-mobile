@@ -88,8 +88,13 @@ function freshPairCode(): string {
 }
 
 /** The deep link a QR code carries: base URL plus the live code. */
-function pairPayload(base: string, code: string): string {
-  return `dshmobile://pair?b=${encodeURIComponent(base)}&c=${encodeURIComponent(code)}`
+function pairPayload(base: string, code: string, alts: readonly string[] = []): string {
+  const extra = alts
+    .filter((one) => one.length > 0 && one !== base)
+    .slice(0, 4)
+    .map((one) => `&a=${encodeURIComponent(one)}`)
+    .join('')
+  return `dshmobile://pair?b=${encodeURIComponent(base)}&c=${encodeURIComponent(code)}${extra}`
 }
 
 /** Harness home, honouring the `DSH_HOME` override the launchers use. */
@@ -1544,6 +1549,11 @@ export function apply(ctx: any, rawConfig?: Config): void {
     const prefs = pairPrefs()
     const pending = ensurePair()
     const lan = lanBases()
+    const primary = prefs.allowLan && lan.length > 0 ? (lan[0] as string) : prefs.publicUrl
+    // 手机连不上首个地址时的退路：其它网卡 + 公网隧道。顺序就是尝试顺序。
+    const alts = [...lan.slice(1), prefs.allowRemote ? prefs.publicUrl : ''].filter(
+      (one) => one.length > 0 && one !== primary,
+    )
     return {
       ok: true,
       host: hostname(),
@@ -1555,8 +1565,9 @@ export function apply(ctx: any, rawConfig?: Config): void {
       allowRemote: prefs.allowRemote,
       publicUrl: prefs.publicUrl,
       lan,
+      alts,
       /** Base URL a QR should carry right now: LAN first, then the tunnel. */
-      base: prefs.allowLan && lan.length > 0 ? (lan[0] as string) : prefs.publicUrl,
+      base: primary,
       phoneSeenAt,
       phoneOnline: phoneSeenAt > 0 && Date.now() - phoneSeenAt < PHONE_ONLINE_MS,
       sessions: true,
@@ -2031,7 +2042,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
         version: VERSION,
         port,
         lan: prefs.allowLan ? lanBases() : [],
-        qr: pairPayload(base, pairCode?.code ?? ''),
+        qr: pairPayload(base, pairCode?.code ?? '', lanBases().slice(1)),
       })
       return
     }
@@ -4006,7 +4017,8 @@ export function apply(ctx: any, rawConfig?: Config): void {
   const panelSnapshot = (): Record<string, unknown> => {
     const snapshot = pairState()
     const base = String(snapshot.base ?? '')
-    const payload = base.length > 0 ? pairPayload(base, String(snapshot.code ?? '')) : ''
+    const alts = Array.isArray(snapshot.alts) ? (snapshot.alts as string[]) : []
+    const payload = base.length > 0 ? pairPayload(base, String(snapshot.code ?? ''), alts) : ''
     return { ...snapshot, payload }
   }
 
@@ -4044,10 +4056,11 @@ export function apply(ctx: any, rawConfig?: Config): void {
     const asked = url.searchParams.get('payload')
     const snapshot = pairState()
     const base = String(snapshot.base ?? '')
+    const alts = Array.isArray(snapshot.alts) ? (snapshot.alts as string[]) : []
     const text = asked !== null && asked.length > 0
       ? asked
       : base.length > 0
-        ? pairPayload(base, String(snapshot.code ?? ''))
+        ? pairPayload(base, String(snapshot.code ?? ''), alts)
         : ''
     if (text.length === 0) {
       return panelJson(409, { error: 'no base url yet', hint: 'turn 局域网直连 on, or set a public url' })

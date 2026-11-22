@@ -41,10 +41,16 @@ export struct PairPage {
     }
   }
 
-  private async doClaim(base: string, code: string): Promise<void> {
-    const b = Pairing.normalizeBase(base);
+  private async doClaim(bases: string[], code: string): Promise<void> {
+    const list: string[] = [];
+    for (let i = 0; i < bases.length; i++) {
+      const one = Pairing.normalizeBase(bases[i]);
+      if (one !== '' && list.indexOf(one) < 0) {
+        list.push(one);
+      }
+    }
     const c = code.trim();
-    if (b === '') {
+    if (list.length === 0) {
       this.err = '先填电脑地址';
       return;
     }
@@ -57,19 +63,22 @@ export struct PairPage {
     }
     this.busy = true;
     this.err = '';
-    this.okMsg = '正在连 ' + b + ' …';
+    this.okMsg = list.length > 1
+      ? '正在连 ' + list[0] + '（另有 ' + (list.length - 1) + ' 个备选）…'
+      : '正在连 ' + list[0] + ' …';
     try {
-      const r: PairClaim = await Pairing.claim(b, c);
+      const r: PairClaim = await Pairing.claimAny(list, c);
+      const used = r.usedBase !== undefined && r.usedBase !== '' ? r.usedBase : list[0];
       this.okMsg = '配对成功 · ' + (r.host !== undefined ? r.host : '');
-      console.info('DSH_PAIR ok base=' + b + ' host=' + r.host);
+      console.info('DSH_PAIR ok base=' + used + ' host=' + r.host);
       Haptics.tap();
       await this.wait(320);
-      this.onPaired(b, r.token, r.host, r.lan !== undefined ? r.lan : []);
+      this.onPaired(used, r.token, r.host, r.lan !== undefined ? r.lan : []);
     } catch (e) {
       const msg = (e as Error).message;
       this.err = msg;
       this.okMsg = '';
-      console.error('DSH_PAIR fail base=' + b + ' :: ' + msg);
+      console.error('DSH_PAIR fail :: ' + msg);
     } finally {
       this.busy = false;
     }
@@ -100,9 +109,13 @@ export struct PairPage {
         this.err = '这个二维码不是配对码，用下面的 6 位码更稳';
         return;
       }
-      this.hint = '已扫到 ' + link.base;
+      this.hint = '已扫到 ' + link.base + (link.alts.length > 0 ? '（含 ' + link.alts.length + ' 个备选）' : '');
       this.step = 2;
-      await this.doClaim(link.base, link.code);
+      const bases: string[] = [link.base];
+      for (let i = 0; i < link.alts.length; i++) {
+        bases.push(link.alts[i]);
+      }
+      await this.doClaim(bases, link.code);
     } catch (e) {
       const msg = (e as Error).message;
       this.err = '打开扫码失败：' + msg;
@@ -453,7 +466,7 @@ export struct PairPage {
         })
 
       this.primaryBtn('code', () => {
-        this.doClaim(this.manual !== '' ? this.manual : this.defaultBase, this.code);
+        this.doClaim([this.manual !== '' ? this.manual : this.defaultBase], this.code);
       })
       Text('把电脑端「设置 → 手机连接」面板上显示的 6 位码填到上面。')
         .fontSize(11)

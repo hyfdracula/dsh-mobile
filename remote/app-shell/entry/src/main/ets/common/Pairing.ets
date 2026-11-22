@@ -26,6 +26,8 @@ export interface PairClaim {
   port: number;
   qr: string;
   lan?: string[];
+  /** 这次真正连上的地址，配对成功后用它保存。 */
+  usedBase: string;
   error: string;
   code: string;
   left: number;
@@ -35,6 +37,8 @@ export interface PairClaim {
 export interface PairLink {
   base: string;
   code: string;
+  /** 同一个二维码里附带的备选地址：首个连不上时依次再试。 */
+  alts: string[];
 }
 
 interface RawResp {
@@ -75,6 +79,7 @@ export class Pairing {
     const query = s.substring(q + 1);
     let base = '';
     let code = '';
+    const alts: string[] = [];
     const parts = query.split('&');
     for (let i = 0; i < parts.length; i++) {
       const eq = parts[i].indexOf('=');
@@ -87,12 +92,14 @@ export class Pairing {
         base = v;
       } else if (k === 'c') {
         code = v;
+      } else if (k === 'a' && v !== '') {
+        alts.push(Pairing.normalizeBase(v));
       }
     }
     if (base === '' || code === '') {
       return null;
     }
-    return { base: Pairing.normalizeBase(base), code: code };
+    return { base: Pairing.normalizeBase(base), code: code, alts: alts };
   }
 
   private static async req(base: string, path: string, method: string, payload: string): Promise<RawResp> {
@@ -128,6 +135,41 @@ export class Pairing {
     return o;
   }
 
+  /**
+   * 用 6 位码换令牌，按顺序试多个地址。
+   *
+   * 二维码里除了首个地址，还可能带几个备选（其它网卡、公网隧道）。只有当某个
+   * 地址**真的连不上**时才换下一个；一旦对面答了（码错 / 被拒 / 限流），
+   * 就说明路是通的，立刻把它的答复抛出去，别拿同一个码去撞别处的服务器。
+   */
+  static async claimAny(bases: readonly string[], code: string): Promise<PairClaim> {
+    const tried: string[] = [];
+    let last: string = '';
+    for (let i = 0; i < bases.length; i++) {
+      const one = Pairing.normalizeBase(bases[i]);
+      if (one === '' || tried.indexOf(one) >= 0) {
+        continue;
+      }
+      tried.push(one);
+      try {
+        return await Pairing.claim(one, code);
+      } catch (e) {
+        const msg = (e as Error).message;
+        last = msg;
+        const dead = msg.indexOf('HTTP ') < 0;
+        console.info('DSH_PAIR try ' + one + ' dead=' + dead + ' :: ' + msg);
+        if (!dead) {
+          throw new Error(msg);
+        }
+      }
+    }
+    throw new Error(
+      '连不上这台电脑（试了 ' + tried.length + ' 个地址，最后一个：' + last + '）。' +
+        '检查：①手机和电脑连的是同一个 Wi-Fi；②电脑防火墙放行 DSH（端口 8901）；' +
+        '③或者让电脑打开公网访问，重新扫一次。'
+    );
+  }
+
   /** 用 6 位码换令牌。码错会带着剩余次数回来，方便直接显示。 */
   static async claim(base: string, code: string): Promise<PairClaim> {
     const body: CodeBody = { code: code.trim() };
@@ -139,6 +181,7 @@ export class Pairing {
       throw new Error('电脑返回了看不懂的内容（HTTP ' + r.status + '）');
     }
     if (r.status === 200 && o.ok === true) {
+      o.usedBase = Pairing.normalizeBase(base);
       return o;
     }
     if (r.status === 401) {

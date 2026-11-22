@@ -2128,7 +2128,7 @@ export struct ChatPage {
         Span(s.t)
           .fontWeight(s.b ? FontWeight.Bold : FontWeight.Normal)
           .fontFamily(s.c ? 'monospace' : 'HarmonyOS Sans')
-          .fontColor(s.c ? Tokens.accent : Tokens.fg)
+          .fontColor(Tokens.fg)
       }, (s: MdSeg, i: number) => i + '_' + s.t.length + (s.b ? 'b' : '') + (s.c ? 'c' : ''))
     }
     .fontSize(size)
@@ -2165,7 +2165,7 @@ export struct ChatPage {
                 Span(s.t)
                   .fontWeight(s.b ? FontWeight.Bold : FontWeight.Medium)
                   .fontFamily(s.c ? 'monospace' : 'HarmonyOS Sans')
-                  .fontColor(s.c ? Tokens.accent : Tokens.fg)
+                  .fontColor(Tokens.fg)
               }, (s: MdSeg, si: number) => 'th' + ci + '_' + si)
             }
             .fontSize(12.5)
@@ -2184,7 +2184,7 @@ export struct ChatPage {
                   Span(s.t)
                     .fontWeight(s.b ? FontWeight.Bold : FontWeight.Normal)
                     .fontFamily(s.c ? 'monospace' : 'HarmonyOS Sans')
-                    .fontColor(s.c ? Tokens.accent : Tokens.fg)
+                    .fontColor(Tokens.fg)
                 }, (s: MdSeg, si: number) => 'td' + ri + '_' + ci + '_' + si)
               }
               .fontSize(12.5)
@@ -2217,7 +2217,7 @@ export struct ChatPage {
       Row() {
         Text('·')
           .fontSize(15)
-          .fontColor(Tokens.accent)
+          .fontColor(Tokens.fg)
           .width(12)
         this.mdText(b.segs, 15, 24)
       }
@@ -2227,7 +2227,7 @@ export struct ChatPage {
       Row() {
         Text(String(b.ord) + '.')
           .fontSize(15)
-          .fontColor(Tokens.accent)
+          .fontColor(Tokens.fg)
           .width(22)
         this.mdText(b.segs, 15, 24)
       }
