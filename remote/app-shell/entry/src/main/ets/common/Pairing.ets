@@ -46,6 +46,19 @@ interface RawResp {
   body: string;
 }
 
+/**
+ * 对面**答了**（码错 / 被拒 / 限流）时抛这个，和「根本没连上」区分开。
+ * 只有没连上才值得换下一个地址；答过的服务器再拿同一个一次性码去撞别处没有意义。
+ */
+export class PairError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 interface CodeBody {
   code: string;
 }
@@ -155,12 +168,13 @@ export class Pairing {
         return await Pairing.claim(one, code);
       } catch (e) {
         const msg = (e as Error).message;
-        last = msg;
-        const dead = msg.indexOf('HTTP ') < 0;
-        console.info('DSH_PAIR try ' + one + ' dead=' + dead + ' :: ' + msg);
-        if (!dead) {
-          throw new Error(msg);
+        if (e instanceof PairError) {
+          // 对面答了：说明路是通的，把这个答复原样交给界面，别去撞下一个地址
+          console.info('DSH_PAIR reject ' + one + ' status=' + e.status);
+          throw e;
         }
+        last = msg;
+        console.info('DSH_PAIR unreachable ' + one + ' :: ' + msg);
       }
     }
     throw new Error(
@@ -178,7 +192,7 @@ export class Pairing {
     try {
       o = JSON.parse(r.body) as PairClaim;
     } catch (e) {
-      throw new Error('电脑返回了看不懂的内容（HTTP ' + r.status + '）');
+      throw new PairError(r.status, '电脑返回了看不懂的内容（HTTP ' + r.status + '）');
     }
     if (r.status === 200 && o.ok === true) {
       o.usedBase = Pairing.normalizeBase(base);
@@ -186,14 +200,14 @@ export class Pairing {
     }
     if (r.status === 401) {
       const left = typeof o.left === 'number' ? o.left : 0;
-      throw new Error(left > 0 ? ('配对码不对，还能试 ' + left + ' 次') : '配对码不对');
+      throw new PairError(r.status, left > 0 ? ('配对码不对，还能试 ' + left + ' 次') : '配对码不对');
     }
     if (r.status === 403) {
-      throw new Error('电脑上关掉了允许连接，先打开再配对');
+      throw new PairError(r.status, '电脑上关掉了允许连接，先打开再配对');
     }
     if (r.status === 429) {
-      throw new Error('试错太多次，等 5 分钟再试');
+      throw new PairError(r.status, '试错太多次，等 5 分钟再试');
     }
-    throw new Error('配对失败（HTTP ' + r.status + '）');
+    throw new PairError(r.status, '配对失败（HTTP ' + r.status + '）');
   }
 }

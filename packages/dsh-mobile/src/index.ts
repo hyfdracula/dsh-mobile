@@ -89,9 +89,13 @@ function freshPairCode(): string {
 
 /** The deep link a QR code carries: base URL plus the live code. */
 function pairPayload(base: string, code: string, alts: readonly string[] = []): string {
-  const extra = alts
-    .filter((one) => one.length > 0 && one !== base)
-    .slice(0, 4)
+  // 最后一个位置留给公网隧道：网卡再多，手机也总还有一条能走的路。
+  const list = alts.filter((one) => one.length > 0 && one !== base)
+  const tunnel = list.length > 0 && /^https:\/\//i.test(list[list.length - 1] as string)
+  const head = tunnel ? list.slice(0, -1) : list
+  const kept = head.slice(0, tunnel ? 3 : 4)
+  const tail = tunnel ? [list[list.length - 1] as string] : []
+  const extra = [...kept, ...tail]
     .map((one) => `&a=${encodeURIComponent(one)}`)
     .join('')
   return `dshmobile://pair?b=${encodeURIComponent(base)}&c=${encodeURIComponent(code)}${extra}`
