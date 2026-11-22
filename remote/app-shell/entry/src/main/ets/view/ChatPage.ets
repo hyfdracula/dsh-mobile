@@ -2388,22 +2388,20 @@ export struct ChatPage {
               .fontColor(Tokens.dim2)
           }
           if (m.turn !== undefined) {
-            // 开新分支放回气泡底下：脚注行上一枚小胶囊，点一下就从这条回复分叉
-            Row() {
+            // 开新分支放回气泡底下：只要一枚分叉图标，不带文字
+            Stack() {
               Image($r('app.media.ic_fork'))
-                .width(11)
-                .height(11)
+                .width(13)
+                .height(13)
                 .fillColor(Tokens.dim2)
                 .draggable(false)
-              Text('从这里开新分支')
-                .fontSize(11)
-                .fontColor(Tokens.dim2)
-                .margin({ left: 4 })
             }
-            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+            .width(26)
+            .height(22)
             .borderRadius(Tokens.rPill)
             .backgroundColor(Tokens.isDark ? '#1FFFFFFF' : '#0F000000')
             .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+            .accessibilityText('从这里开新分支')
             .onClick(() => {
               Haptics.tap();
               this.forkAt(m);
@@ -4444,7 +4442,8 @@ export struct ChatPage {
           .border({ width: 1, color: Tokens.glassTop })
           .shadow({ radius: 18, color: Tokens.shadow, offsetY: 6 })
           // 输入卡实测高度 + 待发送板高度：按钮永远浮在它们上方，不重合
-          .position({ right: 18, bottom: this.kbH + this.inputH + 24 + this.pendH })
+          // 40 = 输入区外层下内距 26 + 输入卡顶边再留 14，避免和玻璃卡边缘/阴影压在一起
+          .position({ right: 18, bottom: this.kbH + this.inputH + 40 + this.pendH })
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
           .transition(TransitionEffect.OPACITY.animation({ duration: 160 }))
           .onClick(() => {
