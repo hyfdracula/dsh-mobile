@@ -2,11 +2,10 @@ import preferences from '@ohos.data.preferences';
 import ConfigurationConstant from '@ohos.app.ability.ConfigurationConstant';
 import common from '@ohos.app.ability.common';
 import { Configuration } from '@ohos.app.ability.Configuration';
-import curves from '@ohos.curves';
 import { Api } from '../common/Api';
 import { Tokens } from '../common/Tokens';
 import { ChatParam } from '../common/Types';
-import { applyTheme, resolveDark, THEME_AUTO } from '../common/Theme';
+import { applyTheme, THEME_AUTO } from '../common/Theme';
 import { ChatPage } from '../view/ChatPage';
 import { AgentsPage } from '../view/AgentsPage';
 import { SettingsPage } from '../view/SettingsPage';
@@ -15,7 +14,9 @@ import { PairPage } from '../view/PairPage';
 import { ShellPage } from '../view/ShellPage';
 import { Haptics } from '../common/Haptics';
 import { Machines } from '../common/Machines';
-import { NavFx } from '../common/NavFx';
+import { Net } from '../common/Net';
+import { Secret } from '../common/Secret';
+import { Toast } from '../common/Toast';
 
 // 首次启动没有内置地址与令牌：先在「配对这台电脑」里扫码或输 6 位码，
 // 配对成功后地址与令牌写进本机 preferences，之后的启动都从这里读。
@@ -36,7 +37,9 @@ struct Index {
   @State private api: Api = new Api(DEFAULT_BASE, DEFAULT_TOKEN, LAN_BASE);
   @State private themeMode: string = THEME_AUTO;
   @State private forceWan: boolean = false;
-  /** 设置 → 连接 里的「自动切换局域网」开关，默认开 */
+  /** 网络策略：auto（自动）/ lan（仅局域网）/ wan（仅公网）。 */
+  @State private netMode: string = 'auto';
+  /** 兼容旧字段：由 netMode 推导。 */
   @State private autoLan: boolean = true;
   /** 当前连着的电脑名字（多台电脑共用同一套界面，切换时整体换地址与令牌）。 */
   @State private machineName: string = '';
@@ -54,6 +57,7 @@ struct Index {
    */
   onPageShow(): void {
     AppStorage.setOrCreate('notifyProbe', Date.now());
+    AppStorage.setOrCreate('appFg', true);
     this.startPresence();
     // 回到前台先重选一次入口：从外面回到家、或切了 Wi-Fi，这一步就能立刻换回局域网
     void this.refreshLan();
@@ -61,6 +65,7 @@ struct Index {
   }
 
   onPageHide(): void {
+    AppStorage.setOrCreate('appFg', false);
     this.stopPresence(true);
   }
 
@@ -119,6 +124,7 @@ struct Index {
 
   aboutToAppear(): void {
     AppStorage.setOrCreate('settingsSub', '');
+    Net.start();
     this.applyThemeNow();
     this.loadCfg();
   }
@@ -130,7 +136,8 @@ struct Index {
   onBackPress(): boolean {
     const sub = AppStorage.get<string>('settingsSub');
     if (sub !== undefined && sub !== '') {
-      AppStorage.setOrCreate('settingsSub', '');
+      // 让 SettingsPage 自己 pop 二级栈：只清共享状态会把栈留脏，下次返回要按两次。
+      AppStorage.setOrCreate('settingsBack', Date.now());
       Haptics.soft();
       return true;
     }
@@ -183,25 +190,51 @@ struct Index {
     try {
       const p = await preferences.getPreferences(getContext(this), PREF_STORE);
       let b = await p.get('base', DEFAULT_BASE) as string;
+      const tOldBase: string = b;
       let t = await p.get('token', DEFAULT_TOKEN) as string;
+      // 令牌优先从资产库读；旧版本只写过 preferences，这里读出来顺手迁进资产库。
+      const sec: string = Secret.load();
+      if (sec !== '') {
+        t = sec;
+        // 资产库已有：把 preferences 里的明文抹掉。
+        if (await p.get('token', '') !== '') {
+          await p.put('token', '');
+          await p.flush();
+        }
+      } else if (t !== '' && t !== DEFAULT_TOKEN) {
+        if (Secret.save(t)) {
+          await p.put('token', '');
+          await p.flush();
+        }
+      }
       let t0FromMachine: string = '';
       const th = await p.get('theme', THEME_AUTO) as string;
       const fw = await p.get('forceWan', '0') as string;
       const al = await p.get('autoLan', '') as string;
       const hp = await p.get('haptics', '1') as string;
       const hd = await p.get('hdsOn', '1') as string;
-      // 隐源光感现已不再提供开关，历史上被关掉的用户一律回到开启态，避免永久无法恢复
-      this.hdsOn = true;
+      const nd = await p.get('notifyDone', '1') as string;
+      const nb = await p.get('notifyBgOnly', '1') as string;
+      const es = await p.get('enterSend', '1') as string;
+      const ts = await p.get('textScale', '1') as string;
+      AppStorage.setOrCreate('notifyDone', nd !== '0');
+      AppStorage.setOrCreate('notifyBgOnly', nb !== '0');
+      AppStorage.setOrCreate('enterSend', es !== '0');
+      const tsN: number = Number(ts);
+      AppStorage.setOrCreate('textScale', tsN > 0 ? tsN : 1);
       const lan = await p.get('lan', '') as string;
       // 「忙碌时发送」的偏好已废弃：运行中一律排队，由输入区按钮单独决定插队
       AppStorage.setOrCreate('sendMode', 'queue');
       this.haptics = hp === '1';
       Haptics.enabled = this.haptics;
+      // 沉浸光感开关回到用户手里：默认开，关掉后底栏与顶栏退回普通底色。
       this.hdsOn = hd !== '0';
-      AppStorage.setOrCreate('hdsOn', true);
+      AppStorage.setOrCreate('hdsOn', this.hdsOn);
+      const nm = await p.get('netMode', '') as string;
       this.forceWan = fw === '1';
       // 老用户只有 forceWan，没有 autoLan：用它推出默认值
       this.autoLan = al === '' ? (fw !== '1') : al === '1';
+      this.netMode = nm !== '' ? nm : (this.forceWan ? 'wan' : (this.autoLan ? 'auto' : 'wan'));
       // 旧版本把局域网地址写进了 base（配对时电脑报回来的就是它），
       // 人离开家就再也连不上：这里把它降级成局域网候选，公网地址回退到默认隧道。
       let lanSaved: string = lan;
@@ -222,7 +255,12 @@ struct Index {
       const cur = Machines.active();
       if (cur !== null) {
         b = cur.wan;
-        t0FromMachine = cur.token;
+        t0FromMachine = Secret.loadFor(cur.id);
+        // 旧版全局令牌只用于「就是这台电脑」的迁移：地址不一致时宁可不带令牌，
+        // 也不能把 A 机的令牌配到 B 机的地址上。
+        if (t0FromMachine === '' && (t === '' || b === tOldBase)) {
+          t0FromMachine = t;
+        }
         lanSaved = cur.lan.length > 0 ? cur.lan[0] : '';
         console.info('DSH_MACH restore ' + cur.name + ' ' + cur.wan);
       } else if (b !== '' && t !== '') {
@@ -235,8 +273,7 @@ struct Index {
         this.wanBase = b;
         this.token = t;
         this.api.rebase(b, t, lanSaved, cur !== null ? cur.lan : (lanSaved !== '' ? [lanSaved] : []));
-        this.api.setForceWan(this.forceWan);
-        this.api.setAutoLan(this.autoLan);
+        this.applyNetMode();
         this.machineName = Machines.displayName();
         console.info('DSH_CFG loaded base=' + b + ' forceWan=' + this.forceWan + ' autoLan=' + this.autoLan + ' lan=' + (lanSaved !== '' ? lanSaved : '-'));
       }
@@ -292,12 +329,12 @@ struct Index {
     this.api.rebase(wan, t, lanOne, lanAll);
     this.machineName = Machines.upsert(wan, t, lanAll, name, true).name;
     AppStorage.setOrCreate('listDirty', Date.now());
-    this.api.setForceWan(this.forceWan);
-    this.api.setAutoLan(this.autoLan);
+    this.applyNetMode();
     try {
       const p = await preferences.getPreferences(getContext(this), PREF_STORE);
       await p.put('base', wan);
-      await p.put('token', t);
+      // 令牌能进资产库就不在 preferences 留明文；进不去才回退。
+      await p.put('token', Secret.save(t) ? '' : t);
       await p.put('lan', lanOne);
       await p.flush();
       console.info('DSH_CFG saved base=' + wan + ' lan=' + (lanOne !== '' ? lanOne : '-'));
@@ -312,16 +349,30 @@ struct Index {
     if (m === null) {
       return;
     }
+    let mt: string = Secret.loadFor(m.id);
+    if (m.wan === this.wanBase && this.token !== '') {
+      // 点的就是当前这台：内存里的令牌一定是对的，以它为准并顺手补写别名。
+      // （只信资产库会踩到「别名缺失/写失败 -> 空令牌 -> 401」的坑。）
+      mt = this.token;
+      Secret.saveFor(m.id, mt);
+    }
+    if (mt === '') {
+      mt = Secret.load();
+    }
+    if (mt === '') {
+      Toast.err('这台电脑的访问令牌丢了，请在连接页重新配对');
+      return;
+    }
     this.wanBase = m.wan;
-    this.token = m.token;
+    this.token = mt;
     this.machineName = m.name;
     this.api.rebase(m.wan, m.token, m.lan.length > 0 ? m.lan[0] : '', m.lan);
-    this.api.setForceWan(this.forceWan);
-    this.api.setAutoLan(this.autoLan);
+    this.applyNetMode();
     try {
       const p = await preferences.getPreferences(getContext(this), PREF_STORE);
       await p.put('base', m.wan);
-      await p.put('token', m.token);
+      const mt2: string = Secret.loadFor(m.id);
+      await p.put('token', mt2 !== '' ? '' : (m.token !== '' ? m.token : ''));
       await p.put('lan', m.lan.length > 0 ? m.lan[0] : '');
       await p.flush();
     } catch (e) {
@@ -342,44 +393,37 @@ struct Index {
     }
   }
 
-  private async saveAutoLan(v: boolean): Promise<void> {
-    this.autoLan = v;
-    this.api.setAutoLan(v);
-    // 关掉自动切换就等于强制走隧道；重新打开时要把这个状态清掉，否则还是只走隧道
-    if (!v) {
-      this.forceWan = true;
-      this.api.setForceWan(true);
-    } else {
-      this.forceWan = false;
-      this.api.setForceWan(false);
-    }
-    console.info('DSH_CFG autoLan=' + v);
-    try {
-      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
-      await p.put('autoLan', v ? '1' : '0');
-      await p.put('forceWan', v ? '0' : '1');
-      await p.flush();
-    } catch (e) {
-      console.error('DSH_CFG autoLan save failed :: ' + (e as Error).message);
-    }
+  /** 把 netMode 同步到 Api 与兼容字段；三处入口（读配置、保存、切电脑）都走它。 */
+  private applyNetMode(): void {
+    this.forceWan = this.netMode === 'wan';
+    this.autoLan = this.netMode !== 'wan';
+    this.api.setForceWan(this.forceWan);
+    this.api.setAutoLan(this.autoLan);
+    this.api.setLanOnly(this.netMode === 'lan');
   }
 
-  private async saveWan(v: boolean): Promise<void> {
-    this.forceWan = v;
-    this.api.setForceWan(v);
-    console.info('DSH_CFG forceWan=' + v);
+  private async saveNetMode(mode: string): Promise<void> {
+    this.netMode = mode;
+    this.applyNetMode();
+    console.info('DSH_CFG netMode=' + mode);
     try {
       const p = await preferences.getPreferences(getContext(this), PREF_STORE);
-      await p.put('forceWan', v ? '1' : '0');
+      await p.put('netMode', mode);
+      // 旧字段继续写，回退旧版本时不至于丢策略；wan 之外的档位都算「自动」。
+      await p.put('forceWan', this.netMode === 'wan' ? '1' : '0');
+      await p.put('autoLan', this.netMode === 'auto' ? '1' : '0');
       await p.flush();
     } catch (e) {
-      console.error('DSH_CFG forceWan save failed :: ' + (e as Error).message);
+      console.error('DSH_CFG netMode save failed :: ' + (e as Error).message);
     }
   }
 
   private async saveTheme(mode: string): Promise<void> {
     this.themeMode = mode;
     this.applyThemeNow();
+    // 换主题会重建 ShellPage：先把二级页收回栈底，否则 settingsSub 残留会让底栏消失。
+    AppStorage.setOrCreate('settingsBack', Date.now());
+    AppStorage.setOrCreate('settingsSub', '');
     this.rebuildNav();
     try {
       const p = await preferences.getPreferences(getContext(this), PREF_STORE);
@@ -458,76 +502,6 @@ struct Index {
     }
   }
 
-  /** 转场两端：普通页面用 navDestinationId，首页（index -1）用固定键。 */
-  private fxIdOf(info: NavContentInfo): string {
-    const id: string | undefined = info.navDestinationId;
-    if (id !== undefined && id !== '') {
-      return id;
-    }
-    return info.index === -1 ? NavFx.HOME : '';
-  }
-
-  /**
-   * 自制 push/pop 转场：新页从右侧整屏滑入，旧页同时左移并压暗一点，
-   * 形成前后层叠的深度；返回时反向播。系统默认转场在两端同步淡入，
-   * 观感上像「翻页」，这里是「推进」。
-   */
-  private navTransition(from: NavContentInfo, to: NavContentInfo,
-      operation: NavigationOperation): NavigationAnimatedTransition | undefined {
-    if (operation === NavigationOperation.REPLACE) {
-      return undefined;
-    }
-    if (from.mode === NavDestinationMode.DIALOG || to.mode === NavDestinationMode.DIALOG) {
-      return undefined;
-    }
-    const fromId: string = this.fxIdOf(from);
-    const toId: string = this.fxIdOf(to);
-    // 有一端没注册（例如宿主自己压进来的页面、onReady 还没跑回来）就退回系统默认，
-    // 避免只动一半：新页正常滑入却被当成「已就位」，或旧页移开后没人复位
-    if (fromId === '' || toId === '' || !NavFx.has(fromId) || !NavFx.has(toId)) {
-      return undefined;
-    }
-    const isPush: boolean = operation === NavigationOperation.PUSH;
-    const anim: NavigationAnimatedTransition = {
-      timeout: 1000,
-      transition: (proxy: NavigationTransitionProxy) => {
-        const tag: string = isPush ? 'push' : 'pop';
-        console.info('DSH_NAV start ' + tag + ' from=' + fromId + ' to=' + toId);
-        if (isPush) {
-          NavFx.apply(fromId, '0%', 1, 1);
-          NavFx.apply(toId, '100%', 1, 1);
-        } else {
-          NavFx.apply(fromId, '0%', 1, 1);
-          NavFx.apply(toId, '-8%', 0.82, 0.992);
-        }
-        let finished: boolean = false;
-        const done = (): void => {
-          if (finished) {
-            return;
-          }
-          finished = true;
-          console.info('DSH_NAV finish ' + tag);
-          proxy.finishTransition();
-        };
-        this.getUIContext().animateTo({
-          duration: isPush ? 420 : 380,
-          // 鸿蒙原生的观感是「先快后慢、末尾轻轻收住」，比线性更容易读
-          curve: curves.cubicBezierCurve(0.2, 0.72, 0.32, 1),
-          onFinish: done
-        }, () => {
-          if (isPush) {
-            NavFx.apply(fromId, '-8%', 0.82, 0.992);
-            NavFx.apply(toId, '0%', 1, 1);
-          } else {
-            NavFx.apply(fromId, '100%', 1, 1);
-            NavFx.apply(toId, '0%', 1, 1);
-          }
-        });
-      }
-    };
-    return anim;
-  }
-
   @Builder
   pageMap(name: string, param: ChatParam) {
     if (name === 'chat') {
@@ -551,7 +525,8 @@ struct Index {
             themeMode: this.themeMode,
             systemDark: this.systemDark(),
             forceWan: this.forceWan,
-          autoLan: this.autoLan,
+            autoLan: this.autoLan,
+            netMode: this.netMode,
             haptics: this.haptics,
             defaultLan: LAN_BASE,
             onReset: () => {
@@ -577,10 +552,13 @@ struct Index {
               this.saveTheme(m);
             },
             onAutoLan: (v: boolean) => {
-            this.saveAutoLan(v);
+            this.saveNetMode(v ? 'auto' : 'wan');
           },
+            onNetMode: (m: string) => {
+              this.saveNetMode(m);
+            },
           onWan: (v: boolean) => {
-              this.saveWan(v);
+              this.saveNetMode(v ? 'wan' : 'auto');
             },
             onHaptics: (v: boolean) => {
               this.saveHaptics(v);
@@ -615,7 +593,7 @@ struct Index {
     .mode(NavigationMode.Stack)
     .hideTitleBar(true)
     .hideToolBar(true)
-    .backgroundColor(this.themeMode === '' ? Tokens.bg : Tokens.bg)
+    .backgroundColor(Tokens.bg)
     .width('100%')
     .height('100%')
 

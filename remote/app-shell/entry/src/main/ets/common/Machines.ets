@@ -1,5 +1,6 @@
 import preferences from '@ohos.data.preferences';
 import { common } from '@kit.AbilityKit';
+import { Secret } from './Secret';
 
 /**
  * 一台已经配对过的电脑。
@@ -72,6 +73,20 @@ function load(): void {
       const f: MachineFile = JSON.parse(raw) as MachineFile;
       rows = f.rows !== undefined && f.rows !== null ? f.rows : [];
       activeId = f.active !== undefined && f.active !== null ? f.active : '';
+      // 旧版本把每台电脑的令牌明文写在这里：迁进 Asset Store，然后把明文清掉。
+      let migrated: boolean = false;
+      for (let i = 0; i < rows.length; i++) {
+        if (rows[i].token !== undefined && rows[i].token !== '') {
+          // 只有确认写进资产库才清明文；写失败宁可留着旧值，也不能让用户丢令牌。
+          if (Secret.saveFor(rows[i].id, rows[i].token)) {
+            rows[i].token = '';
+            migrated = true;
+          }
+        }
+      }
+      if (migrated) {
+        flush();
+      }
     }
   } catch (e) {
     console.error('DSH_MACH parse fail ' + JSON.stringify(e));
@@ -119,6 +134,7 @@ export class Machines {
     load();
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].id === activeId) {
+        // 不把令牌填回行对象：flush() 会序列化整份 rows，填回去等于又把明文写盘。
         return rows[i];
       }
     }
@@ -149,19 +165,21 @@ export class Machines {
     const now: number = Date.now();
     if (found !== null) {
       found.wan = wan;
-      found.token = token;
+      // 写资产库；失败才把明文留在这一行里兜底（下次启动会再尝试迁移）。
+      found.token = Secret.saveFor(id, token) ? '' : token;
       found.lan = lan;
       found.at = now;
       if (name !== '') {
         found.name = name;
       }
     } else {
+      const stored: string = Secret.saveFor(id, token) ? '' : token;
       const m: Machine = {
         id: id,
         name: name !== '' ? name : id,
         wan: wan,
         lan: lan,
-        token: token,
+        token: stored,
         at: now
       };
       rows.push(m);
@@ -206,6 +224,7 @@ export class Machines {
       }
     }
     rows = keep;
+    Secret.removeFor(id);
     if (activeId === id) {
       activeId = rows.length > 0 ? rows[0].id : '';
     }

@@ -5,7 +5,6 @@ import { Api } from '../common/Api';
 import { Mat } from '../common/Mat';
 import { Tokens } from '../common/Tokens';
 import { Haptics } from '../common/Haptics';
-import { NavFx, NavFxSink } from '../common/NavFx';
 import { Notifier } from '../common/Notifier';
 import { Marks } from '../common/Marks';
 import { SessionList } from './SessionList';
@@ -18,13 +17,14 @@ import { SettingsPage } from './SettingsPage';
 @Component
 export struct ShellPage {
   api: Api = new Api('', '');
-  wanBase: string = '';
-  token0: string = '';
+  @Prop wanBase: string = '';
+  @Prop token0: string = '';
   themeMode: string = 'auto';
   systemDark: boolean = true;
   @Prop forceWan: boolean = false;
   /** 设置 → 连接：「自动切换局域网」，默认开（@Prop：等 loadCfg 读到存储值后要能刷新） */
   @Prop autoLan: boolean = true;
+  @Prop netMode: string = 'auto';
   haptics: boolean = true;
   @StorageLink('hdsOn') hdsOn: boolean = true;
   defaultLan: string = '';
@@ -39,6 +39,7 @@ export struct ShellPage {
   onTheme: (m: string) => void = () => {};
   onWan: (v: boolean) => void = () => {};
   onAutoLan: (v: boolean) => void = () => {};
+  onNetMode: (m: string) => void = () => {};
   onHaptics: (v: boolean) => void = () => {};
   onHds: (v: boolean) => void = () => {};
   @State private idx: number = 0;
@@ -52,11 +53,6 @@ export struct ShellPage {
   @StorageLink('settingsSub') settingsSub: string = '';
   private tc: HdsTabsController = new HdsTabsController();
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
-  /** 转场状态：首页没有 navDestinationId，用 NavFx.HOME 注册给 Navigation 驱动。 */
-  @State private fxTx: string = '0%';
-  @State private fxOp: number = 1;
-  @State private fxSc: number = 1;
-  private fxSink: NavFxSink | undefined = undefined;
   /** 通知巡检：会话 id → 上次看到的 updatedAt；同一会话的通知冷却时间 */
   private lastSeen: Map<string, number> = new Map<string, number>();
   private lastNote: Map<string, number> = new Map<string, number>();
@@ -75,15 +71,18 @@ export struct ShellPage {
   private tickN: number = 0;
 
   aboutToAppear(): void {
-    const sink: NavFxSink = {
-      apply: (tx: string, op: number, sc: number): void => {
-        this.fxTx = tx;
-        this.fxOp = op;
-        this.fxSc = sc;
-      }
-    };
-    this.fxSink = sink;
-    NavFx.register(NavFx.HOME, sink);
+    // 换主题会重建本组件：把用户原来所在的 tab 找回来，别把他送回会话列表。
+    const saved: number | undefined = AppStorage.get<number>('shellTab');
+    if (saved !== undefined && saved > 0) {
+      this.idx = saved;
+      setTimeout(() => {
+        try {
+          this.tc.changeIndex(saved);
+        } catch (e) {
+          console.info('DSH_TAB restore skipped: ' + JSON.stringify(e));
+        }
+      }, 0);
+    }
     // 先探一次沉浸光感材质能力，日志里能直接看出设备支不支持、算力档位是多少
     try {
       const sup: boolean = uiMaterial.isImmersiveMaterialSupported();
@@ -97,6 +96,10 @@ export struct ShellPage {
     Notifier.ensure();
     this.scanSessions(true);
     this.watchTimer = setInterval(() => {
+      // 后台不巡检：任务完成通知本身要靠前台扫描，退后台后交给系统通知，回来时 onForegroundProbe 会补扫。
+      if (AppStorage.get<boolean>('appFg') === false) {
+        return;
+      }
       this.tickN++;
       // 每 4 拍（12 秒）扫一次全表；盯着的那几个每拍都问，几秒的小任务也能抓到
       if (this.tickN % 4 === 0) {
@@ -214,6 +217,16 @@ export struct ShellPage {
 
   /** 同一会话 6 秒内只发一条：扫描与盯梢两条路可能同时命中同一次完成。 */
   private notifyDone(id: string, title: string): void {
+    // 应用内开关：总开关关掉就完全不发；「仅后台」在前台时不打扰。
+    const on: boolean | undefined = AppStorage.get<boolean>('notifyDone');
+    if (on === false) {
+      return;
+    }
+    const bgOnly: boolean | undefined = AppStorage.get<boolean>('notifyBgOnly');
+    const fg: boolean | undefined = AppStorage.get<boolean>('appFg');
+    if ((bgOnly === undefined || bgOnly) && fg === true) {
+      return;
+    }
     const now: number = Date.now();
     let noted: number = 0;
     const n = this.lastNote.get(id);
@@ -244,10 +257,6 @@ export struct ShellPage {
     if (this.watchTimer !== 0) {
       clearInterval(this.watchTimer);
       this.watchTimer = 0;
-    }
-    const s = this.fxSink;
-    if (s !== undefined) {
-      NavFx.unregister(NavFx.HOME, s);
     }
   }
 
@@ -392,6 +401,7 @@ export struct ShellPage {
             systemDark: this.systemDark,
             forceWan: this.forceWan,
             autoLan: this.autoLan,
+            netMode: this.netMode,
             haptics: this.haptics,
             hdsOn: this.hdsOn,
             defaultLan: this.defaultLan,
@@ -423,6 +433,9 @@ export struct ShellPage {
             onAutoLan: (v: boolean) => {
               this.onAutoLan(v);
             },
+            onNetMode: (m: string) => {
+              this.onNetMode(m);
+            },
             onHaptics: (v: boolean) => {
               this.onHaptics(v);
             },
@@ -449,8 +462,15 @@ export struct ShellPage {
       // 浮岛本身不画分隔线，HdsTabs 的 divider 交给默认值
       .onChange((i: number) => {
         this.idx = i;
-        // 切走设置页时把二级页状态清掉，否则按返回键会被隐藏的设置页吞掉
+        AppStorage.setOrCreate('shellTab', i);
+        // 回到会话 tab 时补一次刷新：后台时列表的 8 秒轮询被跳过了，不补会看到旧状态。
+        if (i === 0) {
+          AppStorage.setOrCreate('listDirty', Date.now());
+        }
+        // 切走设置页时把二级页收回栈底，否则按返回键会被隐藏的设置页吞掉，
+        // 底栏也会一直因为 settingsSub 非空而不显示。
         if (i !== 1) {
+          AppStorage.setOrCreate('settingsBack', Date.now());
           AppStorage.setOrCreate('settingsSub', '');
         }
       })
@@ -461,8 +481,5 @@ export struct ShellPage {
     .width('100%')
     .height('100%')
     .backgroundColor(this.themeBg)
-    .translate({ x: this.fxTx })
-    .opacity(this.fxOp)
-    .scale({ x: this.fxSc, y: this.fxSc })
   }
 }

@@ -29,12 +29,14 @@
  * @module @deepseek-ai/dsh-mobile
  */
 
-import { randomBytes, randomInt, timingSafeEqual } from 'node:crypto'
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto'
+import { chmodSync, closeSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { send, readJson, tokenMatches, presentedToken, lanAddresses } from './http-util'
+import { createPanel } from './panel'
 import { networkInterfaces, homedir, hostname } from 'node:os'
-import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
+import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as zlib from 'node:zlib'
 
@@ -89,13 +91,13 @@ function freshPairCode(): string {
 
 /** The deep link a QR code carries: base URL plus the live code. */
 function pairPayload(base: string, code: string, alts: readonly string[] = []): string {
-  // 最后一个位置留给公网隧道：网卡再多，手机也总还有一条能走的路。
+  // 公网隧道排在第一个备选：离开 Wi-Fi 时手机不必先等几个网卡各自超时。
   const list = alts.filter((one) => one.length > 0 && one !== base)
-  const tunnel = list.length > 0 && /^https:\/\//i.test(list[list.length - 1] as string)
-  const head = tunnel ? list.slice(0, -1) : list
-  const kept = head.slice(0, tunnel ? 3 : 4)
-  const tail = tunnel ? [list[list.length - 1] as string] : []
-  const extra = [...kept, ...tail]
+  const tunnel = list.find((one) => /^https:\/\//i.test(one)) ?? ''
+  const rest = list.filter((one) => one !== tunnel)
+  const kept = rest.slice(0, tunnel !== '' ? 3 : 4)
+  const ordered = tunnel !== '' ? [tunnel, ...kept] : kept
+  const extra = ordered
     .map((one) => `&a=${encodeURIComponent(one)}`)
     .join('')
   return `dshmobile://pair?b=${encodeURIComponent(base)}&c=${encodeURIComponent(code)}${extra}`
@@ -672,6 +674,7 @@ function projectSessions(payload: unknown, liveAsking?: ReadonlySet<string>): Se
       // 手机接管中的提问不在宿主投影里，只按投影算会让等待答题的会话仍然是绿的。
       asking: (liveAsking?.has(id) ?? false) || asksOf(projectedValues).active.length > 0,
       archived: false,
+      pinned: projectedValues?.pinned === true,
       tokens: tokensOf(projectedValues),
       context: contextOf(projectedValues),
       model: modelOf(projectedValues),
@@ -1218,24 +1221,6 @@ function accumulateTokens(total: TokenUsage, data: unknown): void {
 }
 
 /** Every non-internal IPv4 address plus global IPv6, so the operator can see the phone URL. */
-function lanAddresses(): string[] {
-  const out: string[] = []
-  const nets = networkInterfaces()
-  for (const entries of Object.values(nets)) {
-    if (entries === undefined) continue
-    for (const entry of entries) {
-      if (entry.internal) continue
-      const v4 = entry.family === 'IPv4' || entry.family === 4
-      const v6 = entry.family === 'IPv6' || entry.family === 6
-      if (v4) {
-        out.push(entry.address)
-        continue
-      }
-      if (v6 && !entry.address.startsWith('fe80')) out.push(entry.address)
-    }
-  }
-  return out
-}
 
 /** Render a host:port pair with the brackets an IPv6 literal needs in a URL. */
 function hostPort(address: string, port: number): string {
@@ -1287,13 +1272,6 @@ function lanRank(address: string): number {
 }
 
 /** Constant-time comparison that tolerates a length mismatch. */
-function tokenMatches(given: string, expected: string): boolean {
-  if (given.length === 0 || expected.length === 0) return false
-  const a = Buffer.from(given, 'utf8')
-  const b = Buffer.from(expected, 'utf8')
-  if (a.length !== b.length) return false
-  return timingSafeEqual(a, b)
-}
 
 /**
  * Files picked on the phone do not exist on this machine, so /outbox writes them
@@ -1328,31 +1306,8 @@ async function saveMobileFiles(raw: unknown[]): Promise<{ saved: Record<string, 
 }
 
 /** Pull the caller's token out of the Authorization header or `?t=`. */
-function presentedToken(req: IncomingMessage, url: URL): string {
-  const header = req.headers.authorization
-  if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) {
-    return header.slice(7).trim()
-  }
-  const query = url.searchParams.get('t')
-  return query === null ? '' : query.trim()
-}
 
 /** Read and JSON-parse a bounded request body. */
-async function readJson(req: IncomingMessage, limit: number = MAX_BODY_BYTES): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string)
-    size += buf.length
-    if (size > limit) throw new Error('body too large')
-    chunks.push(buf)
-  }
-  if (size === 0) return {}
-  const text = Buffer.concat(chunks).toString('utf8')
-  const parsed: unknown = JSON.parse(text)
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('body must be a JSON object')
-  return parsed as Record<string, unknown>
-}
 
 /**
  * Internals exposed for out-of-process verification of the pure parts
@@ -1372,6 +1327,22 @@ export function apply(ctx: any, rawConfig?: Config): void {
   const host = rawConfig?.host ?? '::'
   const logFile = rawConfig?.logFile ?? join(dshHome(), 'dsh-mobile.log')
   const token = enabled ? resolveToken(rawConfig?.token) : ''
+
+  /**
+   * 5 分钟短签名：图片直链不再带长期令牌，只带 exp 与 HMAC。
+   * 签名覆盖「用途 + 对象 + 过期时间」，换用途或改对象都验不过。
+   */
+  const SIG_TTL_SEC = 300
+  const sigOf = (kind: string, value: string, exp: string): string =>
+    createHmac('sha256', token).update(`${kind}\n${value}\n${exp}`).digest('hex')
+  const signedOk = (kind: string, value: string, url: URL): boolean => {
+    const exp = url.searchParams.get('e') ?? ''
+    const sig = (url.searchParams.get('sig') ?? '').toLowerCase()
+    if (exp === '' || sig === '') return false
+    const expN = Number(exp)
+    if (!Number.isFinite(expN) || expN < Math.floor(Date.now() / 1000)) return false
+    return tokenMatches(sigOf(kind, value, exp), sig)
+  }
 
   if (!enabled) return
 
@@ -1555,9 +1526,11 @@ export function apply(ctx: any, rawConfig?: Config): void {
     const lan = lanBases()
     const primary = prefs.allowLan && lan.length > 0 ? (lan[0] as string) : prefs.publicUrl
     // 手机连不上首个地址时的退路：其它网卡 + 公网隧道。顺序就是尝试顺序。
-    const alts = [...lan.slice(1), prefs.allowRemote ? prefs.publicUrl : ''].filter(
-      (one) => one.length > 0 && one !== primary,
-    )
+    const tunnelUrl = prefs.allowRemote ? prefs.publicUrl : ''
+    const restLan = lan.slice(1).filter((one) => one !== primary)
+    const v4rest = restLan.filter((one) => !one.includes('['))
+    const v6rest = restLan.filter((one) => one.includes('['))
+    const alts = [tunnelUrl, ...v4rest, ...v6rest].filter((one) => one.length > 0 && one !== primary)
     return {
       ok: true,
       host: hostname(),
@@ -1889,17 +1862,70 @@ export function apply(ctx: any, rawConfig?: Config): void {
     return rows.map((row) => ({ ...row, pinned: lookup.has(row.id) }))
   }
 
-  const send = (res: ServerResponse, status: number, body: unknown): void => {
+
+  /**
+   * 写请求幂等缓存：手机把同一条消息重试两次时，宿主只提交一次。
+   * 只缓存成功响应（2xx），失败不缓存，方便客户端换 key 或人工重试。
+   * 10 分钟、最多 200 条，够覆盖一次弱网重试，不会长期占内存。
+   */
+  const replay = new Map<string, { at: number; status: number; text: string; route: string; hash: string }>()
+  /** 同一个 key 正在处理中：并发重放不能各提交一次。 */
+  /** key → 开始处理的时刻。响应写完（finish）才释放；客户端断开（close）不提前释放。 */
+  const inflight = new Map<string, number>()
+  const inflightBusy = (key: string): boolean => {
+    const at = inflight.get(key)
+    if (at === undefined) return false
+    if (Date.now() - at > 120_000) {
+      inflight.delete(key)
+      return false
+    }
+    return true
+  }
+  const inflightHold = (res: ServerResponse, key: string): void => {
+    inflight.set(key, Date.now())
+    res.on('finish', () => inflight.delete(key))
+  }
+  /** 请求相等性用 sha256 前 32 位，32 位 FNV 太短，不适合承担「同 key 同请求」的判断。 */
+  const hashText = (t: string): string => createHash('sha256').update(t).digest('hex').slice(0, 32)
+  const replayGet = (key: string): { at: number; status: number; text: string; route: string; hash: string } | null => {
+    const hit = replay.get(key)
+    if (hit === undefined) return null
+    if (Date.now() - hit.at > 10 * 60 * 1000) {
+      replay.delete(key)
+      return null
+    }
+    return hit
+  }
+  const replayPut = (key: string, status: number, body: unknown, route: string, hash: string): void => {
+    if (key === '' || status < 200 || status >= 300) return
     const text = typeof body === 'string' ? body : JSON.stringify(body)
-    res.writeHead(status, {
-      'content-type': typeof body === 'string' ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8',
-      'content-length': String(Buffer.byteLength(text)),
-        'access-control-allow-origin': '*',
-      'access-control-allow-headers': 'authorization,content-type',
-      'access-control-allow-methods': 'GET,POST,PATCH,OPTIONS',
+    replay.set(key, { at: Date.now(), status, text, route, hash })
+    while (replay.size > 200) {
+      const first = replay.keys().next().value
+      if (first === undefined) break
+      replay.delete(first)
+    }
+  }
+  /** 命中缓存就直接回放，返回 true 表示这次请求已经处理完。 */
+  const replayHit = (req: IncomingMessage, res: ServerResponse, route: string, hash: string): boolean => {
+    const key = String(req.headers['idempotency-key'] ?? '')
+    if (key === '') return false
+    const hit = replayGet(key)
+    if (hit === null) return false
+    if (hit.route !== route || hit.hash !== hash) {
+      // 同一个 key 换了内容：这是客户端复用错了 key，不能把旧响应冒充成新请求的结果。
+      send(res, 409, { error: 'idempotency key reused with a different request' })
+      return true
+    }
+    res.writeHead(hit.status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': String(Buffer.byteLength(hit.text)),
+      'access-control-allow-origin': '*',
       'cache-control': 'no-store',
+      'x-idempotent-replay': '1',
     })
-    res.end(text)
+    res.end(hit.text)
+    return true
   }
 
   /**
@@ -2051,7 +2077,14 @@ export function apply(ctx: any, rawConfig?: Config): void {
       return
     }
 
-    if (!tokenMatches(presentedToken(req, url), token)) {
+    // 图片直链可以脱离长期令牌：带有效短签名就放行（<Image> 组件加不了请求头）。
+    const attSigned = path.startsWith('/api/attachments/')
+      ? signedOk('att', path.slice('/api/attachments/'.length).toLowerCase(), url)
+      : false
+    const rawMatch = /^\/api\/sessions\/([^/]+)\/fs\/raw$/.exec(path)
+    const rawSigned = rawMatch !== null && method === 'GET' &&
+      signedOk('raw', decodeURIComponent(rawMatch[1]) + '|' + (url.searchParams.get('path') ?? ''), url)
+    if (!attSigned && !rawSigned && !tokenMatches(presentedToken(req, url), token)) {
       await record(logFile, `401 ${method} ${path} from ${req.socket.remoteAddress ?? '?'}`)
       send(res, 401, { error: 'unauthorized', hint: 'send Authorization: Bearer <token>, or ?t=<token>' })
       return
@@ -2194,7 +2227,23 @@ export function apply(ctx: any, rawConfig?: Config): void {
       // Images a message carried. The transcript only carries the digest, so
       // the phone pulls the bytes here and caches them itself. Auth is the same
       // bearer token (or ?t=), because <Image> on the phone cannot set headers.
-      if (path.startsWith('/api/attachments/') && method === 'GET') {
+      if (path === '/api/attachments/sign' && method === 'POST') {
+      const body = await readJson(req)
+      const ids = Array.isArray(body.ids) ? body.ids : []
+      if (ids.length > 64) {
+        send(res, 400, { error: 'at most 64 ids per request' })
+        return
+      }
+      const exp = String(Math.floor(Date.now() / 1000) + SIG_TTL_SEC)
+      const items = ids
+        .map((raw) => String(raw).toLowerCase())
+        .filter((id) => /^[0-9a-f]{8,128}$/.test(id))
+        .map((id) => ({ id, e: exp, sig: sigOf('att', id, exp) }))
+      send(res, 200, { ok: true, items })
+      return
+    }
+
+    if (path.startsWith('/api/attachments/') && method === 'GET') {
         const digest = path.slice('/api/attachments/'.length).toLowerCase()
         if (!/^[0-9a-f]{8,128}$/.test(digest)) {
           send(res, 400, { error: 'bad attachment id' })
@@ -2995,20 +3044,38 @@ export function apply(ctx: any, rawConfig?: Config): void {
 
       const outboxMatch = /^\/api\/sessions\/([^/]+)\/outbox$/.exec(path)
       if (outboxMatch !== null && method === 'POST') {
-        const ctl = controller()
-        if (!ctl || typeof ctl.prompt !== 'function') {
-          send(res, 503, { error: 'sessionController.prompt unavailable' })
+        const outboxSid = decodeURIComponent(outboxMatch[1])
+        const body = await readJson(req, MAX_UPLOAD_BYTES)
+        const route = 'outbox:' + outboxSid
+        const reqHash = hashText(JSON.stringify(body))
+        if (replayHit(req, res, route, reqHash)) {
           return
         }
-        const body = await readJson(req, MAX_UPLOAD_BYTES)
+        const idemKey = String(req.headers['idempotency-key'] ?? '')
+        if (idemKey !== '') {
+          if (inflightBusy(idemKey)) {
+            send(res, 409, { error: 'the same idempotency key is in flight' })
+            return
+          }
+          inflightHold(res, idemKey)
+        }
+        const reply = (status: number, payload: unknown): void => {
+          replayPut(idemKey, status, payload, route, reqHash)
+          send(res, status, payload)
+        }
+        const ctl = controller()
+        if (!ctl || typeof ctl.prompt !== 'function') {
+          reply(503, { error: 'sessionController.prompt unavailable' })
+          return
+        }
         const rawImgs = Array.isArray(body.images) ? body.images : []
         const rawFiles = Array.isArray(body.files) ? body.files : []
         if (rawImgs.length > MAX_IMAGES) {
-          send(res, 400, { error: `at most ${String(MAX_IMAGES)} images per request` })
+          reply(400, { error: `at most ${String(MAX_IMAGES)} images per request` })
           return
         }
         if (rawFiles.length > MAX_FILES) {
-          send(res, 400, { error: `at most ${String(MAX_FILES)} files per request` })
+          reply(400, { error: `at most ${String(MAX_FILES)} files per request` })
           return
         }
         const text = String(body.text ?? '').trim()
@@ -3018,12 +3085,12 @@ export function apply(ctx: any, rawConfig?: Config): void {
           const img = item as Record<string, unknown>
           const mediaType = String(img.mediaType ?? '').toLowerCase()
           if (!IMAGE_TYPES.has(mediaType)) {
-            send(res, 400, { error: `unsupported image type: ${mediaType}`, allowed: [...IMAGE_TYPES] })
+            reply(400, { error: `unsupported image type: ${mediaType}`, allowed: [...IMAGE_TYPES] })
             return
           }
           const data = String(img.data ?? '')
           if (data.length === 0) {
-            send(res, 400, { error: 'image data is empty' })
+            reply(400, { error: 'image data is empty' })
             return
           }
           const part: Record<string, unknown> = { type: 'image', mediaType, data }
@@ -3034,7 +3101,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
         const savedFiles = await saveMobileFiles(rawFiles)
         if (savedFiles.text !== '') content.push({ type: 'text', text: savedFiles.text })
         if (content.length === 0) {
-          send(res, 400, { error: 'nothing to send' })
+          reply(400, { error: 'nothing to send' })
           return
         }
         const sessionId = decodeURIComponent(outboxMatch[1])
@@ -3042,7 +3109,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
         if (mode === 'queue' && running) {
           const itemId = await hostEnqueue(ctl, sessionId, content)
           await record(logFile, `200 POST outbox session=${sessionId} mode=queue host=${itemId} parts=${String(content.length)}`)
-          send(res, 200, {
+          reply(200, {
             ok: true,
             sessionId,
             mode: 'queue',
@@ -3060,21 +3127,39 @@ export function apply(ctx: any, rawConfig?: Config): void {
           ),
         )
         await record(logFile, `200 POST outbox session=${sessionId} mode=${mode} parts=${String(content.length)} known=${String(known)}`)
-        send(res, 200, { ok: true, sessionId, mode, running, parts: content.length, result: result ?? null })
+        reply(200, { ok: true, sessionId, mode, running, parts: content.length, result: result ?? null })
         return
       }
 
       const sendMatch = /^\/api\/sessions\/([^/]+)\/send$/.exec(path)
       if (sendMatch !== null && method === 'POST') {
-        const ctl = controller()
-        if (!ctl || typeof ctl.prompt !== 'function') {
-          send(res, 503, { error: 'sessionController.prompt unavailable', hint: 'is the DSH host fully started?' })
+        const sendSid = decodeURIComponent(sendMatch[1])
+        const body = await readJson(req)
+        const route = 'send:' + sendSid
+        const reqHash = hashText(JSON.stringify(body))
+        if (replayHit(req, res, route, reqHash)) {
           return
         }
-        const body = await readJson(req)
+        const idemKey = String(req.headers['idempotency-key'] ?? '')
+        if (idemKey !== '') {
+          if (inflightBusy(idemKey)) {
+            send(res, 409, { error: 'the same idempotency key is in flight' })
+            return
+          }
+          inflightHold(res, idemKey)
+        }
+        const reply = (status: number, payload: unknown): void => {
+          replayPut(idemKey, status, payload, route, reqHash)
+          send(res, status, payload)
+        }
+        const ctl = controller()
+        if (!ctl || typeof ctl.prompt !== 'function') {
+          reply(503, { error: 'sessionController.prompt unavailable', hint: 'is the DSH host fully started?' })
+          return
+        }
         const text = String(body.text ?? '').trim()
         if (text.length === 0) {
-          send(res, 400, { error: 'text is empty' })
+          reply(400, { error: 'text is empty' })
           return
         }
         const requested = body.mode === 'steer' ? 'steer' : 'queue'
@@ -3093,7 +3178,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
           // sessionController.updateQueue。
           const itemId = await hostEnqueue(ctl, sessionId, [{ type: 'text', text }])
           await record(logFile, `200 POST send session=${sessionId} mode=queue host=${itemId}`)
-          send(res, 200, {
+          reply(200, {
             ok: true,
             sessionId,
             mode: 'queue',
@@ -3119,7 +3204,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
           logFile,
           `200 POST send session=${sessionId} mode=${effective} busy=${running} known=${known} bytes=${String(Buffer.byteLength(text))}`,
         )
-        send(res, 200, { ok: true, sessionId, mode: effective, running, result: result ?? null })
+        reply(200, { ok: true, sessionId, mode: effective, running, result: result ?? null })
         return
       }
 
@@ -3753,6 +3838,47 @@ export function apply(ctx: any, rawConfig?: Config): void {
         }
       }
 
+      /**
+       * 写操作专用校验：在 underRoot 之上再收紧三件事。
+       * 1) 会话必须有真实工作目录，不能落到进程 cwd 的兜底；
+       * 2) 目标父目录必须真实存在且解析后仍在根内（挡 symlink/junction 越界）；
+       * 3) 目标本身如果是链接，一律拒绝，避免「操作的是链接还是链接指向」两可。
+       * mustExist=false 用于重命名的目标：它还不存在，只校验父目录。
+       */
+      const writeTarget = (root: string, rel: string, mustExist: boolean): string | null => {
+        if (rel === '') return null
+        const base = resolve(root)
+        const lexical = resolve(base, rel)
+        if (lexical === base || !lexical.startsWith(base + sep)) return null
+        let realBase = ''
+        let realParent = ''
+        try {
+          realBase = realpathSync(base)
+          realParent = realpathSync(dirname(lexical))
+        } catch {
+          return null
+        }
+        if (!(realParent === realBase || realParent.startsWith(realBase + sep))) return null
+        const joined = join(realParent, basename(lexical))
+        if (!mustExist) {
+          // 目标可以不存在，但如果是悬空的符号链接也不能写：那等于借链接写到别处。
+          try {
+            const st = lstatSync(joined)
+            if (st.isSymbolicLink()) return null
+          } catch {
+            // 不存在：正常
+          }
+          return joined
+        }
+        try {
+          const st = lstatSync(joined)
+          if (st.isSymbolicLink()) return null
+          return joined
+        } catch {
+          return null
+        }
+      }
+
       const fsMatch = /^\/api\/sessions\/([^/]+)\/fs$/.exec(path)
       if (fsMatch !== null && method === 'GET') {
         const sid = decodeURIComponent(fsMatch[1])
@@ -3827,6 +3953,86 @@ export function apply(ctx: any, rawConfig?: Config): void {
         return
       }
 
+      // 工作区写操作：重命名 / 删除。路径照样走 underRoot，越界一律 400。
+      const fsRenameMatch = /^\/api\/sessions\/([^/]+)\/fs\/rename$/.exec(path)
+      if (fsRenameMatch !== null && method === 'POST') {
+        const sid = decodeURIComponent(fsRenameMatch[1])
+        const picked = await rootOf(sid)
+        const root = picked.root
+        if (root === '' || picked.fallback) {
+          send(res, 400, { error: 'session has no working directory' })
+          return
+        }
+        const body = await readJson(req)
+        const rel = String(body.path ?? '')
+        const to = String(body.to ?? '')
+        const from = writeTarget(root, rel, true)
+        const dest = writeTarget(root, to, false)
+        if (from === null || dest === null || from === dest) {
+          send(res, 400, { error: 'bad path' })
+          return
+        }
+        if (existsSync(dest)) {
+          send(res, 409, { error: '\u76ee\u6807\u5df2\u5b58\u5728' })
+          return
+        }
+        try {
+          renameSync(from, dest)
+          await record(logFile, `200 POST fs/rename session=${sid} from=${rel} to=${to}`)
+          send(res, 200, { ok: true })
+        } catch (err) {
+          send(res, 400, { error: `cannot rename: ${err instanceof Error ? err.message : String(err)}` })
+        }
+        return
+      }
+
+      const fsDeleteMatch = /^\/api\/sessions\/([^/]+)\/fs\/delete$/.exec(path)
+      if (fsDeleteMatch !== null && method === 'POST') {
+        const sid = decodeURIComponent(fsDeleteMatch[1])
+        const picked = await rootOf(sid)
+        const root = picked.root
+        if (root === '' || picked.fallback) {
+          send(res, 400, { error: 'session has no working directory' })
+          return
+        }
+        const body = await readJson(req)
+        const rel = String(body.path ?? '')
+        const target = writeTarget(root, rel, true)
+        if (target === null) {
+          send(res, 400, { error: 'bad path' })
+          return
+        }
+        try {
+          const st = statSync(target)
+          if (st.isDirectory()) {
+            // 目录只删空的：递归删除一旦误点代价太大，宁可在电脑上删。
+            rmdirSync(target)
+          } else {
+            unlinkSync(target)
+          }
+          await record(logFile, `200 POST fs/delete session=${sid} path=${rel}`)
+          send(res, 200, { ok: true })
+        } catch (err) {
+          send(res, 400, { error: `cannot delete: ${err instanceof Error ? err.message : String(err)}` })
+        }
+        return
+      }
+
+      // 图片预览用短签名：<Image> 加不了 Authorization 头，又把长期令牌放在 URL 里不安全。
+      const fsSignMatch = /^\/api\/sessions\/([^/]+)\/fs\/sign$/.exec(path)
+      if (fsSignMatch !== null && method === 'POST') {
+        const sid = decodeURIComponent(fsSignMatch[1])
+        const body = await readJson(req)
+        const rel = String(body.path ?? '')
+        if (rel === '') {
+          send(res, 400, { error: 'path is required' })
+          return
+        }
+        const exp = String(Math.floor(Date.now() / 1000) + SIG_TTL_SEC)
+        send(res, 200, { ok: true, e: exp, sig: sigOf('raw', sid + '|' + rel, exp) })
+        return
+      }
+
       const fsRawMatch = /^\/api\/sessions\/([^/]+)\/fs\/raw$/.exec(path)
       if (fsRawMatch !== null && method === 'GET') {
         const sid = decodeURIComponent(fsRawMatch[1])
@@ -3847,15 +4053,35 @@ export function apply(ctx: any, rawConfig?: Config): void {
           send(res, 415, { error: 'not an image' })
           return
         }
-        let body: Buffer
+        // 只流式输出，且给一个明确上限：以前无上限 readFileSync，一个 1GB 的 .png 会直接进堆。
+        const RAW_LIMIT = 16 * 1024 * 1024
+        let size = 0
         try {
-          body = readFileSync(target)
+          const st = statSync(target)
+          if (!st.isFile()) {
+            send(res, 400, { error: 'not a file' })
+            return
+          }
+          if (st.size > RAW_LIMIT) {
+            send(res, 413, { error: `image is too large (${st.size} bytes)` })
+            return
+          }
+          size = st.size
         } catch (err) {
           send(res, 404, { error: `cannot read image: ${err instanceof Error ? err.message : String(err)}` })
           return
         }
-        res.writeHead(200, { 'content-type': type, 'content-length': String(body.length), 'cache-control': 'private, max-age=60' })
-        res.end(body)
+        res.writeHead(200, { 'content-type': type, 'content-length': String(size), 'cache-control': 'private, max-age=60' })
+        const imgStream = createReadStream(target)
+        imgStream.on('error', (err) => {
+          // 头已经发出去了，没法再回 500：直接断掉，让客户端看到失败而不是半个文件。
+          console.error(`fs/raw stream failed: ${err instanceof Error ? err.message : String(err)}`)
+          res.destroy()
+        })
+        res.on('close', () => {
+          imgStream.destroy()
+        })
+        imgStream.pipe(res)
         return
       }
 
@@ -3870,7 +4096,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
           return
         }
         const LIMIT = 64 * 1024 * 1024
-        let body: Buffer
+        let size = 0
         try {
           const st = statSync(target)
           if (!st.isFile()) {
@@ -3881,20 +4107,28 @@ export function apply(ctx: any, rawConfig?: Config): void {
             send(res, 413, { error: `file is too large to download (${st.size} bytes)` })
             return
           }
-          body = readFileSync(target)
+          size = st.size
         } catch (err) {
           send(res, 404, { error: `cannot read file: ${err instanceof Error ? err.message : String(err)}` })
           return
         }
         const name = String(rel).split(/[\\/]/).pop() ?? rel
-        await record(logFile, `200 GET fs/download session=${sid} path=${rel} n=${body.length}`)
+        await record(logFile, `200 GET fs/download session=${sid} path=${rel} n=${size}`)
         res.writeHead(200, {
           'content-type': 'application/octet-stream',
-          'content-length': String(body.length),
+          'content-length': String(size),
           'content-disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(name),
           'cache-control': 'private, max-age=0',
         })
-        res.end(body)
+        const dlStream = createReadStream(target)
+        dlStream.on('error', (err) => {
+          console.error(`fs/download stream failed: ${err instanceof Error ? err.message : String(err)}`)
+          res.destroy()
+        })
+        res.on('close', () => {
+          dlStream.destroy()
+        })
+        dlStream.pipe(res)
         return
       }
 
@@ -3912,12 +4146,12 @@ export function apply(ctx: any, rawConfig?: Config): void {
       } | null
       if (goalSvc === null) {
         send(res, 503, { error: 'goals are unavailable on this host' })
-        return true
+        return
       }
       const agent = (service('agents') as unknown as { get(id: string): unknown } | null)?.get(sid)
       if (agent === undefined || agent === null) {
         send(res, 503, { error: '\u8fd9\u4e2a\u4f1a\u8bdd\u5728\u7535\u8111\u4e0a\u6ca1\u6709\u6253\u5f00\uff1a\u5148\u5728\u7535\u8111\u70b9\u5f00\u5b83\u4e00\u6b21\uff0c\u518d\u56de\u6765\u770b\u76ee\u6807\u3002' })
-        return true
+        return
       }
       const viewOf = (v: unknown): Record<string, unknown> | null => {
         if (v === undefined || v === null || typeof v !== 'object') {
@@ -3932,7 +4166,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
         } catch (ex) {
           send(res, 500, { error: String(ex) })
         }
-        return true
+        return
       }
       const body = await readJson(req)
       const action = typeof body.action === 'string' ? body.action : ''
@@ -3941,11 +4175,11 @@ export function apply(ctx: any, rawConfig?: Config): void {
         current = viewOf(goalSvc.get(agent))
       } catch (ex) {
         send(res, 500, { error: String(ex) })
-        return true
+        return
       }
       if (current === null) {
         send(res, 404, { error: '\u8fd9\u4e2a\u4f1a\u8bdd\u73b0\u5728\u6ca1\u6709\u76ee\u6807' })
-        return true
+        return
       }
       const ref = { id: current.id, revision: current.revision }
       try {
@@ -3968,7 +4202,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
           goalSvc.edit(agent, ref, patch)
         } else {
           send(res, 400, { error: 'action must be pause, resume, complete, clear or edit' })
-          return true
+          return
         }
         const after = action === 'clear' ? null : viewOf(goalSvc.get(agent))
         send(res, 200, { ok: true, sessionId: sid, action, goal: after })
@@ -3976,7 +4210,7 @@ export function apply(ctx: any, rawConfig?: Config): void {
         const err = ex as { code?: string; message?: string }
         send(res, 409, { error: err.message ?? String(ex), code: err.code ?? '' })
       }
-      return true
+      return
     }
 
     send(res, 404, { error: 'not found', path })
@@ -3985,7 +4219,12 @@ export function apply(ctx: any, rawConfig?: Config): void {
       await record(logFile, `500 ${method} ${path} ${message}`)
       send(res, 500, { error: message })
     } finally {
-      const q = url.search.slice(0, 40)
+      // 访问日志里绝不能出现有效令牌：图片/下载用 ?t=<token>，原文会整段落盘。
+      const qp: string[] = []
+      url.searchParams.forEach((v: string, k: string) => {
+        qp.push(k + '=' + ((k === 't' || k === 'payload') ? '***' : v))
+      })
+      const q = qp.length === 0 ? '' : '?' + qp.join('&').slice(0, 40)
       void record(logFile, `${String(res.statusCode)} ${method} ${path}${q} ${String(Date.now() - started)}ms`)
     }
   }
@@ -3996,96 +4235,18 @@ export function apply(ctx: any, rawConfig?: Config): void {
    * registered on the host web server instead (DSH's own session auth covers
    * them) and expose the same pairing state.
    */
-  const PANEL_PREFIX = '/api/dsh-mobile/panel'
-
-  /** Render the QR as SVG; a missing `qrcode` degrades to a caption, not a 500. */
-  const qrSvg = async (text: string): Promise<string | null> => {
-    try {
-      const mod: any = await import('qrcode')
-      const code = mod?.default ?? mod
-      const svg: unknown = await code.toString(text, { type: 'svg', margin: 1, width: 240, errorCorrectionLevel: 'M' })
-      return typeof svg === 'string' ? svg : null
-    } catch {
-      return null
-    }
-  }
-
-  /** JSON response for a panel route. */
-  const panelJson = (status: number, payload: unknown): Response =>
-    new Response(JSON.stringify(payload), {
-      status,
-      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
-    })
-
-  /** The snapshot the panel renders, with the QR payload and its SVG data URL. */
-  const panelSnapshot = (): Record<string, unknown> => {
-    const snapshot = pairState()
-    const base = String(snapshot.base ?? '')
-    const alts = Array.isArray(snapshot.alts) ? (snapshot.alts as string[]) : []
-    const payload = base.length > 0 ? pairPayload(base, String(snapshot.code ?? ''), alts) : ''
-    return { ...snapshot, payload }
-  }
-
-  /** Tolerant body reader: a panel POST without JSON is an empty patch. */
-  const panelBody = async (request: Request): Promise<Record<string, unknown>> => {
-    try {
-      const text = await request.text()
-      if (text.length === 0) return {}
-      const parsed: unknown = JSON.parse(text)
-      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : {}
-    } catch {
-      return {}
-    }
-  }
-
-  /** Merge one patch into the pairing preferences and answer with the new state. */
-  const panelConfig = async (request: Request): Promise<Response> => {
-    const body = await panelBody(request)
-    const current = pairPrefs()
-    const next: PairPrefs = {
-      allowLan: typeof body.allowLan === 'boolean' ? body.allowLan : current.allowLan,
-      allowRemote: typeof body.allowRemote === 'boolean' ? body.allowRemote : current.allowRemote,
-      publicUrl: typeof body.publicUrl === 'string' ? body.publicUrl.trim() : current.publicUrl,
-    }
-    writeState({ pair: next })
-    await record(logFile, `200 PANEL config lan=${String(next.allowLan)} remote=${String(next.allowRemote)}`)
-    return panelJson(200, panelSnapshot())
-  }
-
-  /** The QR itself, as an SVG the panel renders in an <img>. */
-  const panelQr = async (request: Request): Promise<Response> => {
-    const url = new URL(request.url)
-    const asked = url.searchParams.get('payload')
-    const snapshot = pairState()
-    const base = String(snapshot.base ?? '')
-    const alts = Array.isArray(snapshot.alts) ? (snapshot.alts as string[]) : []
-    const text = asked !== null && asked.length > 0
-      ? asked
-      : base.length > 0
-        ? pairPayload(base, String(snapshot.code ?? ''), alts)
-        : ''
-    if (text.length === 0) {
-      return panelJson(409, { error: 'no base url yet', hint: 'turn 局域网直连 on, or set a public url' })
-    }
-    const svg = await qrSvg(text)
-    if (svg === null) {
-      return panelJson(503, { error: 'qrcode module missing', hint: 'install qrcode in the plugin package' })
-    }
-    return new Response(svg, {
-      status: 200,
-      headers: { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'no-store' },
-    })
-  }
-
-  /** The routes the DSH settings panel talks to, all same-origin with the GUI. */
-  const panelRoutes: readonly Record<string, unknown>[] = [
-    { path: `${PANEL_PREFIX}/state`, methods: ['GET'], requestBody: 'buffered', fetch: async () => panelJson(200, panelSnapshot()) },
-    { path: `${PANEL_PREFIX}/newcode`, methods: ['POST'], requestBody: 'buffered', fetch: async () => { rotatePair(); return panelJson(200, panelSnapshot()) } },
-    { path: `${PANEL_PREFIX}/config`, methods: ['POST'], requestBody: 'buffered', fetch: async (request: Request) => panelConfig(request) },
-    { path: `${PANEL_PREFIX}/qr.svg`, methods: ['GET'], requestBody: 'buffered', fetch: async (request: Request) => panelQr(request) },
-  ]
+  const panel = createPanel({
+    pairState: () => pairState(),
+    rotatePair: () => {
+      rotatePair()
+    },
+    writePair: (next) => {
+      writeState({ pair: next })
+    },
+    pairPayload: (base, code, alts) => pairPayload(base, code, alts),
+    record: (line) => record(logFile, line),
+  })
+  const panelRoutes = panel.routes
 
   try {
     ctx.inject(['connection'], (connCtx: any) => {

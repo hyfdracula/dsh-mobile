@@ -1,260 +1,10 @@
 import http from '@ohos.net.http';
+import { classifyError, friendlyError, httpMethodOf, newIdemKey, sleep } from './ApiUtil';
 import { ImagePart } from './Images';
 import { FilePart } from './Files';
 
-/** 会话行（对应 GET /api/sessions 的 sessions[]） */
-export interface SessionRow {
-  id: string;
-  title: string;
-  updatedAt: number;
-  cwd: string;
-  running: boolean;
-  /** 宿主有挂起的提问/审批：会话卡片标黄「等你回答」。 */
-  asking?: boolean;
-  archived?: boolean;
-  pinned?: boolean;
-  agents?: AgentSummary;
-  model?: ModelRef;
-  context?: ContextUsage | null;
-}
-
-export interface TokenUsage {
-  uncachedInputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-}
-
-export interface SessionStats {
-  turns: number;
-  steps: number;
-  toolCalls: number;
-  tokens: TokenUsage;
-}
-
-/** 消息里的一张图片：只带摘要，字节由 /api/attachments 单独取 */
-export interface ImageRef {
-  id: string;
-  mediaType: string;
-  width: number;
-  height: number;
-  name: string;
-}
-
-/** 一轮的结局，挂在那一轮最后一条回复上（宿主 turn/end 的 reason）。 */
-export interface GoalView {
-  id?: string;
-  objective?: string;
-  phase?: string;
-  revision?: number;
-  roundsStarted?: number;
-  maxGoalRounds?: number;
-  activation?: string;
-}
-
-interface GoalResp {
-  ok?: boolean;
-  sessionId?: string;
-  goal?: GoalView | null;
-}
-
-export interface TurnInfo {
-  status: string;
-  ms: number;
-  tokensIn: number;
-  tokensOut: number;
-  atSeq: number;
-  finishedAt?: number;
-}
-
-export interface Message {
-  role: string;
-  text: string;
-  time: number;
-  seq: number;
-  images?: ImageRef[];
-  turn?: TurnInfo;
-}
-
-/** 上下文占用：宿主 token-meter 投影（used 为下一次请求的 prompt 估算，window 为路由容量）。 */
-export interface ContextUsage {
-  used: number;
-  window: number;
-}
-
-/** 电脑端待发送队列里的一条（真正躺在 DSH 宿主里的，不是手机上假排的） */
-export interface QueueTextBody {
-  text: string;
-}
-
-/** 宿主队列里一条消息内的图片（只有元信息，字节走 /queue-image）。 */
-export interface QueueImage {
-  mediaType: string;
-  name?: string;
-}
-
-export interface QueuedItem {
-  id: string;
-  text: string;
-  at: number;
-  index: number;
-  images?: QueueImage[];
-}
-
-export interface AskOption {
-  label: string;
-  description?: string;
-}
-
-export interface AskQuestion {
-  id: string;
-  prompt?: string;
-  header?: string;
-  detail?: string;
-  options?: AskOption[];
-  multiSelect?: boolean;
-}
-
-export interface PendingAsk {
-  callId: string;
-  questions: AskQuestion[];
-  state: string;
-  /** 题卡编号由手机网关合成（宿主这次提问没有带 callId），回答时原样回传即可。 */
-  synthetic?: boolean;
-}
-
-export interface AskAnswer {
-  id: string;
-  selected: string[];
-  custom?: string;
-}
-
-export interface AnswerBody {
-  callId: string;
-  answers: AskAnswer[];
-}
-
-export interface AskState {
-  active: PendingAsk[];
-  settled: Object[];
-}
-
-/** 最后一轮失败的原因（插件从会话日志的 turn/end 里抠出来的）。 */
-export interface TurnErr {
-  code: string;
-  text: string;
-  time: number;
-}
-
-export interface MessagesResult {
-  total: number;
-  messages: Message[];
-  context?: ContextUsage | null;
-  stats?: SessionStats;
-  firstSeq?: number;
-  running?: boolean;
-  /** 最后一轮的结束原因（completed / aborted / interrupted / error …） */
-  lastTurn?: string;
-  /** 最后一轮失败时的原始报错，手机端要在消息流里显示完整 body */
-  lastErr?: TurnErr | null;
-  queue?: QueuedItem[];
-  questions?: AskState;
-}
-
-export interface ModelRef {
-  provider: string;
-  model: string;
-  reasoningEffort?: string;
-}
-
-export interface AgentRef {
-  id: string;
-  label: string;
-  mode: string;
-  createdAt: number;
-}
-
-/** 会话携带的智能体概况（子智能体 + 团队任务数） */
-export interface AgentSummary {
-  enabled: number;
-  tasks: number;
-  subagents: AgentRef[];
-}
-
-export interface ApiInfo {
-  ok: boolean;
-  version: string;
-  host: string;
-  port: number;
-}
-
-interface SessionsResp {
-  ok: boolean;
-  sessions: SessionRow[];
-}
-
-export interface PreviewRow {
-  id: string;
-  preview: string;
-  count: number;
-}
-
-interface PreviewsResp {
-  ok: boolean;
-  previews: PreviewRow[];
-}
-
-interface MessagesResp {
-  ok: boolean;
-  sessionId: string;
-  total: number;
-  messages: Message[];
-  stats?: SessionStats;
-  context?: ContextUsage | null;
-  running?: boolean;
-  firstSeq?: number;
-  lastTurn?: string;
-  lastErr?: TurnErr;
-  queue?: QueuedItem[];
-  questions?: AskState;
-}
-
-interface PresenceBody {
-  online: boolean;
-}
-
-interface PresenceResp {
-  ok?: boolean;
-  online?: boolean;
-  ttlMs?: number;
-}
-
-interface InfoResp {
-  ok: boolean;
-  version: string;
-  host: string;
-  port: number;
-  addresses?: string[];
-}
-
-interface RawResult {
-  code: number;
-  text: string;
-}
-
-/** 服务端出错时回的那一小段 JSON，只需要 error。 */
-interface QueueOrderBody {
-  ids: string[];
-}
-
-interface QueueOrderResp {
-  ok?: boolean;
-  moved?: number;
-}
-
-interface ErrBody {
-  error?: string;
-}
+import { SessionRow, TokenUsage, SessionStats, ImageRef, GoalView, GoalResp, TurnInfo, Message, ContextUsage, QueueTextBody, QueueImage, QueuedItem, AskOption, AskQuestion, PendingAsk, AskAnswer, AnswerBody, AskState, TurnErr, MessagesResult, ModelRef, AgentRef, AgentSummary, ApiInfo, SessionsResp, PreviewRow, PreviewsResp, MessagesResp, PresenceBody, PresenceResp, InfoResp, RawResult, QueueOrderBody, QueueOrderResp, ErrBody, FsWriteBody, FsDeleteBody, RawSignBody, RawSignResp, SignBody, SignItem, SignResp, ForkBody, ForkResp, FilesBody, FilesResp, OutboxBody, OutboxResp, ImagesBody, ImagesResp, StopResp, CreateBody, CreateResp, RenameBody, ModelBody, EffortRef, CatalogModel, CatalogGroup, Catalog, ModelsResp, PresetRow, PermRow, PresetsResp, PermsResp, PresetBody, PresetResp, PermBody, PermResp, ArchiveResp, PinBody, PinResp, SendBody, HostPluginRow, HostPluginGroup, HostPluginsResp, HostTaskRow, HostSchedulesResp, HostTaskActionBody, HostPluginToggleBody, HostPluginToggleResp, FsEntry, FsListing, FsResp, TeamMemberRow, TeamTaskRow, TeamResp, TeamModeBody, TeamModeResp, FsFile, FsFileResp, AnswerModeBody, AnswerModeResp } from './ApiTypes';
+export { SessionRow, TokenUsage, SessionStats, ImageRef, GoalView, TurnInfo, Message, ContextUsage, QueueTextBody, QueueImage, QueuedItem, AskOption, AskQuestion, PendingAsk, AskAnswer, AnswerBody, AskState, TurnErr, MessagesResult, ModelRef, AgentRef, AgentSummary, ApiInfo, PreviewRow, EffortRef, CatalogModel, CatalogGroup, Catalog, PresetRow, PermRow, PresetsResp, PermsResp, HostPluginRow, HostPluginGroup, HostTaskRow, FsEntry, FsListing, TeamMemberRow, TeamTaskRow, TeamResp, FsFile } from './ApiTypes';
 
 /**
  * dsh-mobile 的 HTTP 客户端。
@@ -267,9 +17,42 @@ interface ErrBody {
  * 单次请求会直接超时，所以网络类失败最多重试 3 次（HTTP 4xx/5xx 不重试）。
  */
 export class Api {
+  /** 最近几次请求失败：反馈页「复制诊断信息」带上它，复现问题不用再让用户翻日志。 */
+  private static errRing: string[] = [];
+
+  static noteError(msg: string): void {
+    const t: Date = new Date();
+    const hh: string = (t.getHours() < 10 ? '0' : '') + t.getHours();
+    const mm: string = (t.getMinutes() < 10 ? '0' : '') + t.getMinutes();
+    Api.errRing.push(hh + ':' + mm + ' ' + msg);
+    while (Api.errRing.length > 8) {
+      Api.errRing.shift();
+    }
+  }
+
+  static recentErrors(): string[] {
+    return Api.errRing.slice();
+  }
+
+  /** 一条逻辑消息的幂等键：同一次发送的重试复用同一个键，宿主只提交一次。 */
+  static newIdemKey(): string {
+    return newIdemKey();
+  }
+
+  /**
+   * 错误分类：UI 与重试策略共用一处判断，不要再各自 startsWith 猜。
+   * net=断网/超时，http=电脑端返回错误，auth=令牌不对，parse=返回不是 JSON，
+   * nobase=还没配对，other=其余。
+   */
+  static kind(msg: string): string {
+    return classifyError(msg);
+  }
+
   token: string;
   /** true 时跳过局域网探测，强制走隧道入口。 */
   forceWan: boolean = false;
+  /** 仅局域网：探不到也不回退隧道（「自动 / 仅局域网 / 仅公网」里的中间档）。 */
+  lanOnly: boolean = false;
   /**
    * 同一个 Wi-Fi 下自动改走局域网直连。用户可以在 设置 → 连接 里关掉：
    * 关掉后只走配对的公网地址（隧道），不再试探局域网。
@@ -299,15 +82,56 @@ export class Api {
     return this.chosen !== '' ? this.chosen : this.wanBase;
   }
 
+  /** 图片短签名缓存：id → "e=...&sig=..."，以及过期时刻（秒）。 */
+  private attSig: Map<string, string> = new Map<string, string>();
+  private attExp: Map<string, number> = new Map<string, number>();
+
+  /**
+   * 向宿主换一批图片短签名（5 分钟有效）。
+   * 失败不抛：退回旧的 ?t= 直链，图片照样能显示。
+   */
+  async signAttachments(ids: string[]): Promise<void> {
+    const need: string[] = [];
+    const nowSec: number = Math.floor(Date.now() / 1000);
+    for (let i = 0; i < ids.length && need.length < 64; i++) {
+      const id: string = ids[i];
+      // 过期（或 60 秒内到期）的也要重新换签，否则去掉 ?t= 回退后图片会在 5 分钟后变空白。
+      const exp: number = this.attExp.get(id) ?? 0;
+      if (!this.attSig.has(id) || exp <= nowSec + 60) {
+        need.push(id);
+      }
+    }
+    if (need.length === 0) {
+      return;
+    }
+    try {
+      const r = await this.call<SignResp>('/api/attachments/sign', 'POST',
+        JSON.stringify({ ids: need } as SignBody));
+      const items: SignItem[] = r.items === undefined ? [] : r.items;
+      for (let i = 0; i < items.length; i++) {
+        this.attSig.set(items[i].id, 'e=' + items[i].e + '&sig=' + items[i].sig);
+        const e: number = Number(items[i].e);
+        this.attExp.set(items[i].id, Number.isFinite(e) ? e : 0);
+      }
+    } catch (e) {
+      console.info('DSH_ATT_SIGN skipped :: ' + (e as Error).message);
+    }
+  }
+
   /**
    * 一张图片的直链。
    * @param img - 消息里带的图片摘要
-   * @returns 带令牌的完整 URL，<Image> 组件直接可用
+   * @returns 优先短签名，拿不到就退回带令牌的直链，<Image> 直接可用
    */
   attachmentUrl(img: ImageRef): string {
     const mt: string = img.mediaType !== '' ? img.mediaType : 'image/png';
-    return this.currentBase() + '/api/attachments/' + img.id + '?t=' + encodeURIComponent(this.token) +
-      '&m=' + encodeURIComponent(mt);
+    const sig: string | undefined = this.attSig.get(img.id);
+    // 过期前 30 秒就当它失效，让下一次 load 重新换签。
+    // 没有签名就返回空串，调用方不渲染图片：不再把长期令牌塞回 URL（协议 v2 起）。
+    if (sig !== undefined && (this.attExp.get(img.id) ?? 0) > Math.floor(Date.now() / 1000) + 30) {
+      return this.currentBase() + '/api/attachments/' + img.id + '?' + sig + '&m=' + encodeURIComponent(mt);
+    }
+    return '';
   }
 
   /** 切换连接偏好；清掉已选入口让下一次请求重新探测。 */
@@ -318,6 +142,11 @@ export class Api {
 
   setAutoLan(v: boolean): void {
     this.autoLan = v;
+    this.chosen = '';
+  }
+
+  setLanOnly(v: boolean): void {
+    this.lanOnly = v;
     this.chosen = '';
   }
 
@@ -411,6 +240,11 @@ export class Api {
     this.token = token;
     this.chosen = '';
     this.lanDownUntil = 0;
+    // 换电脑/换令牌后旧签名全部作废：它们是用上一台电脑的令牌签的。
+    this.attSig.clear();
+    this.attExp.clear();
+    this.rawSig.clear();
+    this.rawExp.clear();
     console.info('DSH_BASE rebase ' + this.wanBase + ' lan=' + (this.lanBase !== '' ? this.lanBase : '-'));
   }
 
@@ -543,6 +377,24 @@ export class Api {
     if (this.chosen !== '') {
       return this.chosen;
     }
+    if (this.lanOnly) {
+      if (Date.now() >= this.lanDownUntil) {
+        const hit: string = await this.probeLan(1500);
+        if (hit !== '') {
+          this.chosen = hit;
+          console.info('DSH_BASE lan-only ' + hit);
+          return this.chosen;
+        }
+        this.lanDownUntil = Date.now() + 15000;
+      }
+      // 只走局域网：宁可失败也不回退隧道；没有候选地址时给出可读错误。
+      this.chosen = this.lanBase !== '' ? this.lanBase : (this.lanCands.length > 0 ? this.lanCands[0] : '');
+      if (this.chosen === '') {
+        throw new Error('现在是「仅局域网」模式，但这台电脑没有可用的局域网地址；到「连接」里切回自动，或先在同一 Wi-Fi 下配对');
+      }
+      this.scheduleLanProbe();
+      return this.chosen;
+    }
     if (this.forceWan || !this.autoLan) {
       this.chosen = this.wanBase;
       console.info('DSH_BASE wan (forced) ' + this.wanBase);
@@ -576,6 +428,13 @@ export class Api {
     this.chosen = '';
     this.lanDownUntil = 0;
     this.nextLanProbe = 0;
+    if (this.lanOnly) {
+      const hit: string = await this.probeLan(2000);
+      this.chosen = hit !== '' ? hit : (this.lanBase !== '' ? this.lanBase : (this.lanCands.length > 0 ? this.lanCands[0] : ''));
+      this.scheduleLanProbe();
+      console.info('DSH_BASE poke lan-only ' + (this.chosen !== '' ? this.chosen : '-'));
+      return;
+    }
     if (this.autoLan && !this.forceWan) {
       const hit: string = await this.probeLan(2000);
       if (hit !== '') {
@@ -622,19 +481,7 @@ export class Api {
    * 旧写法只区分 POST 与 GET，把 PATCH 静默降级成 GET，导致重命名必定 404。
    */
   private methodOf(method: string): http.RequestMethod {
-    if (method === 'POST') {
-      return http.RequestMethod.POST;
-    }
-    if (method === 'PATCH') {
-      return http.RequestMethod.PATCH;
-    }
-    if (method === 'PUT') {
-      return http.RequestMethod.PUT;
-    }
-    if (method === 'DELETE') {
-      return http.RequestMethod.DELETE;
-    }
-    return http.RequestMethod.GET;
+    return httpMethodOf(method);
   }
 
   /**
@@ -643,45 +490,36 @@ export class Api {
    * 所以 HTML 一律换成固定说法；JSON 里的 error 字段保留，方便对号入座。
    */
   private friendly(code: number, text: string, path: string): string {
-    const body: string = (text ?? '').trim();
-    const lower: string = body.toLowerCase();
-    const html: boolean = lower.startsWith('<!doctype html') || lower.startsWith('<html') || lower.includes('<html');
-    console.info('DSH_API_ERR ' + path + ' code=' + String(code));
-    if (code === 401) {
-      return '这台电脑不认这个令牌了，去设置里重新配对';
-    }
-    if (body.startsWith('{')) {
-      try {
-        const obj: ErrBody = JSON.parse(body) as ErrBody;
-        const msg: string = obj.error !== undefined ? obj.error : '';
-        if (msg !== '') {
-          return (code >= 500 ? '电脑端出错（HTTP ' + String(code) + '）：' : '请求被拒（HTTP ' + String(code) + '）：') + msg;
-        }
-      } catch (e) {
-        // 不是合法 JSON，退回通用说法
-      }
-    }
-    if (code >= 500) {
-      return html ? '连不上电脑（隧道 HTTP ' + String(code) + '），稍后自动重试'
-        : '电脑端出错（HTTP ' + String(code) + '）';
-    }
-    const tail: string = html ? '' : body.slice(0, 80);
-    return '请求失败（HTTP ' + String(code) + '）' + (tail !== '' ? '：' + tail : '');
+    return friendlyError(code, text, path);
   }
 
-  private async once<T>(path: string, method: string, payload?: string): Promise<T> {
+  private async once<T>(path: string, method: string, payload?: string, idem?: string): Promise<T> {
+    // 首帧时页面可能先于 Index.loadCfg 发起请求：等一小会儿让地址就位，
+    // 否则会拿空 base 拼出非法 URL，再被当成网络错误重试三次。
+    for (let i = 0; i < 15 && this.wanBase === ''; i++) {
+      await this.sleep(100);
+    }
+    if (this.wanBase === '') {
+      throw new Error('还没连上电脑：先在「连接」里配对或填写地址');
+    }
     const base = await this.ensureBase();
     const req = http.createHttp();
     // 隧道首包可能是冷路径（Cloudflare 边缘回源 5–20 秒），局域网则是毫秒级，
     // 所以超时按入口分开给：公网给足，局域网保持灵敏。
-    const connectMs: number = this.isLan() ? 5000 : 18000;
+    // 局域网要么毫秒级答，要么根本不在了：等 2.2 秒还没连上就当作「Wi-Fi 掉了」，
+    // 别用 5 秒把这个判断拖到用户明显感觉到卡。隧道仍然给足 18 秒（冷回源很慢）。
+    const connectMs: number = this.isLan() ? 2200 : 18000;
     try {
+      const header: Record<string, string> = {
+        'Authorization': 'Bearer ' + this.token,
+        'Content-Type': 'application/json; charset=utf-8'
+      };
+      if (idem !== undefined && idem !== '') {
+        header['Idempotency-Key'] = idem;
+      }
       const opts: http.HttpRequestOptions = {
         method: this.methodOf(method),
-        header: {
-          'Authorization': 'Bearer ' + this.token,
-          'Content-Type': 'application/json; charset=utf-8'
-        },
+        header: header,
         expectDataType: http.HttpDataType.STRING,
         connectTimeout: connectMs,
         readTimeout: connectMs + 8000,
@@ -694,48 +532,73 @@ export class Api {
       if (code < 200 || code >= 300) {
         throw new Error(this.friendly(code, text, path));
       }
-      return JSON.parse(text) as T;
+      let parsed: T;
+      try {
+        parsed = JSON.parse(text) as T;
+      } catch (e) {
+        // 200 但返回的不是 JSON：多半是隧道边缘页 / 劫持页。不要把它当断网重试三次。
+        throw new Error('响应格式不对（HTTP ' + String(code) + '）：可能被网络劫持或隧道返回了错误页');
+      }
+      return parsed;
     } finally {
       req.destroy();
     }
   }
 
-  private async call<T>(path: string, method: string, payload?: string): Promise<T> {
-    const attempts = 3;
+  private async call<T>(path: string, method: string, payload?: string, idem?: string): Promise<T> {
+    // 读请求总是可重试；写请求目前仍只尝试一次。
+    // 客户端已经会带 Idempotency-Key（宿主 v2 按 key 去重），但旧宿主会忽略这个头，
+    // 所以自动重试要等宿主升级后再打开，否则老版本上会重复发送。
+    const attempts = method === 'GET' ? 3 : 1;
     let last: Error = new Error('unknown');
     for (let i = 1; i <= attempts; i++) {
       try {
-        return await this.once<T>(path, method, payload);
+        return await this.once<T>(path, method, payload, idem);
       } catch (e) {
         last = e as Error;
         const msg = last.message ?? '';
         console.error('DSH_API_FAIL ' + method + ' ' + path + ' try=' + i + ' :: ' + msg);
+        Api.noteError(method + ' ' + path + ' :: ' + msg);
         if (msg.startsWith('连不上电脑') || msg.startsWith('电脑端出错')) {
           // 5xx：隧道回源失败很常见，换一个入口再试一次（同一个 Wi-Fi 下就会落到局域网）。
           this.chosen = '';
           this.lanDownUntil = 0;
           if (i < attempts) {
-            await this.sleep(500 * i);
+            // 指数退避 + 一点抖动：隧道抖动时错开重试，别三下都撞在同一秒。
+            await this.sleep(450 * i * i + Math.floor(Math.random() * 120));
             continue;
           }
           break;
         }
-        if (msg.startsWith('请求') || msg.startsWith('这台电脑')) {
+        if (msg.startsWith('请求') || msg.startsWith('这台电脑') || msg.startsWith('响应格式') || msg.startsWith('还没连上')) {
           break;
         }
-        // 网络类失败：重置入口选择，下一轮重新探测（可能已经从 Wi-Fi 切到移动网络）
-        this.chosen = '';
+        // 网络类失败：如果刚才走的是局域网，那基本就是离开了 Wi-Fi。直接降到公网入口，
+        // 并把局域网冷却一段时间——否则下一轮 ensureBase 又要白探 1.5 秒才回落，
+        // 用户在外面要看着「转圈」等好几秒。
+        if (this.lanOnly) {
+          // 仅局域网模式不允许降级：清掉入口，下一轮仍只探局域网。
+          this.chosen = '';
+          this.lanDownUntil = 0;
+        } else if (this.isLan()) {
+          this.lanDownUntil = Date.now() + 45000;
+          this.chosen = this.wanBase;
+          console.info('DSH_BASE demote lan -> wan after ' + msg);
+        } else {
+          // 走隧道也失败了：重置入口，下一轮重新选（可能刚好走进 Wi-Fi）
+          this.chosen = '';
+        }
         if (i === attempts) {
           break;
         }
-        await this.sleep(220 * i);
+        await this.sleep(i === 1 ? 80 : 220 * i);
       }
     }
     throw last;
   }
 
   private sleep(ms: number): Promise<void> {
-    return new Promise<void>((resolve) => setTimeout(() => resolve(), ms));
+    return sleep(ms);
   }
 
   /**
@@ -810,13 +673,13 @@ export class Api {
    * queue=排到下一轮（不打断），steer=插话（替掉当前轮）。
    * 空闲会话不管传什么都只能 steer，插件侧会自己纠正。
    */
-  async send(id: string, text: string, mode: string = ''): Promise<void> {
+  async send(id: string, text: string, mode: string = '', idem: string = ''): Promise<void> {
     const body: SendBody = { text: text };
     if (mode === 'steer' || mode === 'queue') {
       body.mode = mode;
     }
     await this.call<object>('/api/sessions/' + encodeURIComponent(id) + '/send', 'POST',
-      JSON.stringify(body));
+      JSON.stringify(body), idem);
   }
 
   /** 从电脑端队列里撤掉一条。 */
@@ -957,11 +820,11 @@ export class Api {
    * 分开调 /images 与 /files 会变成两条队列项，用户看到的是「一条图文」被拆成两条。
    */
   async sendOutbox(id: string, text: string, images: ImagePart[], files: FilePart[],
-    mode: string = ''): Promise<number> {
+    mode: string = '', idem: string = ''): Promise<number> {
     const body: OutboxBody = { text: text, images: images, files: files };
     if (mode === 'steer' || mode === 'queue') body.mode = mode;
     const r = await this.call<OutboxResp>('/api/sessions/' + encodeURIComponent(id) + '/outbox', 'POST',
-      JSON.stringify(body));
+      JSON.stringify(body), idem);
     return r.parts === undefined ? 0 : r.parts;
   }
 
@@ -1073,327 +936,62 @@ export class Api {
     };
   }
 
-  /** 图片文件的直链（带令牌，<Image> 可直接用）。 */
-  fsRawUrl(id: string, path: string): string {
-    return this.currentBase() + '/api/sessions/' + encodeURIComponent(id) + '/fs/raw?path=' +
-      encodeURIComponent(path) + '&t=' + encodeURIComponent(this.token);
+  /** 工作区图片的短签名缓存：`sid|path` → `e=..&sig=..`，以及过期时刻（秒）。 */
+  private rawSig: Map<string, string> = new Map<string, string>();
+  private rawExp: Map<string, number> = new Map<string, number>();
+
+  /** 给一张工作区图片换 5 分钟签名；失败不抛，调用方退回带令牌的直链。 */
+  async signFsRaw(id: string, path: string): Promise<void> {
+    const key: string = id + '|' + path;
+    const nowSec: number = Math.floor(Date.now() / 1000);
+    if (this.rawSig.has(key) && (this.rawExp.get(key) ?? 0) > nowSec + 60) {
+      return;
+    }
+    try {
+      const r = await this.call<RawSignResp>(
+        '/api/sessions/' + encodeURIComponent(id) + '/fs/sign', 'POST',
+        JSON.stringify({ path: path } as RawSignBody));
+      if (r.sig !== undefined && r.e !== undefined) {
+        this.rawSig.set(key, 'e=' + r.e + '&sig=' + r.sig);
+        const e: number = Number(r.e);
+        this.rawExp.set(key, Number.isFinite(e) ? e : 0);
+      }
+    } catch (e) {
+      console.info('DSH_RAW_SIGN skipped :: ' + (e as Error).message);
+    }
   }
 
-  /** 任意文件的下载直链（带令牌，交给 request.downloadFile 直接落盘）。 */
+  /** 图片文件的直链：优先短签名，拿不到退回旧 ?t=。 */
+  fsRawUrl(id: string, path: string): string {
+    const sig: string | undefined = this.rawSig.get(id + '|' + path);
+    if (sig !== undefined && (this.rawExp.get(id + '|' + path) ?? 0) > Math.floor(Date.now() / 1000) + 30) {
+      return this.currentBase() + '/api/sessions/' + encodeURIComponent(id) + '/fs/raw?path=' +
+        encodeURIComponent(path) + '&' + sig;
+    }
+    // 与附件一致：拿不到签名就不给直链，避免把长期令牌写进 URL。
+    return '';
+  }
+
+  /** 任意文件的下载直链：不带令牌，调用方用 Authorization 请求头（Saver 已支持）。 */
   fsDownloadUrl(id: string, path: string): string {
     return this.currentBase() + '/api/sessions/' + encodeURIComponent(id) + '/fs/download?path=' +
-      encodeURIComponent(path) + '&t=' + encodeURIComponent(this.token);
+      encodeURIComponent(path);
   }
-}
 
-interface ForkBody {
-  atSeq?: number;
-}
+  /** 给 Saver 用的 bearer 值；只用于下载请求头，不进 URL。 */
+  bearer(): string {
+    return 'Bearer ' + this.token;
+  }
 
-interface ForkResp {
-  ok?: boolean;
-  sessionId?: string;
-}
+  /** 重命名工作区里的文件/目录（同目录内换名）。 */
+  async fsRename(id: string, path: string, to: string): Promise<void> {
+    await this.call<object>('/api/sessions/' + encodeURIComponent(id) + '/fs/rename', 'POST',
+      JSON.stringify({ path: path, to: to } as FsWriteBody));
+  }
 
-interface FilesBody {
-  text: string;
-  files: FilePart[];
-  mode?: string;
-}
-
-interface FilesResp {
-  ok: boolean;
-  count: number;
-  bytes: number;
-}
-
-interface OutboxBody {
-  text: string;
-  images: ImagePart[];
-  files: FilePart[];
-  mode?: string;
-}
-
-interface OutboxResp {
-  ok: boolean;
-  parts: number;
-  queued?: boolean;
-}
-
-interface ImagesBody {
-  text: string;
-  images: ImagePart[];
-  mode?: string;
-}
-
-interface ImagesResp {
-  ok: boolean;
-  count: number;
-  bytes: number;
-}
-
-interface StopResp {
-  ok: boolean;
-  accepted: boolean;
-}
-
-interface CreateBody {
-  cwd: string;
-}
-
-interface CreateResp {
-  ok: boolean;
-  sessionId?: string;
-}
-
-interface RenameBody {
-  title: string;
-}
-
-interface ModelBody {
-  provider: string;
-  model: string;
-  reasoningEffort?: string;
-}
-
-export interface EffortRef {
-  id: string;
-  name: string;
-}
-
-export interface CatalogModel {
-  id: string;
-  name: string;
-  description: string;
-  efforts: EffortRef[];
-  defaultEffort: string;
-}
-
-export interface CatalogGroup {
-  id: string;
-  name: string;
-  models: CatalogModel[];
-}
-
-export interface Catalog {
-  current: ModelRef | null;
-  routable: boolean;
-  groups: CatalogGroup[];
-}
-
-interface ModelsResp {
-  ok: boolean;
-  sessionId: string;
-  catalog: Catalog;
-}
-
-export interface PresetRow {
-  id: string;
-  name: string;
-  description: string;
-  isDefault: boolean;
-  broken: string;
-}
-
-export interface PermRow {
-  value: string;
-  name: string;
-  description: string;
-}
-
-export interface PresetsResp {
-  ok: boolean;
-  presets: PresetRow[];
-  current: string;
-  unavailable: boolean;
-}
-
-export interface PermsResp {
-  ok: boolean;
-  presets: PermRow[];
-  current: string;
-  defaultPreset: string;
-  unavailable: boolean;
-}
-
-interface PresetBody {
-  presetId: string;
-}
-
-interface PresetResp {
-  ok: boolean;
-  selected?: string;
-  scope?: string;
-}
-
-interface PermBody {
-  permission: string;
-}
-
-interface PermResp {
-  ok: boolean;
-  preset?: string;
-  current?: string;
-}
-
-interface ArchiveResp {
-  ok: boolean;
-  sessionId?: string;
-  archived?: boolean;
-  cancelledFirst?: boolean;
-  via?: string;
-}
-
-interface PinBody {
-  pinned: boolean;
-}
-
-interface PinResp {
-  ok: boolean;
-  sessionId?: string;
-  pinned?: boolean;
-  via?: string;
-}
-
-interface SendBody {
-  text: string;
-  mode?: string;
-}
-
-export interface HostPluginRow {
-  name: string;
-  version: string;
-  enabled: boolean;
-  local: boolean;
-}
-
-export interface HostPluginGroup {
-  profile: string;
-  items: HostPluginRow[];
-}
-
-interface HostPluginsResp {
-  ok?: boolean;
-  groups?: HostPluginGroup[];
-}
-
-export interface HostTaskRow {
-  id: string;
-  title: string;
-  kind: string;
-  when: string;
-  active: boolean;
-  sessionId: string;
-}
-
-interface HostSchedulesResp {
-  ok?: boolean;
-  source?: string;
-  items?: HostTaskRow[];
-}
-
-/** 任务动作的请求体：action 只认 pause / resume / run / delete。 */
-interface HostTaskActionBody {
-  action: string;
-}
-
-/** 插件开关的请求体。 */
-interface HostPluginToggleBody {
-  profile: string;
-  name: string;
-  enabled: boolean;
-}
-
-interface HostPluginToggleResp {
-  ok?: boolean;
-  profile?: string;
-  name?: string;
-  enabled?: boolean;
-  /** 清单是否真的被改写；没改说明本来就是那个状态 */
-  changed?: boolean;
-  /** 改写后必须重启宿主才生效 */
-  restartRequired?: boolean;
-}
-
-export interface FsEntry {
-  name: string;
-  dir: boolean;
-  size: number;
-  mtime: number;
-}
-
-export interface FsListing {
-  root: string;
-  path: string;
-  entries: FsEntry[];
-  more: boolean;
-  /** 会话没有工作目录时，宿主退回了它自己的当前目录 */
-  fallback?: boolean;
-}
-
-interface FsResp {
-  ok?: boolean;
-  root?: string;
-  path?: string;
-  entries?: FsEntry[];
-  more?: boolean;
-  fallback?: boolean;
-}
-
-export interface TeamMemberRow {
-  id: string;
-  name: string;
-  description: string;
-  phase: string;
-  error: string;
-}
-
-export interface TeamTaskRow {
-  id: string;
-  revision: number;
-  subject: string;
-  description: string;
-  status: string;
-  ownerName: string;
-  ownerId: string;
-}
-
-export interface TeamResp {
-  ok?: boolean;
-  sessionId?: string;
-  enabled?: boolean;
-  sawMode?: boolean;
-  members?: TeamMemberRow[];
-  tasks?: TeamTaskRow[];
-}
-
-interface TeamModeBody {
-  enabled: boolean;
-}
-
-interface TeamModeResp {
-  ok?: boolean;
-  enabled?: boolean;
-}
-
-export interface FsFile {
-  name: string;
-  size: number;
-  text: string;
-}
-
-interface FsFileResp {
-  ok?: boolean;
-  name?: string;
-  size?: number;
-  text?: string;
-}
-
-interface AnswerModeBody {
-  mode: string;
-}
-
-interface AnswerModeResp {
-  ok?: boolean;
-  mode?: string;
+  /** 删除工作区里的文件，或空目录。 */
+  async fsDelete(id: string, path: string): Promise<void> {
+    await this.call<object>('/api/sessions/' + encodeURIComponent(id) + '/fs/delete', 'POST',
+      JSON.stringify({ path: path } as FsDeleteBody));
+  }
 }

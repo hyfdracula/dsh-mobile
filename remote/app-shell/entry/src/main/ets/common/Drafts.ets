@@ -80,6 +80,21 @@ export class Drafts {
     }, 500);
   }
 
+  /** 草稿条数：设置里的「应用数据」用它显示与清理。 */
+  static count(): number {
+    Drafts.ensure();
+    return Drafts.mem === null ? 0 : Drafts.mem.size;
+  }
+
+  static clearAll(): void {
+    Drafts.ensure();
+    if (Drafts.mem === null) {
+      return;
+    }
+    Drafts.mem.clear();
+    Drafts.flush();
+  }
+
   /** 立刻落盘（离页、退到后台时用）。 */
   static flush(): void {
     if (Drafts.mem === null || Drafts.store === null) {

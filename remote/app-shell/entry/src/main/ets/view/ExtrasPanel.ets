@@ -1,7 +1,9 @@
 import { common } from '@kit.AbilityKit';
 import { Api, FsEntry, HostPluginGroup, HostPluginRow, HostTaskRow, TeamMemberRow, TeamTaskRow } from '../common/Api';
 import { Tokens } from '../common/Tokens';
+import { bytes } from '../common/Format';
 import { Haptics } from '../common/Haptics';
+import { Toast } from '../common/Toast';
 import { Saver } from '../common/Saver';
 
 /**
@@ -29,6 +31,9 @@ export struct ExtrasPanel {
   @State private rootFallback: boolean = false;
   @State private path: string = '';
   @State private entries: FsEntry[] = [];
+  /** 文件面板：当前目录过滤与排序（客户端做，不动宿主）。 */
+  @State private fsQuery: string = '';
+  @State private fsSort: string = 'name';
   @State private more: boolean = false;
   @State private viewerOn: boolean = false;
   @State private viewerName: string = '';
@@ -41,6 +46,14 @@ export struct ExtrasPanel {
   @State private imagePath: string = '';
   /** 正在保存到手机：发一次请求就锁住按钮，避免连点堆出多个下载任务 */
   @State private saving: boolean = false;
+  /** 文件面板的写操作：重命名浮层与忙碌锁。 */
+  @State private fsMenuOn: boolean = false;
+  @State private fsMenuName: string = '';
+  @State private fsMenuDir: boolean = false;
+  @State private renameOn: boolean = false;
+  @State private renameTarget: string = '';
+  @State private renameName: string = '';
+  @State private fsBusy: boolean = false;
   /** 跟设置二级页同一套：顶部渐变用当前页面底色，深浅色切换时跟着变 */
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
   /** 正在请求的任务 id：同一时刻只让一条任务显示「处理中」 */
@@ -188,12 +201,6 @@ export struct ExtrasPanel {
       n.endsWith('.gif') || n.endsWith('.bmp') || n.endsWith('.svg');
   }
 
-  private sizeText(b: number): string {
-    if (b >= 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + ' MB';
-    if (b >= 1024) return (b / 1024).toFixed(1) + ' KB';
-    return String(b) + ' B';
-  }
-
   private whenText(iso: string): string {
     if (iso === '') return '';
     const d = new Date(iso);
@@ -222,6 +229,8 @@ export struct ExtrasPanel {
     }
     const full: string = this.join(e.name);
     if (this.isImage(e.name)) {
+      // 先换短签名，再让 <Image> 去取图；旧宿主没有这个路由时会自动退回 ?t=。
+      await this.api.signFsRaw(this.sessionId, full);
       this.imagePath = full;
       this.imageOn = true;
       this.saving = false;
@@ -287,15 +296,15 @@ export struct ExtrasPanel {
     try {
       const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
       const url: string = this.api.fsDownloadUrl(this.sessionId, targetPath);
-      const saved: boolean = await Saver.save(ctx, url, targetName);
+      const saved: boolean = await Saver.save(ctx, url, targetName, this.api.bearer());
       if (saved) {
-        this.getUIContext().getPromptAction().showToast({ message: '已保存到手机', duration: 1600 });
+        Toast.ok('已保存到手机');
       }
     } catch (e) {
       // 查看器盖在面板上面，光写 this.err 用户看不见，同时弹一条提示
       const reason: string = (e as Error).message;
       this.err = reason;
-      this.getUIContext().getPromptAction().showToast({ message: reason, duration: 2600 });
+      Toast.err(reason);
     } finally {
       this.saving = false;
     }
@@ -320,7 +329,7 @@ export struct ExtrasPanel {
     try {
       await this.api.scheduleAction(id, action);
       await this.loadSchedules();
-      this.getUIContext().getPromptAction().showToast({ message: this.actText(action), duration: 1600 });
+      Toast.ok(this.actText(action));
     } catch (e) {
       this.err = (e as Error).message;
     } finally {
@@ -449,7 +458,7 @@ export struct ExtrasPanel {
   private refreshButton() {
     Stack() {
       Text('↻')
-        .fontSize(18)
+        .fontSize(17)
         .fontColor(Tokens.fg)
     }
     .width(38)
@@ -503,11 +512,11 @@ export struct ExtrasPanel {
     if (this.notice !== '') {
       Row() {
         Text(this.notice)
-          .fontSize(11.5)
+          .fontSize(12)
           .fontColor(Tokens.accent)
           .layoutWeight(1)
         Text('知道了')
-          .fontSize(11.5)
+          .fontSize(12)
           .fontColor(Tokens.dim2)
           .padding({ left: 12, top: 2, bottom: 2 })
           .onClick(() => {
@@ -517,7 +526,7 @@ export struct ExtrasPanel {
       .width('100%')
       .padding({ left: 12, right: 12, top: 10, bottom: 10 })
       .backgroundColor(Tokens.accentGlass)
-      .borderRadius(12)
+      .borderRadius(14)
       .margin({ bottom: 10 })
     }
   }
@@ -538,11 +547,11 @@ export struct ExtrasPanel {
   private pluginRows(g: HostPluginGroup) {
     Row() {
       Text(g.profile)
-        .fontSize(11.5)
+        .fontSize(12)
         .fontColor(Tokens.dim2)
         .layoutWeight(1)
       Text(String(this.enabledCount(g)) + ' / ' + String(g.items.length) + ' 已启用')
-        .fontSize(10.5)
+        .fontSize(11)
         .fontColor(Tokens.dim2)
     }
     .width('100%')
@@ -552,7 +561,7 @@ export struct ExtrasPanel {
       Row() {
         Column() {
           Text(this.shortName(it.name))
-            .fontSize(14)
+            .fontSize(13)
             .fontColor(Tokens.fg)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -578,7 +587,7 @@ export struct ExtrasPanel {
       .padding({ left: 12, right: 12, top: 11, bottom: 11 })
       .margin({ bottom: 6 })
       .backgroundColor(Tokens.surface)
-      .borderRadius(12)
+      .borderRadius(14)
     }, (it: HostPluginRow) => g.profile + '/' + it.name + '/' + String(it.enabled))
   }
 
@@ -597,13 +606,13 @@ export struct ExtrasPanel {
     Column() {
       Row() {
         Text(it.title)
-          .fontSize(14)
+          .fontSize(13)
           .fontColor(Tokens.fg)
           .layoutWeight(1)
           .maxLines(2)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
         Text(it.active ? '启用' : '暂停')
-          .fontSize(10.5)
+          .fontSize(11)
           .fontColor(it.active ? Tokens.accent : Tokens.dim2)
           .padding({ left: 8, right: 8, top: 3, bottom: 3 })
           .backgroundColor(it.active ? Tokens.accentGlass : Tokens.chip)
@@ -624,12 +633,12 @@ export struct ExtrasPanel {
         Blank()
         if (this.acting === it.id) {
           Text('处理中')
-            .fontSize(11.5)
+            .fontSize(12)
             .fontColor(Tokens.dim2)
         } else {
           Row() {
             Text(it.active ? '暂停' : '恢复')
-              .fontSize(11.5)
+              .fontSize(12)
               .fontColor(Tokens.accent)
           }
           .padding({ left: 10, right: 10, top: 5, bottom: 5 })
@@ -642,7 +651,7 @@ export struct ExtrasPanel {
 
           Row() {
             Text('立即')
-              .fontSize(11.5)
+              .fontSize(12)
               .fontColor(Tokens.fg)
           }
           .padding({ left: 10, right: 10, top: 5, bottom: 5 })
@@ -678,7 +687,7 @@ export struct ExtrasPanel {
     .padding({ left: 12, right: 12, top: 11, bottom: 11 })
     .margin({ bottom: 6 })
     .backgroundColor(Tokens.surface)
-    .borderRadius(12)
+    .borderRadius(14)
   }
 
   @Builder
@@ -690,21 +699,25 @@ export struct ExtrasPanel {
 
   @Builder
   private teamRows() {
-    Row() {
-      Text(this.sawMode ? (this.teamOn ? '团队协作已开' : '团队协作没开') : '这个会话没有团队记录')
-        .fontSize(12)
-        .fontColor(this.teamOn ? Tokens.accent : Tokens.dim2)
-      Blank()
-      Text(this.members.length > 0 ? this.members.length + ' 名成员' : '')
-        .fontSize(11)
-        .fontColor(Tokens.dim2)
+    // 完全没有团队记录时不要再补一行「这个会话没有团队记录」：下面的空态已经说清楚了，
+    // 两句话叠在一起反而像两条互不相干的提示。
+    if (this.sawMode) {
+      Row() {
+        Text(this.teamOn ? '团队协作已开' : '团队协作没开')
+          .fontSize(12)
+          .fontColor(this.teamOn ? Tokens.accent : Tokens.dim2)
+        Blank()
+        Text(this.members.length > 0 ? this.members.length + ' 名成员' : '')
+          .fontSize(11)
+          .fontColor(Tokens.dim2)
+      }
+      .width('100%')
+      .padding({ left: 4, right: 4, top: 2, bottom: 10 })
     }
-    .width('100%')
-    .padding({ left: 4, right: 4, top: 2, bottom: 10 })
 
     if (this.members.length > 0) {
       Text('成员')
-        .fontSize(11.5)
+        .fontSize(12)
         .fontColor(Tokens.dim2)
         .width('100%')
         .padding({ left: 4, bottom: 8 })
@@ -712,7 +725,7 @@ export struct ExtrasPanel {
         Column() {
           Row() {
             Text(m.name === '' ? m.id : m.name)
-              .fontSize(14)
+              .fontSize(13)
               .fontColor(Tokens.fg)
               .layoutWeight(1)
               .maxLines(1)
@@ -725,7 +738,7 @@ export struct ExtrasPanel {
 
           if (m.description !== '') {
             Text(m.description)
-              .fontSize(11.5)
+              .fontSize(12)
               .fontColor(Tokens.dim2)
               .width('100%')
               .margin({ top: 4 })
@@ -746,20 +759,20 @@ export struct ExtrasPanel {
         .padding({ left: 12, right: 12, top: 10, bottom: 10 })
         .margin({ bottom: 6 })
         .backgroundColor(Tokens.surface)
-        .borderRadius(12)
+        .borderRadius(14)
       }, (m: TeamMemberRow) => m.id + m.phase)
     }
 
     if (this.teamTasks.length > 0) {
       Text('任务板')
-        .fontSize(11.5)
+        .fontSize(12)
         .fontColor(Tokens.dim2)
         .width('100%')
         .padding({ left: 4, top: 10, bottom: 8 })
       ForEach(this.teamTasks, (t: TeamTaskRow) => {
         Column() {
           Text(t.subject === '' ? t.id : t.subject)
-            .fontSize(14)
+            .fontSize(13)
             .fontColor(Tokens.fg)
             .width('100%')
             .maxLines(2)
@@ -778,7 +791,7 @@ export struct ExtrasPanel {
             }
             Blank()
             Text('#' + String(t.revision))
-              .fontSize(10.5)
+              .fontSize(11)
               .fontColor(Tokens.dim2)
           }
           .width('100%')
@@ -788,9 +801,150 @@ export struct ExtrasPanel {
         .padding({ left: 12, right: 12, top: 10, bottom: 10 })
         .margin({ bottom: 6 })
         .backgroundColor(Tokens.surface)
-        .borderRadius(12)
+        .borderRadius(14)
       }, (t: TeamTaskRow) => t.id + String(t.revision) + t.status)
     }
+  }
+
+  @Builder
+  private fsActionCard() {
+    Column() {
+      Column() {
+        Text(this.fsMenuName)
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.fg)
+          .width('100%')
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text('重命名')
+          .fontSize(14)
+          .fontColor(Tokens.fg)
+          .width('100%')
+          .padding({ top: 14, bottom: 12 })
+          .onClick(() => {
+            Haptics.tap();
+            this.renameTarget = this.join(this.fsMenuName);
+            this.renameName = this.fsMenuName;
+            this.fsMenuOn = false;
+            this.renameOn = true;
+          })
+        Divider().color(Tokens.lineSoft)
+        Text('删除')
+          .fontSize(14)
+          .fontColor(Tokens.err)
+          .width('100%')
+          .padding({ top: 12, bottom: 12 })
+          .onClick(() => {
+            this.fsMenuOn = false;
+            this.confirmDeleteFileByName(this.fsMenuName, this.fsMenuDir);
+          })
+        Divider().color(Tokens.lineSoft)
+        Text('取消')
+          .fontSize(14)
+          .fontColor(Tokens.dim)
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .padding({ top: 12, bottom: 4 })
+          .onClick(() => {
+            this.fsMenuOn = false;
+          })
+      }
+      .width('100%')
+      .padding(16)
+      .backgroundColor(Tokens.surface)
+      .borderRadius(Tokens.rCard)
+      .border({ width: 1, color: Tokens.lineSoft })
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 24, right: 24 })
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor('#66000000')
+  }
+
+  private confirmDeleteFileByName(name: string, dir: boolean): void {
+    AlertDialog.show({
+      title: dir ? '删除空目录' : '删除文件',
+      message: dir ? '只能删空目录；里面有东西请先在电脑上处理。' : '删除后无法从手机恢复。',
+      primaryButton: { value: '取消', action: () => {} },
+      secondaryButton: {
+        value: '删除',
+        fontColor: Tokens.err,
+        action: () => {
+          this.doDelete(this.join(name));
+        }
+      }
+    });
+  }
+
+  private async doDelete(target: string): Promise<void> {
+    if (this.fsBusy) {
+      return;
+    }
+    this.fsBusy = true;
+    try {
+      await this.api.fsDelete(this.sessionId, target);
+      Toast.ok('已删除');
+      await this.loadFiles(this.path);
+    } catch (err) {
+      Toast.err((err as Error).message);
+    } finally {
+      this.fsBusy = false;
+    }
+  }
+
+  private async doRename(): Promise<void> {
+    const next: string = this.renameName.trim();
+    if (next === '' || this.fsBusy) {
+      return;
+    }
+    this.fsBusy = true;
+    try {
+      await this.api.fsRename(this.sessionId, this.renameTarget, this.join(next));
+      this.renameOn = false;
+      Toast.ok('已重命名');
+      await this.loadFiles(this.path);
+    } catch (err) {
+      Toast.err((err as Error).message);
+    } finally {
+      this.fsBusy = false;
+    }
+  }
+
+  private mtimeText(ms: number): string {
+    const d = new Date(ms);
+    const m = d.getMonth() + 1;
+    const day = d.getDate();
+    const h = d.getHours();
+    const mi = d.getMinutes();
+    return m + '/' + day + ' ' + (h < 10 ? '0' : '') + h + ':' + (mi < 10 ? '0' : '') + mi;
+  }
+
+  private fsRows(): FsEntry[] {
+    const kw: string = this.fsQuery.trim().toLowerCase();
+    const out: FsEntry[] = [];
+    for (let i = 0; i < this.entries.length; i++) {
+      const e: FsEntry = this.entries[i];
+      if (kw === '' || e.name.toLowerCase().indexOf(kw) >= 0) {
+        out.push(e);
+      }
+    }
+    out.sort((a: FsEntry, b: FsEntry) => {
+      if (a.dir !== b.dir) {
+        return a.dir ? -1 : 1;
+      }
+      if (this.fsSort === 'time') {
+        return b.mtime - a.mtime;
+      }
+      if (this.fsSort === 'size') {
+        return b.size - a.size;
+      }
+      const x: string = a.name.toLowerCase();
+      const y: string = b.name.toLowerCase();
+      return x < y ? -1 : (x > y ? 1 : 0);
+    });
+    return out;
   }
 
   @Builder
@@ -820,55 +974,118 @@ export struct ExtrasPanel {
           .width(26)
           .textAlign(TextAlign.Center)
         Text('上一级')
-          .fontSize(14)
+          .fontSize(13)
           .fontColor(Tokens.dim)
       }
       .width('100%')
       .padding({ left: 8, right: 12, top: 10, bottom: 10 })
       .margin({ bottom: 6 })
       .backgroundColor(Tokens.surface)
-      .borderRadius(12)
+      .borderRadius(14)
       .onClick(() => {
         this.up();
       })
     }
 
-    ForEach(this.entries, (e: FsEntry) => {
+    Row({ space: 8 }) {
+      TextInput({ placeholder: '过滤当前目录', text: this.fsQuery })
+        .height(34)
+        .fontSize(12)
+        .borderRadius(17)
+        .backgroundColor(Tokens.surface2)
+        .placeholderColor(Tokens.dim2)
+        .layoutWeight(1)
+        .onChange((v: string) => {
+          this.fsQuery = v;
+        })
+      ForEach(['name', 'time', 'size'], (k: string) => {
+        Text(k === 'name' ? '名称' : (k === 'time' ? '时间' : '大小'))
+          .fontSize(11)
+          .fontColor(this.fsSort === k ? Tokens.accentInk : Tokens.dim)
+          .backgroundColor(this.fsSort === k ? Tokens.accent : Tokens.surface2)
+          .borderRadius(Tokens.rPill)
+          .padding({ left: 9, right: 9, top: 5, bottom: 5 })
+          .onClick(() => {
+            Haptics.tap();
+            this.fsSort = k;
+          })
+      }, (k: string) => k)
+    }
+    .width('100%')
+    .margin({ bottom: 6 })
+    .alignItems(VerticalAlign.Center)
+
+    if (this.entries.length === 0) {
+      Text('这个文件夹是空的')
+        .fontSize(12)
+        .fontColor(Tokens.dim2)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .padding({ top: 24 })
+    } else if (this.fsRows().length === 0) {
+      Text('没有匹配的文件')
+        .fontSize(12)
+        .fontColor(Tokens.dim2)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .padding({ top: 24 })
+    }
+
+    ForEach(this.fsRows(), (e: FsEntry) => {
       Row() {
         Text(e.dir ? '▸' : (this.isImage(e.name) ? '◫' : '·'))
-          .fontSize(14)
+          .fontSize(13)
           .fontColor(e.dir ? Tokens.accent : Tokens.dim2)
           .width(26)
           .textAlign(TextAlign.Center)
         Column() {
           Text(e.name)
-            .fontSize(14)
+            .fontSize(13)
             .fontColor(Tokens.fg)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          if (!e.dir) {
-            Text(this.sizeText(e.size))
-              .fontSize(11)
-              .fontColor(Tokens.dim2)
-              .margin({ top: 2 })
-          }
+          Text(e.dir ? '文件夹' : (bytes(e.size) + ' · ' + this.mtimeText(e.mtime)))
+            .fontSize(11)
+            .fontColor(Tokens.dim2)
+            .margin({ top: 2 })
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
-        Text(e.dir ? '›' : '')
+        // ⋯ 与列表里的会话卡一致：手势在 List 里会被滚动吃掉，给一个明确入口。
+        Text('⋯')
           .fontSize(16)
+          .fontColor(Tokens.dim2)
+          .width(32)
+          .height(32)
+          .textAlign(TextAlign.Center)
+          .borderRadius(999)
+          .onClick(() => {
+            Haptics.tap();
+            this.fsMenuName = e.name;
+            this.fsMenuDir = e.dir;
+            this.fsMenuOn = true;
+          })
+        Text(e.dir ? '›' : '')
+          .fontSize(15)
           .fontColor(Tokens.dim2)
       }
       .width('100%')
       .padding({ left: 8, right: 12, top: 10, bottom: 10 })
       .margin({ bottom: 6 })
       .backgroundColor(Tokens.surface)
-      .borderRadius(12)
+      .borderRadius(14)
       .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
       .onClick(() => {
         this.openEntry(e);
       })
-    }, (e: FsEntry) => e.name + (e.dir ? '/d' : '/f'))
+      .gesture(LongPressGesture({ repeat: false })
+        .onAction(() => {
+          Haptics.long();
+          this.fsMenuName = e.name;
+          this.fsMenuDir = e.dir;
+          this.fsMenuOn = true;
+        }))
+    }, (e: FsEntry) => e.name + (e.dir ? '/d' : '/f') + String(e.mtime))
 
     if (this.more) {
       Text('这个目录内容较多，只显示前 400 项')
@@ -914,7 +1131,7 @@ export struct ExtrasPanel {
                 .width('100%')
                 .padding({ left: 12, right: 12, top: 10, bottom: 10 })
                 .backgroundColor(Tokens.surface)
-                .borderRadius(12)
+                .borderRadius(14)
                 .margin({ bottom: 10 })
               }
 
@@ -964,6 +1181,12 @@ export struct ExtrasPanel {
       if (this.imageOn) {
         this.imageOverlay()
       }
+      if (this.fsMenuOn) {
+        this.fsActionCard()
+      }
+      if (this.renameOn) {
+        this.renameCard()
+      }
     }
     .width('100%')
     .height('100%')
@@ -980,12 +1203,12 @@ export struct ExtrasPanel {
           .height(13)
           .color(Tokens.dim2)
         Text('保存中')
-          .fontSize(12.5)
+          .fontSize(13)
           .fontColor(Tokens.dim2)
           .margin({ left: 4 })
       } else {
         Text(label)
-          .fontSize(12.5)
+          .fontSize(13)
           .fontColor(Tokens.fg)
       }
     }
@@ -1004,7 +1227,7 @@ export struct ExtrasPanel {
     Column() {
       Row() {
         Text(this.viewerName)
-          .fontSize(14)
+          .fontSize(13)
           .fontColor(Tokens.fg)
           .layoutWeight(1)
           .maxLines(1)
@@ -1030,7 +1253,7 @@ export struct ExtrasPanel {
             .fontSize(15)
             .fontColor(Tokens.fg)
           Text('它不是文本文件，可以保存到手机再用别的应用打开')
-            .fontSize(12.5)
+            .fontSize(13)
             .fontColor(Tokens.dim2)
             .textAlign(TextAlign.Center)
             .padding({ left: 24, right: 24 })
@@ -1041,12 +1264,12 @@ export struct ExtrasPanel {
                 .height(15)
                 .color(Tokens.dim2)
               Text('保存中')
-                .fontSize(13.5)
+                .fontSize(13)
                 .fontColor(Tokens.dim2)
                 .margin({ left: 6 })
             } else {
               Text('保存到手机')
-                .fontSize(13.5)
+                .fontSize(13)
                 .fontColor(Tokens.accentInk)
             }
           }
@@ -1087,6 +1310,65 @@ export struct ExtrasPanel {
   }
 
   @Builder
+  private renameCard() {
+    Column() {
+      Column() {
+        Text('重命名')
+          .fontSize(15)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.fg)
+          .width('100%')
+        TextInput({ text: this.renameName, placeholder: '新名字' })
+          .height(42)
+          .fontSize(13)
+          .borderRadius(Tokens.rInput)
+          .backgroundColor(Tokens.surface2)
+          .margin({ top: 12 })
+          .onChange((v: string) => {
+            this.renameName = v;
+          })
+        Row() {
+          Text('取消')
+            .fontSize(13)
+            .fontColor(Tokens.fg)
+            .layoutWeight(1)
+            .height(42)
+            .textAlign(TextAlign.Center)
+            .borderRadius(Tokens.rInput)
+            .backgroundColor(Tokens.surface2)
+            .onClick(() => {
+              this.renameOn = false;
+            })
+          Text(this.fsBusy ? '保存中' : '保存')
+            .fontSize(13)
+            .fontColor(Tokens.accentInk)
+            .layoutWeight(1)
+            .height(42)
+            .textAlign(TextAlign.Center)
+            .borderRadius(Tokens.rInput)
+            .backgroundColor(Tokens.accent)
+            .margin({ left: 10 })
+            .onClick(() => {
+              this.doRename();
+            })
+        }
+        .width('100%')
+        .margin({ top: 14 })
+      }
+      .width('100%')
+      .padding(16)
+      .backgroundColor(Tokens.surface)
+      .borderRadius(Tokens.rCard)
+      .border({ width: 1, color: Tokens.lineSoft })
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 24, right: 24 })
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor('#66000000')
+  }
+
+  @Builder
   private imageOverlay() {
     Column() {
       Row() {
@@ -1109,13 +1391,24 @@ export struct ExtrasPanel {
       .padding({ top: 48, left: 18, right: 12, bottom: 6 })
 
       // 点图片关闭：整块都挂点击会连保存一起关掉，所以只挂在图片上
-      Image(this.api.fsRawUrl(this.sessionId, this.imagePath))
+      if (this.api.fsRawUrl(this.sessionId, this.imagePath) !== '') {
+        Image(this.api.fsRawUrl(this.sessionId, this.imagePath))
+          .width('100%')
+          .layoutWeight(1)
+          .objectFit(ImageFit.Contain)
+          .onClick(() => {
+            this.imageOn = false;
+          })
+      } else {
+        Column() {
+          Text('图片签名没拿到，稍后重试')
+            .fontSize(13)
+            .fontColor('#CCCCCC')
+        }
         .width('100%')
         .layoutWeight(1)
-        .objectFit(ImageFit.Contain)
-        .onClick(() => {
-          this.imageOn = false;
-        })
+        .justifyContent(FlexAlign.Center)
+      }
 
       Text('点图片关闭')
         .fontSize(12)

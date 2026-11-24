@@ -1,7 +1,7 @@
 import { Api, PermRow, PresetRow } from '../common/Api';
 import { Tokens } from '../common/Tokens';
 import { ChatParam } from '../common/Types';
-import { NavFx, NavFxSink } from '../common/NavFx';
+import { PageHeader } from '../common/Chrome';
 
 /**
  * Two session-level switches that live outside the model picker:
@@ -24,33 +24,6 @@ export struct PresetsPage {
   @State private loading: boolean = true;
   @State private err: string = '';
   @State private note: string = '';
-  /** 转场状态：由 Navigation 的 customNavContentTransition 按 navDestinationId 驱动。 */
-  @State private fxTx: string = '0%';
-  @State private fxOp: number = 1;
-  @State private fxSc: number = 1;
-  private fxId: string = '';
-  private fxSink: NavFxSink | undefined = undefined;
-
-  /** 把本页的转场状态登记给 Navigation。 */
-  private bindFx(id: string): void {
-    const sink: NavFxSink = {
-      apply: (tx: string, op: number, sc: number): void => {
-        this.fxTx = tx;
-        this.fxOp = op;
-        this.fxSc = sc;
-      }
-    };
-    this.fxId = id;
-    this.fxSink = sink;
-    NavFx.register(id, sink);
-  }
-
-  aboutToDisappear(): void {
-    const s = this.fxSink;
-    if (s !== undefined) {
-      NavFx.unregister(this.fxId, s);
-    }
-  }
 
   aboutToAppear(): void {
     this.load();
@@ -113,7 +86,7 @@ export struct PresetsPage {
             .width(20)
             .height(20)
             .fill(Tokens.accentStrong)
-          Text('✓')
+          Text('√')
             .fontSize(12)
             .fontWeight(FontWeight.Bold)
             .fontColor('#FFFFFF')
@@ -132,12 +105,12 @@ export struct PresetsPage {
 
       Column() {
         Text(title)
-          .fontSize(14.5)
+          .fontSize(15)
           .fontWeight(active ? FontWeight.Medium : FontWeight.Normal)
           .fontColor(active ? Tokens.accent : Tokens.fg)
         if (sub !== '') {
           Text(sub)
-            .fontSize(11.5)
+            .fontSize(12)
             .fontColor(Tokens.dim2)
             .margin({ top: 3 })
             .maxLines(2)
@@ -170,44 +143,19 @@ export struct PresetsPage {
   build() {
     NavDestination() {
       Column() {
-        Row() {
-          Text('‹')
-            .fontSize(30)
-            .fontColor(Tokens.fg)
-            .width(34)
-            .height(34)
-            .textAlign(TextAlign.Center)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => this.stack.pop())
-          Column() {
-            Text('预设与权限')
-              .fontSize(16)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(Tokens.fg)
-            Text(this.param.title !== '' ? this.param.title : '当前会话')
-              .fontSize(11)
-              .fontColor(Tokens.dim2)
-              .margin({ top: 2 })
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
+        PageHeader({
+          title: '预设与权限',
+          subtitle: this.param.title !== '' ? this.param.title : '当前会话',
+          rightKind: 'label',
+          rightLabel: '刷新',
+          onBack: () => {
+            this.stack.pop();
+          },
+          onRight: () => {
+            this.load();
           }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-          .margin({ left: 4 })
-
-          Text('刷新')
-            .fontSize(12.5)
-            .fontColor(Tokens.dim)
-            .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-            .borderRadius(999)
-            .border({ width: 1, color: Tokens.line })
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => {
-              this.load();
-            })
-        }
-        .width('100%')
-        .padding({ left: 8, right: 14, top: 8, bottom: 8 })
+        })
+        .padding({ left: 16, right: 16 })
 
         if (this.err !== '') {
           Text(this.err)
@@ -242,7 +190,7 @@ export struct PresetsPage {
                 .height(60)
               } else if (this.presets.length === 0) {
                 Text('宿主没有提供预设目录')
-                  .fontSize(12.5)
+                  .fontSize(13)
                   .fontColor(Tokens.dim2)
                   .width('100%')
                   .margin({ bottom: 12 })
@@ -263,7 +211,7 @@ export struct PresetsPage {
 
               if (this.permPresets.length === 0) {
                 Text('宿主没有提供权限目录')
-                  .fontSize(12.5)
+                  .fontSize(13)
                   .fontColor(Tokens.dim2)
                   .width('100%')
                   .margin({ bottom: 20 })
@@ -290,15 +238,6 @@ export struct PresetsPage {
     }
     .hideTitleBar(true)
     .backgroundColor(Tokens.bg)
-    .onReady((context: NavDestinationContext) => {
-      const id: string | undefined = context.navDestinationId;
-      if (id !== undefined && id !== '') {
-        this.bindFx(id);
-      }
-    })
-    .translate({ x: this.fxTx })
-    .opacity(this.fxOp)
-    .scale({ x: this.fxSc, y: this.fxSc })
   }
 }
 

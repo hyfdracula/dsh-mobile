@@ -28,7 +28,7 @@ export class Haptics {
     try {
       vibrator.startVibration(
         { type: 'time', duration: ms },
-        { id: 0, usage: 'unknown' }
+        { id: 0, usage: 'touch' }
       ).catch((e: Error) => {
         console.error('DSH_HAP fail :: ' + e.message);
       });

@@ -4,37 +4,14 @@ import curves from '@ohos.curves';
 import pasteboard from '@ohos.pasteboard';
 import { Api, PreviewRow, SessionRow } from '../common/Api';
 import { Tokens } from '../common/Tokens';
+import { ago, dayKey, wsOf } from '../common/Format';
 import { Machines, Machine } from '../common/Machines';
 import { Marks } from '../common/Marks';
 import { Haptics } from '../common/Haptics';
 import { Mat } from '../common/Mat';
+import { Toast } from '../common/Toast';
 import { BlurStrategy, HdsNavDestination, HdsNavigationTitleBarOptions, HdsNavigationBackgroundStyle, HdsNavigationTitleBarStyle, HdsNavigation, ScrollEffectOptions, TitleBarContentOptions, TitleBarStyleOptions, hdsMaterial } from '@kit.UIDesignKit';
 import { ChatParam } from '../common/Types';
-
-function ago(ms: number): string {
-  const d = Date.now() - ms;
-  if (d < 60_000) return '刚刚';
-  if (d < 3_600_000) return Math.floor(d / 60_000) + ' 分钟前';
-  if (d < 86_400_000) return Math.floor(d / 3_600_000) + ' 小时前';
-  if (d < 172_800_000) return '昨天';
-  return Math.floor(d / 86_400_000) + ' 天前';
-}
-
-function dayKey(ms: number): string {
-  const now = new Date();
-  const t = new Date(ms);
-  const a = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const b = new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime();
-  const diff = Math.round((a - b) / 86_400_000);
-  if (diff <= 0) return '今天';
-  if (diff === 1) return '昨天';
-  return '更早';
-}
-
-function wsOf(cwd: string): string {
-  const parts = cwd.split(/[\\/]/).filter((s: string) => s.length > 0);
-  return parts.length > 0 ? parts[parts.length - 1] : '默认';
-}
 
 interface RowModel {
   kind: string;
@@ -78,6 +55,11 @@ export struct SessionTile {
   @Prop count: number = 0;
   /** 归档视图里 ⋮ 菜单的第三项改成「恢复」，与左滑操作保持一致 */
   @Prop archivedView: boolean = false;
+  /** 多选模式：卡片左侧出现勾选圈，点整卡是勾选而不是进会话。 */
+  @Prop selectMode: boolean = false;
+  @Prop checked: boolean = false;
+  onToggle: () => void = () => {};
+  onLongSelect: () => void = () => {};
 
   onTap: () => void = () => {};
   onRename: () => void = () => {};
@@ -88,16 +70,13 @@ export struct SessionTile {
   @StorageLink('themeDark') themeDark: boolean = true;
   // 状态标记（done / interrupted）存在 Marks 里，靠这个版本号触发重绘
   @StorageLink('marksVer') marksVer: number = 0;
-  /** 系统点击反馈由 clickEffect 负责，卡片自己不再维护按压态 */
-  @State private pressed: boolean = false;
   /** 点 ⋮ 时先把这一行存进来，菜单 builder 就不用带参数绑定了 */
   @State private menuRow: SessionRow = { id: '', title: '', updatedAt: 0, cwd: '', running: false };
   /** 点 ⋮ 的时刻：万一这次点击继续冒泡，别让卡片把它当成「进入会话」 */
   private menuAt: number = 0;
 
-  /** 卡片状态：asking 黄、running 蓝、中断 红、完成 绿、其余无色。 */
-  private glowKind(): string {
-    // 在等你回答时这一轮仍算 running，但用户看到的应该是「该我了」的黄色，所以 asking 优先于 running。
+  private statusKind(): string {
+    // 在等你回答时这一轮仍算 running，但用户看到的应该是「该我了」，所以 asking 优先于 running。
     if (this.row.asking === true) {
       return 'asking';
     }
@@ -114,61 +93,73 @@ export struct SessionTile {
     return '';
   }
 
-  private glowBg(): string {
-    const k: string = this.glowKind();
-    // 底色跟着主题走：原生卡片是不透明的，状态只用淡淡的色相标出来
-    const dark: boolean = Tokens.isDark;
+  /** 徽标文字：四态各一句，其余不画徽标 */
+  private statusLabel(): string {
+    const k: string = this.statusKind();
     if (k === 'running') {
-      return dark ? '#182235' : '#EAF2FF';
+      return '进行中';
     }
     if (k === 'asking') {
-      return dark ? '#2A2418' : '#FFF6E5';
+      return '等你回答';
     }
     if (k === 'interrupted') {
-      return dark ? '#2A1A1A' : '#FFEDED';
+      return '已中断';
     }
     if (k === 'done') {
-      return dark ? '#152A20' : '#EAF9F0';
+      return '已完成';
     }
-    return dark ? Tokens.surface : '#FFFFFF';
+    return '';
   }
 
-  private glowEdge(): string {
-    const k: string = this.glowKind();
+  private statusInk(): string {
+    const k: string = this.statusKind();
     if (k === 'running') {
-      return '#803B82F6';
+      return Tokens.runInk;
     }
     if (k === 'asking') {
-      return '#80F5A623';
+      return Tokens.askInk;
     }
     if (k === 'interrupted') {
-      return '#80FF3B30';
+      return Tokens.intrInk;
     }
-    if (k === 'done') {
-      return '#8034C759';
-    }
-    return Tokens.isDark ? Tokens.lineSoft : '#E8EAF0';
+    return Tokens.doneInk;
   }
 
-  private glowShadow(): string {
-    const k: string = this.glowKind();
+  private statusBg(): string {
+    const k: string = this.statusKind();
     if (k === 'running') {
-      return '#4D3B82F6';
+      return Tokens.runBg;
     }
     if (k === 'asking') {
-      return '#4DF5A623';
+      return Tokens.askBg;
     }
     if (k === 'interrupted') {
-      return '#4DFF3B30';
+      return Tokens.intrBg;
     }
-    if (k === 'done') {
-      return '#4D34C759';
-    }
-    return Tokens.accentGlow;
+    return Tokens.doneBg;
   }
 
-  private hasGlow(): boolean {
-    return this.glowKind() !== '';
+  /**
+   * 状态徽标：8 圆点 + 10.5 号字，一块淡底 pill。
+   * 以前是整卡调色 + 彩边 + 彩色阴影，一屏里十几张卡都在发光，用户根本看不出哪张重要；
+   * 现在卡片一律中性，状态只占右上角这么一小块。
+   */
+  @Builder
+  statusBadge() {
+    Row({ space: 5 }) {
+      Row()
+        .width(8)
+        .height(8)
+        .borderRadius(6)
+        .backgroundColor(this.statusInk())
+      Text(this.statusLabel())
+        .fontSize(11)
+        .fontColor(this.statusInk())
+    }
+    .height(21)
+    .padding({ left: 7, right: 7 })
+    .borderRadius(Tokens.rPill)
+    .backgroundColor(this.statusBg())
   }
 
   /**
@@ -213,49 +204,95 @@ export struct SessionTile {
 
   build() {
     Row() {
+      if (this.selectMode) {
+        Stack() {
+          if (this.checked) {
+            Text('√')
+              .fontSize(12)
+              .fontColor(Tokens.accentInk)
+          }
+        }
+        .width(22)
+        .height(22)
+        .borderRadius(999)
+        .backgroundColor(this.checked ? Tokens.accent : Color.Transparent)
+        .border({ width: 1.5, color: this.checked ? Tokens.accent : Tokens.line })
+        .margin({ right: 10 })
+        .alignContent(Alignment.Center)
+      }
       Column() {
         Row() {
           Text(this.row.title === '' ? '(untitled)' : this.row.title)
-            .fontSize(16)
+            .fontSize(15)
             .fontWeight(FontWeight.Medium)
             .fontColor(Tokens.fg)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .layoutWeight(1)
+          // 「置顶」和状态徽标同一造型，但留在标题行右侧：两者挤在同一个角上会互相顶。
           if (this.row.pinned === true) {
-            Text('置顶')
-              .fontSize(10)
-              .fontColor(Tokens.accent)
-              .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-              .backgroundColor(Tokens.accentSoft)
-              .borderRadius(999)
-              .margin({ left: 8 })
+            Row() {
+              Text('置顶')
+                .fontSize(11)
+                .fontColor(Tokens.accent)
+            }
+            .height(21)
+            .padding({ left: 7, right: 7 })
+            .borderRadius(Tokens.rPill)
+            .backgroundColor(Tokens.accentSoft)
+            .margin({ left: 8 })
           }
         }
         .width('100%')
 
         Row() {
           Text(ago(this.row.updatedAt))
-            .fontSize(11.5)
+            .fontSize(12)
             .fontColor(Tokens.dim2)
           Text(wsOf(this.row.cwd))
-            .fontSize(11.5)
+            .fontSize(12)
             .fontColor(Tokens.dim2)
             .margin({ left: 10 })
+          Blank()
+          // 徽标放在元信息行右侧：不额外占一行，卡片高度就不会因为「有状态」而变化。
+          if (this.statusKind() !== '') {
+            this.statusBadge()
+          }
         }
         .width('100%')
         .margin({ top: 6 })
+        .alignItems(VerticalAlign.Center)
+        // 宿主已经给了最后一条摘要与条数：放一行，扫列表时不用逐个点开。
+        if (this.preview !== '') {
+          Row() {
+            Text(this.preview)
+              .fontSize(12)
+              .fontColor(Tokens.dim)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            if (this.count > 0) {
+              Text(String(this.count) + ' 条')
+                .fontSize(11)
+                .fontColor(Tokens.dim2)
+                .margin({ left: 8 })
+            }
+          }
+          .width('100%')
+          .margin({ top: 5 })
+          .alignItems(VerticalAlign.Center)
+        }
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
       // 右侧 ⋮：点开菜单前先把本行存进 @State，菜单 builder 无参
       Text('⋮')
-        .fontSize(18)
+        .fontSize(17)
         .fontColor(Tokens.dim)
         .width(32)
         .height(32)
         .textAlign(TextAlign.Center)
-        .borderRadius(16)
+        .borderRadius(20)
         .margin({ left: 4 })
         .accessibilityText('会话菜单')
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
@@ -269,25 +306,27 @@ export struct SessionTile {
     .width('100%')
     .padding({ left: 12, right: 8, top: 12, bottom: 12 })
     .borderRadius(Tokens.rCard)
-    .backgroundColor(this.glowBg())
-    .border({
-      width: this.hasGlow() ? 1.2 : 1,
-      color: this.glowEdge()
-    })
-    // 原生观感：不自己画按压缩放/弹簧，交给 ListItem 的系统点击反馈；
-    // 状态色仍靠一圈细边表示，但不加阴影，避免像「浮起来的自绘卡片」。
-    .shadow({
-      radius: this.hasGlow() ? 10 : 0,
-      color: this.glowShadow(),
-      offsetY: 0
-    })
+    // 卡片只做一块中性底板：状态全部交给右上角那枚小徽标。
+    // 以前整卡调色 + 彩边 + 彩色阴影，一屏十几张都在发光，反而看不出哪张在跑。
+    .backgroundColor(Tokens.surface)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
     .onClick(() => {
       // 刚点过 ⋮ 就不要再进会话
       if (Date.now() - this.menuAt < 350) {
         return;
       }
+      if (this.selectMode) {
+        this.onToggle();
+        return;
+      }
       this.onTap();
     })
+    .gesture(LongPressGesture({ repeat: false })
+      .onAction(() => {
+        if (!this.selectMode) {
+          this.onLongSelect();
+        }
+      }))
   }
 }
 
@@ -341,7 +380,7 @@ export struct SessionList {
     this.load();
   }
 
-  /** 首页「换电脑」：当前电脑名与弹层开关（machineName 由 Index 传下来） */
+  /** 换电脑弹层。machineName 仍由 Index 传进来：顶栏不再显示它，但删了这个 @Prop 会让父级传参报错 */
   @Prop machineName: string = '';
   onPickMachine: (id: string) => void = () => {};
   @StorageLink('machinesVer') machinesVer: number = 0;
@@ -351,6 +390,8 @@ export struct SessionList {
   /** 通知点进来时要打开的会话：EntryAbility 写 AppStorage，这里跳转 */
   @State private groupBy: string = 'time';
   @State private listState: string = 'all';
+  /** 排序：recent（最近活动）/ title（标题）。 */
+  @State private sortBy: string = 'recent';
 
   @State private err: string = '';
   @State private q: string = '';
@@ -358,11 +399,13 @@ export struct SessionList {
   /** 搜索胶囊横向展开进度：点搜索时先置 0.12 再置 1，靠隐式动画从按钮处流水般铺开。 */
   @State private searchGrow: number = 1;
   @State private ws: string = '';
-  @State private enter: boolean = false;
   @State private creating: boolean = false;
-  @State private toast: string = '';
   @State private refreshing: boolean = false;
-  @State private scrollY: number = 0;
+  /**
+   * 首屏 9 秒还没回来、被轮询接管之后列表仍然是空的：
+   * 这种情况不是「还没有会话」，是根本没拿到，空态要给「重试」而不是「点右下角 + 新建」。
+   */
+  @State private timedOut: boolean = false;
   // 重命名弹窗盖住底部 Tab：置位时让 ShellPage 把 Tab 栏收掉
   @State @Watch('syncSheet') private renameOn: boolean = false;
   // 新建工作区：填一个名字和父目录，宿主机接受不存在的新目录会自动建出来
@@ -377,11 +420,16 @@ export struct SessionList {
   /** 交给 HDS 标题栏的 bindToScrollable，用来驱动滚动模糊 */
   private scroller: Scroller = new Scroller();
   @State private archivedView: boolean = false;
+  /** 多选：进入后整卡点击切换勾选，顶部出现批量操作条。 */
+  @State private selectOn: boolean = false;
+  @State private selected: string[] = [];
   /** 折叠起来的日期分组（置顶那组永远展开，不参与折叠） */
   @State private folded: string[] = [];
   @State private renameId: string = '';
   @State private renameText: string = '';
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
+  /** 网络状态：离线时列表顶部给一条明确提示，而不是让请求转到超时。 */
+  @StorageLink('online') online: boolean = true;
   /** 上次列表的指纹：轮询时只有真的变了才替换数据，避免无谓重绘 */
   private rowSig: string = '';
   private poll: number = 0;
@@ -392,11 +440,16 @@ export struct SessionList {
     this.load();
     // 列表要能自己更新：会话在跑/跑完/等你回答都会改变卡片颜色，不能只在进页面时读一次
     this.poll = setInterval(() => {
+      // 退到后台、或用户在设置页时不必每 8 秒拉一次全表；回来时 onPageShow/切 tab 会立刻补一次。
+      if (AppStorage.get<boolean>('appFg') === false) {
+        return;
+      }
+      const tab: number | undefined = AppStorage.get<number>('shellTab');
+      if (tab !== undefined && tab !== 0) {
+        return;
+      }
       this.pollRows();
     }, 8000);
-    setTimeout(() => {
-      this.enter = true;
-    }, 40);
   }
 
   aboutToDisappear(): void {
@@ -410,7 +463,8 @@ export struct SessionList {
     const parts: string[] = [];
     for (let i = 0; i < rows.length; i++) {
       const r: SessionRow = rows[i];
-      parts.push(r.id + ':' + r.updatedAt + ':' + (r.running ? '1' : '0') + ':' + (r.asking === true ? '1' : '0'));
+      parts.push(r.id + ':' + r.updatedAt + ':' + (r.running ? '1' : '0') + ':' + (r.asking === true ? '1' : '0') +
+        ':' + r.title + ':' + (r.pinned === true ? '1' : '0'));
     }
     return parts.join(',');
   }
@@ -424,12 +478,17 @@ export struct SessionList {
       }
       this.loading = false;
       this.loadSlow = false;
+      // 本轮是「超时接管」而不是正常首屏：先记下来，这次还是拿不到就给重试入口，
+      // 否则接管后剩下的只是一块空白。
+      this.timedOut = true;
     }
     if (this.renameOn || this.creating) {
       return;
     }
     try {
       const rows = await this.api.sessions();
+      // 已经拿到回答了：无论内容与上次是否一样，都不再是「没拿到」的状态
+      this.timedOut = false;
       const want = this.archivedView;
       const live = rows.filter((r: SessionRow) => (r.archived === true) === want);
       const sorted = live.sort((a: SessionRow, b: SessionRow) => b.updatedAt - a.updatedAt);
@@ -464,6 +523,7 @@ export struct SessionList {
       const live = rows.filter((r: SessionRow) => (r.archived === true) === want);
       this.rows = live.sort((a: SessionRow, b: SessionRow) => b.updatedAt - a.updatedAt);
       this.rowSig = this.sigOf(this.rows);
+      this.timedOut = false;
       console.info('DSH_LIST rows=' + this.rows.length);
       this.loadPreviews();
     } catch (e) {
@@ -499,10 +559,29 @@ export struct SessionList {
 
   private async loadPreviews(): Promise<void> {
     try {
-      const ids: string[] = this.rows.slice(0, 40).map((r: SessionRow) => r.id);
+      // 按「当前真正显示出来的行」取摘要（筛选/排序/归档视图都算），
+      // 以前固定取原始前 40 条，按工作区筛选后靠后的卡片就没有摘要。
+      const ids: string[] = [];
+      const ms: RowModel[] = this.models();
+      for (let i = 0; i < ms.length && ids.length < 60; i++) {
+        if (ms[i].kind === 'row' && ids.indexOf(ms[i].row.id) < 0) {
+          ids.push(ms[i].row.id);
+        }
+      }
+      if (ids.length === 0) {
+        return;
+      }
       const got = await this.api.previews(ids);
-      this.previews = got;
-      console.info('DSH_LIST previews=' + got.length);
+      // 合并而不是整体替换：已经拿到的摘要不会因为切换筛选而闪没。
+      const map: Map<string, PreviewRow> = new Map<string, PreviewRow>();
+      for (let i = 0; i < this.previews.length; i++) {
+        map.set(this.previews[i].id, this.previews[i]);
+      }
+      for (let i = 0; i < got.length; i++) {
+        map.set(got[i].id, got[i]);
+      }
+      this.previews = Array.from(map.values());
+      console.info('DSH_LIST previews=' + String(got.length));
     } catch (e) {
       console.info('DSH_LIST previews skipped :: ' + (e as Error).message);
     }
@@ -522,23 +601,6 @@ export struct SessionList {
       }
     }
     return 0;
-  }
-
-  private runningCount(): number {
-    let n = 0;
-    this.rows.forEach((r: SessionRow) => {
-      if (r.running) n++;
-    });
-    return n;
-  }
-
-  private weekCount(): number {
-    const cut = Date.now() - 7 * 86_400_000;
-    let n = 0;
-    this.rows.forEach((r: SessionRow) => {
-      if (r.updatedAt >= cut) n++;
-    });
-    return n;
   }
 
   private workspaces(): WsOpt[] {
@@ -564,7 +626,7 @@ export struct SessionList {
     return r.id + '|' + r.title + '|' + r.updatedAt + '|' + (r.running ? '1' : '0')
       + '|' + (r.asking === true ? '1' : '0') + '|' + Marks.get(r.id)
       + '|' + (r.pinned === true ? '1' : '0')
-      + '|' + this.countOf(r.id) + '|' + (this.previewOf(r.id) === '' ? '0' : '1');
+      + '|' + this.countOf(r.id) + '|' + this.previewOf(r.id);
   }
 
   private models(): RowModel[] {
@@ -572,8 +634,8 @@ export struct SessionList {
     const out: RowModel[] = [];
     let lastDay = '';
     // 置顶的排最前，单独成组
-    const pinned = this.archivedView ? [] : this.rows.filter((r: SessionRow) => r.pinned === true);
-    const rest = this.archivedView ? this.rows : this.rows.filter((r: SessionRow) => r.pinned !== true);
+    const pinned = this.archivedView ? [] : this.sortRows(this.rows.filter((r: SessionRow) => r.pinned === true));
+    const rest = this.sortRows(this.archivedView ? this.rows : this.rows.filter((r: SessionRow) => r.pinned !== true));
     const pinnedShown: SessionRow[] = pinned.filter((r: SessionRow) => {
       if (this.ws !== '' && wsOf(r.cwd) !== this.ws) return false;
       if (kw !== '' && (r.title === '' ? '(untitled)' : r.title).toLowerCase().indexOf(kw) < 0) return false;
@@ -616,6 +678,26 @@ export struct SessionList {
       out.push({ kind: 'row', label: '', key: this.rowKey(r), row: r });
     });
     return out;
+  }
+
+  /** 按当前排序方式给一份副本：标题排序时同名的按最近活动。 */
+  private sortRows(list: SessionRow[]): SessionRow[] {
+    if (this.sortBy !== 'title') {
+      return list;
+    }
+    const copy: SessionRow[] = list.slice();
+    copy.sort((a: SessionRow, b: SessionRow) => {
+      const x: string = (a.title === '' ? '(untitled)' : a.title).toLowerCase();
+      const y: string = (b.title === '' ? '(untitled)' : b.title).toLowerCase();
+      if (x < y) {
+        return -1;
+      }
+      if (x > y) {
+        return 1;
+      }
+      return b.updatedAt - a.updatedAt;
+    });
+    return copy;
   }
 
   /** 工作区分组的组名：路径末段，拿不到就给「其他」 */
@@ -671,8 +753,10 @@ export struct SessionList {
       const p: preferences.Preferences = preferences.getPreferencesSync(host, opts);
       const g: string = p.getSync('groupBy', 'time') as string;
       const st: string = p.getSync('listState', 'all') as string;
+      const sb: string = p.getSync('sortBy', 'recent') as string;
       this.groupBy = g === 'ws' ? 'ws' : 'time';
       this.listState = st === 'first' || st === 'none' ? st : 'all';
+      this.sortBy = sb === 'title' ? 'title' : 'recent';
     } catch (e) {
       console.info('DSH_VIEW load failed: ' + JSON.stringify(e));
     }
@@ -685,6 +769,7 @@ export struct SessionList {
       const p: preferences.Preferences = preferences.getPreferencesSync(host, opts);
       p.putSync('groupBy', this.groupBy);
       p.putSync('listState', this.listState);
+      p.putSync('sortBy', this.sortBy);
       p.flushSync();
     } catch (e) {
       console.info('DSH_VIEW save failed: ' + JSON.stringify(e));
@@ -694,6 +779,14 @@ export struct SessionList {
   private setGroupBy(g: string): void {
     Haptics.tap();
     this.groupBy = g;
+    this.viewOn = false;
+    this.saveListView();
+    this.applyListState();
+  }
+
+  private setSortBy(sb: string): void {
+    Haptics.tap();
+    this.sortBy = sb;
     this.viewOn = false;
     this.saveListView();
     this.applyListState();
@@ -736,11 +829,17 @@ export struct SessionList {
       : this.folded.concat([label]);
   }
 
+  /**
+   * 21 处操作共用这一句提示。以前它只往 @State toast 里写，而 build 里根本没有对应的节点，
+   * 于是所有「已置顶 / 已归档 / 新建失败」都是静默的。现在直接走系统轻提示；
+   * 文案里带「失败」的走错误态（停留更久），其余按成功处理，调用点一个都不用改。
+   */
   private flash(msg: string): void {
-    this.toast = msg;
-    setTimeout(() => {
-      this.toast = '';
-    }, 2200);
+    if (msg.indexOf('失败') >= 0) {
+      Toast.err(msg);
+      return;
+    }
+    Toast.ok(msg);
   }
 
   /** 建会话时可选的工作区：当前筛选的、最近用过的，去重保序。 */
@@ -780,12 +879,12 @@ export struct SessionList {
     Column() {
       Row() {
         Text('新建会话')
-          .fontSize(22)
+          .fontSize(24)
           .fontWeight(FontWeight.Bold)
           .fontColor(Tokens.fg)
         Blank()
         Text('×')
-          .fontSize(19)
+          .fontSize(20)
           .fontColor(Tokens.dim)
           .textAlign(TextAlign.Center)
           .width(38)
@@ -799,7 +898,7 @@ export struct SessionList {
       .height(56)
 
       Text('选一个工作区')
-        .fontSize(11.5)
+        .fontSize(12)
         .fontColor(Tokens.dim2)
         .width('100%')
 
@@ -813,10 +912,10 @@ export struct SessionList {
                 .width(30)
                 .height(30)
                 .textAlign(TextAlign.Center)
-                .borderRadius(9)
+                .borderRadius(10)
                 .backgroundColor(Tokens.accentSoft)
               Text(this.wsLabel(d))
-                .fontSize(14)
+                .fontSize(13)
                 .fontColor(Tokens.fg)
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -844,10 +943,10 @@ export struct SessionList {
               .width(30)
               .height(30)
               .textAlign(TextAlign.Center)
-              .borderRadius(9)
+              .borderRadius(10)
               .backgroundColor(Tokens.accentSoft)
             Text('另建一个工作区…')
-              .fontSize(14)
+              .fontSize(13)
               .fontColor(Tokens.fg)
               .layoutWeight(1)
           }
@@ -878,22 +977,6 @@ export struct SessionList {
     if (parts.length <= 1) return d;
     if (parts.length === 2) return parts[1];
     return parts[parts.length - 2] + '\\' + parts[parts.length - 1];
-  }
-
-  private async newSession(): Promise<void> {
-    if (this.creating) return;
-    this.creating = true;
-    try {
-      const cwd = this.rows.length > 0 ? this.rows[0].cwd : '';
-      const id = await this.api.createSession(cwd);
-      const p: ChatParam = { id: id, title: '新会话' };
-      this.stack.pushPathByName('chat', p);
-      this.flash('已新建会话');
-    } catch (e) {
-      this.flash('新建失败：' + (e as Error).message);
-    } finally {
-      this.creating = false;
-    }
   }
 
   private async doPin(r: SessionRow): Promise<void> {
@@ -1012,6 +1095,7 @@ export struct SessionList {
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
           .onClick(() => {
             this.ws = o.id;
+          void this.loadPreviews();
           })
       }, (o: WsOpt) => 'ws-' + o.id)
       // 新工作区就是宿主机上的一层新目录：建一个会话指向它，列表里自然多一项
@@ -1045,7 +1129,8 @@ export struct SessionList {
       const p: string = this.tidyPath(r.cwd);
       if (p !== '') return p;
     }
-    return 'C:\\Users\\19161\\Documents';
+    // 找不到任何已知工作区时交给宿主自己决定，别把作者的本机路径写死。
+    return '';
   }
 
   /** 宿主里可能存着带重复分隔符的路径（历史会话），显示与拼接前先压成单个 */
@@ -1061,11 +1146,11 @@ export struct SessionList {
   private wsPath(): string {
     const name: string = this.wsNewName.trim().replace(/[\\/:*?"<>|]/g, '');
     let dir: string = this.tidyPath(this.wsNewDir.trim());
-    if (dir === '') dir = 'C:\\Users\\19161\\Documents';
     while (dir.length > 1 && (dir.endsWith('\\') || dir.endsWith('/'))) {
       dir = dir.substring(0, dir.length - 1);
     }
     if (name === '') return '';
+    if (dir === '') return name;
     return dir + '\\' + name;
   }
 
@@ -1111,17 +1196,12 @@ export struct SessionList {
     }
   }
 
-  /** 分组标题不参与左滑，用空动作占位 */
-  @Builder
-  noSwipe() {
-  }
-
   /** 左滑露出的操作：置顶 / 归档，高度与会话卡片对齐 */
   @Builder
   swipeActions(r: SessionRow) {
     Row() {
       Text(r.pinned === true ? '取消置顶' : '置顶')
-        .fontSize(12.5)
+        .fontSize(13)
         .fontColor('#FFFFFF')
         .width(58)
         .height(58)
@@ -1133,7 +1213,7 @@ export struct SessionList {
           this.doPin(r);
         })
       Text(this.archivedView ? '恢复' : '归档')
-        .fontSize(12.5)
+        .fontSize(13)
         .fontColor('#FFFFFF')
         .width(58)
         .height(58)
@@ -1189,12 +1269,12 @@ export struct SessionList {
       Blank()
       Column() {
         Text('重命名会话')
-          .fontSize(16)
+          .fontSize(15)
           .fontWeight(FontWeight.Medium)
           .fontColor(Tokens.fg)
           .margin({ bottom: 14 })
         TextInput({ text: this.renameText, placeholder: '会话标题' })
-          .fontSize(14)
+          .fontSize(13)
           .fontColor(Tokens.fg)
           .placeholderColor(Tokens.dim2)
           .backgroundColor(Tokens.surface2)
@@ -1255,12 +1335,12 @@ export struct SessionList {
       Blank()
       Column() {
         Text('新建工作区')
-          .fontSize(16)
+          .fontSize(15)
           .fontWeight(FontWeight.Medium)
           .fontColor(Tokens.fg)
           .margin({ bottom: 14 })
         TextInput({ text: this.wsNewName, placeholder: '工作区名字，例如 my-project' })
-          .fontSize(14)
+          .fontSize(13)
           .fontColor(Tokens.fg)
           .placeholderColor(Tokens.dim2)
           .backgroundColor(Tokens.surface2)
@@ -1270,7 +1350,7 @@ export struct SessionList {
             this.wsNewName = v;
           })
         TextInput({ text: this.wsNewDir, placeholder: '放在哪个目录下' })
-          .fontSize(12.5)
+          .fontSize(13)
           .fontColor(Tokens.dim)
           .placeholderColor(Tokens.dim2)
           .backgroundColor(Tokens.surface2)
@@ -1282,7 +1362,7 @@ export struct SessionList {
           })
         // 建完实际落在这台电脑的哪个目录，先给用户看一眼
         Text(this.wsPath() === '' ? '会在电脑上新建这个目录' : this.wsPath())
-          .fontSize(11.5)
+          .fontSize(12)
           .fontColor(Tokens.dim2)
           .width('100%')
           .maxLines(2)
@@ -1331,23 +1411,6 @@ export struct SessionList {
     .onClick(() => {
       this.wsNewOn = false;
     })
-  }
-
-  /** 列表页顶部整块：工作区胶囊 + 搜索 + 统计。整块是浮层，列表从它底下滚过去。 */
-  /** 「192.168.1.3:8901」这种名字只留主机部分，胶囊里不占地方 */
-  private devShort(): string {
-    let n: string = this.machineName !== '' ? this.machineName : Machines.displayName();
-    n = n.replace('http://', '').replace('https://', '');
-    const cut: number = n.indexOf('/');
-    if (cut > 0) {
-      n = n.substring(0, cut);
-    }
-    // 去掉端口：胶囊里只留主机，够认得出来
-    const colon: number = n.lastIndexOf(':');
-    if (colon > 0 && n.indexOf(']') < colon) {
-      n = n.substring(0, colon);
-    }
-    return n;
   }
 
   @Builder
@@ -1421,13 +1484,13 @@ export struct SessionList {
   viewOpt(label: string, on: boolean, act: () => void) {
     Row() {
       Text(label)
-        .fontSize(13.5)
+        .fontSize(13)
         .fontColor(Tokens.fg)
         .layoutWeight(1)
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
       if (on) {
-        Text('✓')
+        Text('√')
           .fontSize(13)
           .fontColor(Tokens.accent)
       }
@@ -1435,7 +1498,7 @@ export struct SessionList {
     .width('100%')
     .height(38)
     .padding({ left: 12, right: 12 })
-    .borderRadius(9)
+    .borderRadius(10)
     .backgroundColor(on ? (Tokens.isDark ? '#26FFFFFF' : '#99FFFFFF') : Color.Transparent)
     .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
     .onClick(act)
@@ -1444,10 +1507,72 @@ export struct SessionList {
   @Builder
   viewHead(label: string) {
     Text(label)
-      .fontSize(10.5)
+      .fontSize(11)
       .fontColor(Tokens.dim2)
       .width('100%')
       .padding({ left: 12, top: 8, bottom: 4 })
+  }
+
+  private enterSelect(): void {
+    Haptics.tap();
+    this.viewOn = false;
+    this.selectOn = true;
+    this.selected = [];
+  }
+
+  private exitSelect(): void {
+    Haptics.soft();
+    this.selectOn = false;
+    this.selected = [];
+  }
+
+  private toggleOne(id: string): void {
+    Haptics.tap();
+    const at: number = this.selected.indexOf(id);
+    if (at >= 0) {
+      this.selected.splice(at, 1);
+    } else {
+      this.selected.push(id);
+    }
+  }
+
+  private selectAll(): void {
+    Haptics.tap();
+    // 「全选」只覆盖当前筛选/分组后真正显示出来的行，而不是把所有已加载会话都选中。
+    const ids: string[] = [];
+    const ms: RowModel[] = this.models();
+    for (let i = 0; i < ms.length; i++) {
+      if (ms[i].kind === 'row') {
+        ids.push(ms[i].row.id);
+      }
+    }
+    if (ids.length > 0 && this.selected.length === ids.length) {
+      this.selected = [];
+      return;
+    }
+    this.selected = ids;
+  }
+
+  /** 批量归档：逐条调用，失败也继续；最后统一提示成功几条。 */
+  private async archiveSelected(): Promise<void> {
+    if (this.selected.length === 0) {
+      return;
+    }
+    const ids: string[] = this.selected.slice();
+    Haptics.tap();
+    let ok: number = 0;
+    for (let i = 0; i < ids.length; i++) {
+      try {
+        if (await this.api.archive(ids[i])) {
+          ok++;
+        }
+      } catch (e) {
+        console.info('DSH_BATCH archive failed ' + ids[i] + ' :: ' + (e as Error).message);
+      }
+    }
+    this.exitSelect();
+    Toast.ok('已归档 ' + String(ok) + ' 个会话');
+    await this.load();
   }
 
   /** 分组方式菜单：结构照 dsh-console */
@@ -1460,6 +1585,14 @@ export struct SessionList {
       })
       this.viewOpt('按工作区', this.groupBy === 'ws', (): void => {
         this.setGroupBy('ws');
+      })
+      Divider().color(Tokens.lineSoft).margin({ top: 6, bottom: 2 })
+      this.viewHead('排序方式')
+      this.viewOpt('最近活动优先', this.sortBy === 'recent', (): void => {
+        this.setSortBy('recent');
+      })
+      this.viewOpt('标题 A-Z', this.sortBy === 'title', (): void => {
+        this.setSortBy('title');
       })
       Divider().color(Tokens.lineSoft).margin({ top: 6, bottom: 2 })
       this.viewHead('筛选会话')
@@ -1489,6 +1622,12 @@ export struct SessionList {
         this.setListState('none');
       })
       Divider().color(Tokens.lineSoft).margin({ top: 6, bottom: 2 })
+      Divider().color(Tokens.lineSoft).margin({ top: 6, bottom: 2 })
+      this.viewHead('多选')
+      this.viewOpt('选择会话', false, (): void => {
+        this.enterSelect();
+      })
+      Divider().color(Tokens.lineSoft).margin({ top: 6, bottom: 2 })
       this.viewHead('已完成')
       this.viewOpt('全部标为已读', false, (): void => {
         this.markAllRead();
@@ -1499,9 +1638,85 @@ export struct SessionList {
     .alignItems(HorizontalAlign.Start)
     .backgroundColor(Tokens.isDark ? '#E6171B22' : '#F2FFFFFF')
     .backdropBlur(24)
-    .borderRadius(18)
+    .borderRadius(20)
     .border({ width: 1, color: Tokens.isDark ? '#33FFFFFF' : '#D9FFFFFF' })
     .shadow({ radius: 26, color: Tokens.shadow, offsetY: 10 })
+  }
+
+  /**
+   * 退出搜索态：顶栏那颗「取消」和空态里的「清除搜索」共用这一段，
+   * 收起动画的时长/曲线原样保留，别处不要再抄一份。
+   */
+  private clearSearch(): void {
+    this.q = '';
+    this.searchGrow = 0.12;
+    setTimeout(() => {
+      this.searching = false;
+      this.searchGrow = 1;
+    }, 200);
+  }
+
+  /**
+   * 空态里的动作按钮：文案只负责显示，行为按当前是哪一种空态分派。
+   * 这样 emptyState 不用背一个回调参数，@Builder 传函数容易在重建时丢掉。
+   */
+  private onEmptyAction(): void {
+    Haptics.tap();
+    if (this.q.trim() !== '') {
+      this.clearSearch();
+      return;
+    }
+    if (this.timedOut) {
+      this.timedOut = false;
+      this.loading = true;
+      void this.load();
+      return;
+    }
+    if (this.rows.length > 0) {
+      this.ws = '';
+    }
+  }
+
+  /**
+   * 空态：图标 + 一句标题 + 一句说明 + 可选动作。
+   * 只收字符串参数（@Builder 的布尔参数是首帧快照，这里也没有哪个分支需要布尔）。
+   */
+  @Builder
+  emptyState(title: string, hint: string, action: string) {
+    Column() {
+      Image($r('app.media.ic_chat'))
+        .width(48)
+        .height(48)
+        .fillColor(Tokens.dim2)
+        .objectFit(ImageFit.Contain)
+      Text(title)
+        .fontSize(Tokens.fsBodyLg)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.fg)
+        .margin({ top: 14 })
+      Text(hint)
+        .fontSize(Tokens.fsFoot)
+        .fontColor(Tokens.dim2)
+        .textAlign(TextAlign.Center)
+        .margin({ top: 6 })
+      if (action !== '') {
+        Text(action)
+          .fontSize(Tokens.fsBody)
+          .fontColor(Tokens.accent)
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+          .borderRadius(Tokens.rPill)
+          .backgroundColor(Tokens.accentSoft)
+          .margin({ top: 16 })
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+          .onClick(() => {
+            this.onEmptyAction();
+          })
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Center)
+    // 列表第一项是 85 高的透明占位（让内容从浮动顶栏下面开始），空态接在它后面
+    .padding({ left: 24, right: 24, top: 84, bottom: 40 })
   }
 
   /** 下拉刷新区域：整块下移到摄像头开孔以下（默认位置在 0，会被挖孔挡住） */
@@ -1517,7 +1732,7 @@ export struct SessionList {
           .height(20)
           .color(Tokens.dim2)
         Text(this.refreshing ? '正在刷新' : '松开刷新')
-          .fontSize(11.5)
+          .fontSize(12)
           .fontColor(Tokens.dim2)
       }
     }
@@ -1528,6 +1743,7 @@ export struct SessionList {
     .justifyContent(FlexAlign.Center)
   }
 
+  /** 列表页顶部整块：工作区胶囊 + 搜索 + 统计。整块是浮层，列表从它底下滚过去。 */
   @Builder
   headerBlock() {
     Column() {
@@ -1542,7 +1758,7 @@ export struct SessionList {
               .objectFit(ImageFit.Contain)
               .margin({ left: 16, right: 10 })
             TextInput({ placeholder: '搜索会话', text: this.q })
-              .fontSize(14)
+              .fontSize(13)
               .fontColor(Tokens.fg)
               .placeholderColor(Tokens.dim2)
               .backgroundColor(Color.Transparent)
@@ -1558,12 +1774,7 @@ export struct SessionList {
               .padding({ left: 8, right: 16 })
               .onClick(() => {
                 Haptics.tap();
-                this.q = '';
-                this.searchGrow = 0.12;
-                setTimeout(() => {
-                  this.searching = false;
-                  this.searchGrow = 1;
-                }, 200);
+                this.clearSearch();
               })
           }
           .width('100%')
@@ -1571,7 +1782,7 @@ export struct SessionList {
           .margin({ left: 0, right: 0, top: 0 })
           .backgroundColor(Tokens.glassFloat)
           .backdropBlur(18)
-          .borderRadius(23)
+          .borderRadius(24)
           .border({ width: 1, color: Tokens.pillEdge })
           .shadow({ radius: 20, color: Tokens.shadow, offsetY: 6 })
           .systemMaterial(Mat.whiteOn(this.matOn()))
@@ -1617,7 +1828,7 @@ export struct SessionList {
           }
           .width(42)
           .height(42)
-          .borderRadius(21)
+          .borderRadius(20)
           .margin({ right: 10 })
           .backgroundColor(Tokens.glassStrong)
           .border({ width: 1, color: Tokens.pillEdge })
@@ -1650,7 +1861,7 @@ export struct SessionList {
           }
           .width(42)
           .height(42)
-          .borderRadius(21)
+          .borderRadius(20)
           .backgroundColor(Tokens.glassStrong)
           .border({ width: 1, color: Tokens.pillEdge })
           .shadow({ radius: 12, color: Tokens.accentGlow, offsetY: 2 })
@@ -1687,7 +1898,7 @@ export struct SessionList {
           }
           .width(42)
           .height(42)
-          .borderRadius(21)
+          .borderRadius(20)
           .backgroundColor(Tokens.glassStrong)
           .border({ width: 1, color: Tokens.pillEdge })
           .shadow({ radius: 12, color: Tokens.accentGlow, offsetY: 2 })
@@ -1772,7 +1983,7 @@ export struct SessionList {
             Row({ space: 8 }) {
               LoadingProgress().width(20).height(20).color(Tokens.accent)
               Text(this.loadSlow ? '还没连上电脑' : '读取会话…')
-                .fontSize(12.5)
+                .fontSize(13)
                 .fontColor(Tokens.dim2)
             }
             .justifyContent(FlexAlign.Center)
@@ -1798,12 +2009,22 @@ export struct SessionList {
         } else if (this.err !== '') {
           Column() {
             Text('读取失败')
-              .fontSize(14)
+              .fontSize(13)
               .fontColor(Tokens.err)
             Text(this.err)
-              .fontSize(11.5)
+              .fontSize(12)
               .fontColor(Tokens.dim2)
               .margin({ top: 6 })
+            if (Api.kind(this.err) === 'net') {
+              // 局域网 IP 由 DHCP 分配，电脑换了网/重启路由后地址会变；
+              // 只说「重试」会让用户一直点，这里直接把下一步写出来。
+              Text('电脑可能换了地址：去「设置 → 连接」改地址，或重新扫码配对')
+                .fontSize(12)
+                .fontColor(Tokens.dim)
+                .width('86%')
+                .textAlign(TextAlign.Center)
+                .margin({ top: 8 })
+            }
             Text('重试')
               .fontSize(13)
               .fontColor(Tokens.accent)
@@ -1822,12 +2043,97 @@ export struct SessionList {
             ListItem() {
               Row().width('100%').height(85)
             }
+            if (this.selectOn) {
+              ListItem() {
+                Row() {
+                  Text('已选 ' + String(this.selected.length))
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(Tokens.fg)
+                  Blank()
+                  Text('全选')
+                    .fontSize(12)
+                    .fontColor(Tokens.accent)
+                    .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+                    .onClick(() => {
+                      this.selectAll();
+                    })
+                  Text('归档')
+                    .fontSize(12)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(this.selected.length > 0 ? Tokens.accentInk : Tokens.dim2)
+                    .backgroundColor(this.selected.length > 0 ? Tokens.accent : Tokens.surface2)
+                    .borderRadius(Tokens.rPill)
+                    .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+                    .margin({ left: 8 })
+                    .onClick(() => {
+                      this.archiveSelected();
+                    })
+                  Text('取消')
+                    .fontSize(12)
+                    .fontColor(Tokens.dim)
+                    .padding({ left: 10, right: 4, top: 5, bottom: 5 })
+                    .margin({ left: 4 })
+                    .onClick(() => {
+                      this.exitSelect();
+                    })
+                }
+                .width('100%')
+                .padding({ left: 14, right: 10, top: 8, bottom: 8 })
+                .backgroundColor(Tokens.surface)
+                .borderRadius(14)
+                .margin({ bottom: 8 })
+                .alignItems(VerticalAlign.Center)
+              }
+            }
+            if (!this.online) {
+              ListItem() {
+                Row() {
+                  Text('当前离线')
+                    .fontSize(12)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(Tokens.err)
+                  Text('消息会先留在手机上，恢复网络后到聊天页重发')
+                    .fontSize(12)
+                    .fontColor(Tokens.dim)
+                    .margin({ left: 8 })
+                    .layoutWeight(1)
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+                .width('100%')
+                .padding({ left: 14, right: 14, top: 9, bottom: 9 })
+                .backgroundColor(Tokens.isDark ? '#1FFF5C5C' : '#12FF3B30')
+                .borderRadius(14)
+                .margin({ bottom: 8 })
+                .alignItems(VerticalAlign.Center)
+              }
+            }
+            // 一条可显示的行都没有时不能再留一片空白：空态也放进 List，
+            // 下拉刷新就还是能用的，不用为了空态另起一棵渲染树。
+            if (this.models().length === 0) {
+              ListItem() {
+                if (this.q.trim() !== '') {
+                  this.emptyState('没有匹配的会话', '换个关键词，或清除搜索', '清除搜索')
+                } else if (this.archivedView) {
+                  this.emptyState('归档是空的', '归档过的会话会出现在这里', '')
+                } else if (this.timedOut) {
+                  this.emptyState('还没拿到会话', '电脑那边暂时没响应，可以再试一次', '重试')
+                } else if (this.rows.length > 0) {
+                  // 有会话但被工作区筛掉了：说清楚是筛选，别让人以为会话丢了
+                  this.emptyState('这个工作区还没有会话', '换个工作区看看', '全部工作区')
+                } else {
+                  this.emptyState('还没有会话', '点右下角 + 新建', '')
+                }
+              }
+              .width('100%')
+            } else {
             ForEach(this.models(), (m: RowModel, idx: number) => {
               if (m.kind === 'head') {
                 ListItem() {
                   Row() {
                     Text(m.label)
-                      .fontSize(11.5)
+                      .fontSize(12)
                       .fontColor(Tokens.dim2)
                       .letterSpacing(1.2)
                     Blank()
@@ -1858,6 +2164,15 @@ export struct SessionList {
                     preview: this.previewOf(m.row.id),
                     count: this.countOf(m.row.id),
                     archivedView: this.archivedView,
+                    selectMode: this.selectOn,
+                    checked: this.selected.indexOf(m.row.id) >= 0,
+                    onToggle: () => {
+                      this.toggleOne(m.row.id);
+                    },
+                    onLongSelect: () => {
+                      this.enterSelect();
+                      this.toggleOne(m.row.id);
+                    },
                     onTap: () => {
                       Haptics.tap();
                       const p: ChatParam = { id: m.row.id, title: m.row.title };
@@ -1887,7 +2202,9 @@ export struct SessionList {
                 }
                 // 只有会话卡片能左右滑，分组标题根本不挂这个手势
                 .swipeAction({ end: this.swipeActions(m.row), edgeEffect: SwipeEdgeEffect.Spring })
-              }            }, (m: RowModel) => m.key)
+              }
+            }, (m: RowModel) => m.key)
+            }
           }
           .width('100%')
           .height('100%')
@@ -1895,9 +2212,6 @@ export struct SessionList {
           .scrollBar(BarState.Off)
           .edgeEffect(EdgeEffect.Spring)
           .contentEndOffset(220)
-          .onScroll((x: number, y: number) => {
-            this.scrollY = y;
-          })
           }
           .width('100%')
           .height('100%')
@@ -1939,7 +2253,7 @@ export struct SessionList {
           Row()
             .width('100%')
             .height('100%')
-            .borderRadius(29)
+            .borderRadius(24)
             .linearGradient({
               angle: 160,
               colors: [[Tokens.isDark ? '#33FFFFFF' : '#B3FFFFFF', 0.0], ['#00FFFFFF', 0.62]],
@@ -1954,7 +2268,7 @@ export struct SessionList {
         }
         .width(58)
         .height(58)
-        .borderRadius(29)
+        .borderRadius(24)
         .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#8CFFFFFF')
         .backdropBlur(Tokens.isDark ? 20 : 26)
         .border({ width: 1, color: Tokens.isDark ? '#40FFFFFF' : '#D9FFFFFF' })

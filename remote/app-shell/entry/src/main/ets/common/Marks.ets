@@ -91,6 +91,12 @@ export class Marks {
     Marks.bump();
   }
 
+  /** 结果标记条数：设置里的「应用数据」用它显示与清理。 */
+  static count(): number {
+    Marks.ensure();
+    return Marks.mem === null ? 0 : Marks.mem.size;
+  }
+
   /** 全部标为已读：一次清空所有结果标记。 */
   static clearAll(): void {
     Marks.ensure();

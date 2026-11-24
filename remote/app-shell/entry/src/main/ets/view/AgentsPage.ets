@@ -1,21 +1,15 @@
 import curves from '@ohos.curves';
 import { Api, AgentRef, SessionRow } from '../common/Api';
 import { Tokens } from '../common/Tokens';
+import { ago } from '../common/Format';
 import { ChatParam } from '../common/Types';
-import { NavFx, NavFxSink } from '../common/NavFx';
+import { PageHeader } from '../common/Chrome';
+import { EmptyState } from '../common/Widgets';
 
 interface AgentGroup {
   sessionId: string;
   title: string;
   rows: AgentRef[];
-}
-
-function ago(ms: number): string {
-  const d = Date.now() - ms;
-  if (d < 60_000) return '刚刚';
-  if (d < 3_600_000) return Math.floor(d / 60_000) + ' 分钟前';
-  if (d < 86_400_000) return Math.floor(d / 3_600_000) + ' 小时前';
-  return Math.floor(d / 86_400_000) + ' 天前';
 }
 
 @Component
@@ -28,33 +22,6 @@ export struct AgentsPage {
   @State private loading: boolean = true;
   @State private enter: boolean = false;
   @State private err: string = '';
-  /** 转场状态：由 Navigation 的 customNavContentTransition 按 navDestinationId 驱动。 */
-  @State private fxTx: string = '0%';
-  @State private fxOp: number = 1;
-  @State private fxSc: number = 1;
-  private fxId: string = '';
-  private fxSink: NavFxSink | undefined = undefined;
-
-  /** 把本页的转场状态登记给 Navigation。 */
-  private bindFx(id: string): void {
-    const sink: NavFxSink = {
-      apply: (tx: string, op: number, sc: number): void => {
-        this.fxTx = tx;
-        this.fxOp = op;
-        this.fxSc = sc;
-      }
-    };
-    this.fxId = id;
-    this.fxSink = sink;
-    NavFx.register(id, sink);
-  }
-
-  aboutToDisappear(): void {
-    const s = this.fxSink;
-    if (s !== undefined) {
-      NavFx.unregister(this.fxId, s);
-    }
-  }
 
   aboutToAppear(): void {
     this.load();
@@ -100,7 +67,7 @@ export struct AgentsPage {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
           Text(a.mode + ' · ' + ago(a.createdAt))
-            .fontSize(11.5)
+            .fontSize(12)
             .fontColor(Tokens.dim2)
             .margin({ top: 3 })
         }
@@ -120,40 +87,18 @@ export struct AgentsPage {
   build() {
     NavDestination() {
       Column() {
-        Row() {
-          Text('‹')
-            .fontSize(30)
-            .fontColor(Tokens.fg)
-            .width(34)
-            .height(34)
-            .textAlign(TextAlign.Center)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => this.stack.pop())
-          Column() {
-            Text('智能体团队')
-              .fontSize(19)
-              .fontWeight(FontWeight.Bold)
-              .fontColor(Tokens.fg)
-            Text(this.loading ? '加载中…' : (this.total + ' 个子智能体 · ' + this.groups.length + ' 个会话'))
-              .fontSize(11)
-              .fontColor(Tokens.dim2)
-              .margin({ top: 2 })
+        PageHeader({
+          title: '智能体团队',
+          subtitle: this.loading ? '加载中…' : (this.total + ' 个子智能体 · ' + this.groups.length + ' 个会话'),
+          rightKind: 'glyph',
+          onBack: () => {
+            this.stack.pop();
+          },
+          onRight: () => {
+            this.loading = true;
+            this.load();
           }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-          .margin({ left: 4 })
-
-          Text('⟳')
-            .fontSize(17)
-            .fontColor(Tokens.dim)
-            .padding(6)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => {
-              this.loading = true;
-              this.load();
-            })
-        }
-        .width('100%')
+        })
         .margin({ bottom: 12 })
 
         if (this.loading) {
@@ -164,12 +109,11 @@ export struct AgentsPage {
         } else if (this.err !== '') {
           Text('读取失败：' + this.err).fontSize(13).fontColor(Tokens.err).padding(20)
         } else if (this.groups.length === 0) {
-          Text('还没有子智能体')
-            .fontSize(13)
-            .fontColor(Tokens.dim2)
-            .width('100%')
-            .textAlign(TextAlign.Center)
-            .padding(40)
+          EmptyState({
+            icon: $r('app.media.ic_group'),
+            title: '还没有子智能体',
+            hint: '在电脑端这个会话的菜单里打开「智能体团队」，成员与任务才会同步到这里。'
+          })
         } else {
           List({ space: 14 }) {
             ForEach(this.groups, (g: AgentGroup) => {
@@ -177,7 +121,7 @@ export struct AgentsPage {
                 Column() {
                   Row() {
                     Text(g.title)
-                      .fontSize(12.5)
+                      .fontSize(13)
                       .fontColor(Tokens.dim)
                       .maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -223,14 +167,5 @@ export struct AgentsPage {
     .hideTitleBar(true)
     .backgroundColor(this.themeBg)
     .mode(NavDestinationMode.STANDARD)
-    .onReady((context: NavDestinationContext) => {
-      const id: string | undefined = context.navDestinationId;
-      if (id !== undefined && id !== '') {
-        this.bindFx(id);
-      }
-    })
-    .translate({ x: this.fxTx })
-    .opacity(this.fxOp)
-    .scale({ x: this.fxSc, y: this.fxSc })
   }
 }

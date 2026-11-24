@@ -37,11 +37,11 @@ export class Saver {
    * @returns true 已保存；false 用户取消（不是错误，调用方不要提示失败）
    * @throws Error 下载失败或写入失败，message 带中文前缀
    */
-  static async save(ctx: common.UIAbilityContext, url: string, name: string): Promise<boolean> {
+  static async save(ctx: common.UIAbilityContext, url: string, name: string, auth: string = ''): Promise<boolean> {
     const fileName: string = Saver.baseName(name);
     const tmpPath: string = Saver.tempPath(ctx, fileName);
     try {
-      await Saver.download(ctx, url, tmpPath);
+      await Saver.download(ctx, url, tmpPath, auth);
     } catch (e) {
       Saver.drop(tmpPath);
       throw new Error('下载失败：' + Saver.reason(e as Error));
@@ -57,16 +57,21 @@ export class Saver {
   }
 
   /** 下载到沙箱路径，完成或失败都会把下载任务从系统队列里删掉。 */
-  private static async download(ctx: common.UIAbilityContext, url: string, filePath: string): Promise<void> {
+  private static async download(ctx: common.UIAbilityContext, url: string, filePath: string, auth: string): Promise<void> {
     // 同名残留会让下载任务直接失败，先清掉
     Saver.drop(filePath);
+    const header: Record<string, string> = {};
+    if (auth !== '') {
+      header['Authorization'] = auth;
+    }
     const config: request.DownloadConfig = {
       url: url,
       filePath: filePath,
       // 蜂窝网也允许下载：手机上不一定接着 Wi-Fi，拦住反而莫名其妙
       enableMetered: true,
       enableRoaming: true,
-      background: false
+      background: false,
+      header: header
     };
     const task: request.DownloadTask = await request.downloadFile(ctx, config);
     try {
@@ -129,6 +134,30 @@ export class Saver {
     return true;
   }
 
+  /**
+   * 把一段文本存成文件（导出会话 Markdown 用）：走系统保存面板，用户自己挑位置。
+   * 返回 false 表示用户取消，不是错误。
+   */
+  static async saveText(ctx: common.UIAbilityContext, text: string, name: string): Promise<boolean> {
+    const options: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+    options.newFileNames = [Saver.baseName(name)];
+    const viewPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+    const uris: string[] = await viewPicker.save(options);
+    if (uris.length === 0 || uris[0] === '') {
+      return false;
+    }
+    const target = fileIo.openSync(uris[0], fileIo.OpenMode.READ_WRITE);
+    try {
+      try {
+        fileIo.truncateSync(target.fd, 0);
+      } catch (e) {
+      }
+      fileIo.writeSync(target.fd, text);
+    } finally {
+      fileIo.closeSync(target);
+    }
+    return true;
+  }
   /** 缓存目录里的一次性临时文件路径，带原扩展名以便选择器按类型排序。 */
   private static tempPath(ctx: common.UIAbilityContext, name: string): string {
     return ctx.cacheDir + '/' + TEMP_PREFIX + String(Date.now()) + Saver.suffix(name);

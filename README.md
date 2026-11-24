@@ -28,11 +28,12 @@
 
 | 文件 | 说明 |
 |---|---|
-| `dsh-mobile-1.0.0-20261120-signed.hap` | 已签名，但签名 profile 只授权了作者登记过的设备，换手机装会验签失败 |
-| `dsh-mobile-1.0.0-20261120-unsigned.hap` | 未签名，用自己的证书签完就能装 |
+| `dsh-mobile-2.0.0-signed.hap` | 当前版本 2.0.0；已签名，签名 profile 仍只授权作者登记过的设备 |
+| `dsh-mobile-1.0.0-20261120-signed.hap` | 旧版 1.0.0，已签名，同样只授权作者登记过的设备 |
+| `dsh-mobile-1.0.0-20261120-unsigned.hap` | 旧版 1.0.0，未签名，用自己的证书签完就能装 |
 
 ```bash
-hdc install -r release/dsh-mobile-1.0.0-20261120-signed.hap
+hdc install -r release/dsh-mobile-2.0.0-signed.hap
 ```
 
 装不上就照 [`release/README.md`](release/README.md) 里的两种签名方式重签一次。安装包内不含任何服务器地址或令牌，首次启动直接进配对向导。

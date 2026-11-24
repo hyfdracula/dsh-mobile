@@ -9,6 +9,8 @@
 import { common } from '@kit.AbilityKit';
 import { Tokens } from '../common/Tokens';
 import { Haptics } from '../common/Haptics';
+import { Toast } from '../common/Toast';
+import { PageHeader, TopFade } from '../common/Chrome';
 import { Bucket, DeviceSpace, scanStorage, clearCache, deviceSpace, sizeText } from '../common/Storage';
 
 /** 环形图内圈留白与线宽（vp）。 */
@@ -134,74 +136,13 @@ export struct StoragePage {
             this.refresh();
             this.redraw();
           }, 80);
-          this.getUIContext().getPromptAction().showToast({
-            message: freed > 0 ? '已清理 ' + sizeText(freed) : '本来就没有可清理的缓存'
-          });
+          Toast.ok(freed > 0 ? '已清理 ' + sizeText(freed) : '本来就没有可清理的缓存');
         }
       }
     });
   }
 
   /** 顶部同色渐变：内容滚上来时在标题下面淡出，替掉原来那块不透明标题栏 */
-
-  @Builder
-  pageHeader() {
-    Row() {
-      Stack() {
-        Image($r('app.media.ic_back'))
-          .width(20)
-          .height(20)
-          .fillColor(Tokens.fg)
-          .objectFit(ImageFit.Contain)
-      }
-      .width(38)
-      .height(38)
-      .borderRadius(999)
-      .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#8CFFFFFF')
-      .backdropBlur(22)
-      .border({ width: 1, color: Tokens.isDark ? '#40FFFFFF' : '#D9FFFFFF' })
-      .shadow({ radius: 14, color: Tokens.isDark ? '#40000000' : '#26000000', offsetY: 4 })
-      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-      .onClick(() => {
-        Haptics.tap();
-        this.onExit();
-      })
-
-      Text('存储空间')
-        .fontSize(20)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(Tokens.fg)
-        .margin({ left: 12 })
-
-      Blank()
-
-      Stack() {
-        Text('\u21bb')
-          .fontSize(20)
-          .fontColor(Tokens.fg)
-      }
-      .width(38)
-      .height(38)
-      .borderRadius(999)
-      .backgroundColor(Tokens.isDark ? '#3DFFFFFF' : '#8CFFFFFF')
-      .backdropBlur(22)
-      .border({ width: 1, color: Tokens.isDark ? '#40FFFFFF' : '#D9FFFFFF' })
-      .shadow({ radius: 14, color: Tokens.isDark ? '#40000000' : '#26000000', offsetY: 4 })
-      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-      .onClick(() => {
-        Haptics.soft();
-        this.refresh();
-        this.redraw();
-      })
-      .accessibilityText('重新统计')
-    }
-    .width('100%')
-    .height(48)
-    // 父级 NavDestination 已经有 16/54 的留白，这里只补一点上边距，
-    // 标题才能和设置页其它二级页（通知/外观/连接）停在同一条水平线上
-    .margin({ top: 4 })
-    .alignItems(VerticalAlign.Center)
-  }
 
   build() {
     Stack({ alignContent: Alignment.Top }) {
@@ -265,11 +206,11 @@ export struct StoragePage {
 
               Row() {
                 Text('设备可用空间')
-                  .fontSize(14)
+                  .fontSize(13)
                   .fontColor(Tokens.dim)
                 Blank()
                 Text(this.deviceText())
-                  .fontSize(14)
+                  .fontSize(13)
                   .fontColor(Tokens.fg)
               }
               .width('100%')
@@ -314,10 +255,10 @@ export struct StoragePage {
                     .margin({ left: 12 })
 
                     Text(sizeText(b.bytes))
-                      .fontSize(14)
+                      .fontSize(13)
                       .fontColor(Tokens.dim)
                     Text('›')
-                      .fontSize(18)
+                      .fontSize(17)
                       .fontColor(Tokens.dim2)
                       .margin({ left: 6 })
                   }
@@ -376,19 +317,20 @@ export struct StoragePage {
       .height('100%')
       .scrollBar(BarState.Off)
 
-      // 同色渐变：滚上来的卡片在标题下面淡出，不再有硬边遮罩。
-      // 高度和会话列表页保持一致（96），三处页面看起来是同一套。
-      Row()
-        .width('100%')
-        .height(96)
-        .linearGradient({
-          angle: 180,
-          colors: [[this.themeBg, 0.0], [this.themeBg, 0.55], ['#00' + this.themeBg.slice(1), 1.0]]
-        })
-        .hitTestBehavior(HitTestMode.None)
-
-      // 浮动的玻璃返回钮 + 标题 + 刷新钮
-      this.pageHeader()
+      // 同色渐变与页头统一交给 Chrome 组件：高度 96、38 玻璃返回、20 号标题。
+      TopFade({ fadeHeight: 96 })
+      PageHeader({
+        title: '存储空间',
+        rightKind: 'glyph',
+        onBack: () => {
+          this.onExit();
+        },
+        onRight: () => {
+          Haptics.soft();
+          this.refresh();
+          this.redraw();
+        }
+      })
     }
     .width('100%')
     .height('100%')

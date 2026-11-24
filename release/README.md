@@ -1,11 +1,12 @@
-# 安装包
+﻿# 安装包
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| `dsh-mobile-1.0.0-20261120-signed.hap` | 1.19 MB | 已签名，**只能装在签名证书 profile 里列出的设备上** |
-| `dsh-mobile-1.0.0-20261120-unsigned.hap` | 1.12 MB | 未签名，需用自己的证书签名后再装 |
+| `dsh-mobile-2.0.0-signed.hap` | 2.75 MB | 当前版本 2.0.0（versionCode 2000000）；已签名，**只能装在签名证书 profile 里列出的设备上** |
+| `dsh-mobile-1.0.0-20261120-signed.hap` | 1.19 MB | 旧版 1.0.0，已签名，**只能装在签名证书 profile 里列出的设备上** |
+| `dsh-mobile-1.0.0-20261120-unsigned.hap` | 1.12 MB | 旧版 1.0.0，未签名，需用自己的证书签名后再装 |
 
-构建于 2026-11-20，`compatibleSdkVersion` / `targetSdkVersion` = 26.0.0，bundle 名 `com.dsh.mobile`。
+构建于 2026-11-24（2.0.0），`compatibleSdkVersion` / `targetSdkVersion` = 26.0.0，bundle 名 `com.dsh.mobile`。
 
 ## 为什么已签名包不一定能装
 
