@@ -1,4 +1,5 @@
 import http from '@ohos.net.http';
+import { LinkLog } from './LinkLog';
 
 /**
  * 配对客户端：直连一台还没配置过的电脑，用 6 位码换令牌。
@@ -11,6 +12,9 @@ export interface PairInfo {
   name: string;
   version: string;
   host: string;
+  hostId?: string;
+  e2eePub?: string;
+  e2ee?: boolean;
   port: number;
   lan: string[];
   publicUrl: string;
@@ -22,6 +26,9 @@ export interface PairClaim {
   token: string;
   base: string;
   host: string;
+  hostId?: string;
+  e2eePub?: string;
+  e2ee?: boolean;
   version: string;
   port: number;
   qr: string;
@@ -100,7 +107,12 @@ export class Pairing {
         continue;
       }
       const k = parts[i].substring(0, eq);
-      const v = decodeURIComponent(parts[i].substring(eq + 1));
+      let v = parts[i].substring(eq + 1);
+      try {
+        v = decodeURIComponent(v);
+      } catch (e) {
+        continue;
+      }
       if (k === 'b') {
         base = v;
       } else if (k === 'c') {
@@ -117,6 +129,7 @@ export class Pairing {
 
   private static async req(base: string, path: string, method: string, payload: string): Promise<RawResp> {
     const client = http.createHttp();
+    const t0: number = Date.now();
     try {
       const opts: http.HttpRequestOptions = {
         method: method === 'POST' ? http.RequestMethod.POST : http.RequestMethod.GET,
@@ -129,7 +142,13 @@ export class Pairing {
         opts.extraData = payload;
       }
       const resp = await client.request(base + path, opts);
+      const ms: number = Date.now() - t0;
+      LinkLog.record('PAIR', method + ' ' + base + path + ' -> ' + String(resp.responseCode) + ' (' + String(ms) + 'ms)');
       return { status: resp.responseCode, body: resp.result as string };
+    } catch (e) {
+      const ms: number = Date.now() - t0;
+      LinkLog.record('PAIR', method + ' ' + base + path + ' FAIL (' + String(ms) + 'ms) ' + ((e as Error).message ?? ''));
+      throw new Error((e as Error).message ?? 'network error');
     } finally {
       client.destroy();
     }
@@ -138,10 +157,15 @@ export class Pairing {
   /** 探一台电脑：拿到名字、版本与它对外的局域网地址。 */
   static async info(base: string): Promise<PairInfo> {
     const r = await Pairing.req(Pairing.normalizeBase(base), '/api/pair/info', 'GET', '');
-    if (r.status !== 200) {
+    if (r.status < 200 || r.status >= 300) {
       throw new Error('这台电脑没有开启手机连接（HTTP ' + r.status + '）');
     }
-    const o = JSON.parse(r.body) as PairInfo;
+    let o: PairInfo;
+    try {
+      o = JSON.parse(r.body) as PairInfo;
+    } catch (e) {
+      throw new Error('连接地址返回的不是有效响应（HTTP ' + r.status + '），请核对端口或隧道');
+    }
     if (o.ok !== true) {
       throw new Error('返回内容不是手机连接接口');
     }
@@ -155,7 +179,8 @@ export class Pairing {
    * 地址**真的连不上**时才换下一个；一旦对面答了（码错 / 被拒 / 限流），
    * 就说明路是通的，立刻把它的答复抛出去，别拿同一个码去撞别处的服务器。
    */
-  static async claimAny(bases: readonly string[], code: string): Promise<PairClaim> {
+  static async claimAny(bases: readonly string[], code: string,
+    onStage?: (stage: number, detail: string) => void): Promise<PairClaim> {
     const tried: string[] = [];
     let last: string = '';
     for (let i = 0; i < bases.length; i++) {
@@ -164,14 +189,21 @@ export class Pairing {
         continue;
       }
       tried.push(one);
+      if (onStage !== undefined) {
+        onStage(0, '正在尝试 ' + one + ' (' + String(tried.length) + '/' + String(bases.length) + ')');
+      }
       try {
-        return await Pairing.claim(one, code);
+        const res: PairClaim = await Pairing.claim(one, code);
+        if (onStage !== undefined) {
+          onStage(1, '已验证配对码 · ' + one);
+        }
+        return res;
       } catch (e) {
         const msg = (e as Error).message;
         if (e instanceof PairError) {
           // 对面答了：说明路是通的，把这个答复原样交给界面，别去撞下一个地址
           console.info('DSH_PAIR reject ' + one + ' status=' + e.status);
-          throw e;
+          throw new PairError(e.status, e.message);
         }
         last = msg;
         console.info('DSH_PAIR unreachable ' + one + ' :: ' + msg);
@@ -192,9 +224,9 @@ export class Pairing {
     try {
       o = JSON.parse(r.body) as PairClaim;
     } catch (e) {
-      throw new PairError(r.status, '电脑返回了看不懂的内容（HTTP ' + r.status + '）');
+      throw new PairError(r.status, '无法解析电脑返回（HTTP ' + r.status + '），隧道或端口可能未就绪');
     }
-    if (r.status === 200 && o.ok === true) {
+    if (r.status >= 200 && r.status < 300 && o.ok === true) {
       o.usedBase = Pairing.normalizeBase(base);
       return o;
     }

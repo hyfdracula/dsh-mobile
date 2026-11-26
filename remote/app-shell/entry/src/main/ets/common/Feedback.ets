@@ -18,10 +18,15 @@ import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { bundleManager } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { bytes } from './Format';
+import { AppCtx } from './AppCtx';
+import { bytes, stamp } from './Format';
 
-/** 反馈后端。自定义域，`*.workers.dev` 在国内被 DNS 污染，不能用。 */
-export const FEEDBACK_BASE: string = 'https://feedback.juo.de5.net';
+/** 可选反馈后端域名；留空时上架版本自动隐藏所有反馈入口，仅本地纯直连运行。 */
+export const FEEDBACK_BASE: string = '';
+
+export function isFeedbackEnabled(): boolean {
+  return FEEDBACK_BASE.trim() !== '';
+}
 
 /** 反馈类型。 */
 export interface FeedbackKind {
@@ -120,19 +125,14 @@ export function sizeText(n: number): string {
   return bytes(n);
 }
 
-/** 日期：`11-23 14:05`。 */
+/** 日期：`11-23 14:05`，统一委托 Format.stamp。 */
 export function timeText(ms: number): string {
-  const d: Date = new Date(ms);
-  const mm: string = d.getMonth() + 1 < 10 ? '0' + (d.getMonth() + 1) : '' + (d.getMonth() + 1);
-  const dd: string = d.getDate() < 10 ? '0' + d.getDate() : '' + d.getDate();
-  const hh: string = d.getHours() < 10 ? '0' + d.getHours() : '' + d.getHours();
-  const mi: string = d.getMinutes() < 10 ? '0' + d.getMinutes() : '' + d.getMinutes();
-  return mm + '-' + dd + ' ' + hh + ':' + mi;
+  return stamp(ms);
 }
 
 function store(): preferences.Preferences {
   const opts: preferences.Options = { name: STORE };
-  return preferences.getPreferencesSync(getContext(), opts);
+  return preferences.getPreferencesSync(AppCtx.ability(), opts);
 }
 
 /** 本机的匿名设备号（32 位 hex）。 */
@@ -256,7 +256,7 @@ function reasonOf(code: number, body: string): string {
     }
   }
   if (code === 429) {
-    return '今天提得太多了，明天再来，或者直接进 QQ 群说。';
+    return '今天提交次数过多，请明天再试。';
   }
   if (code === 413) {
     return msg !== '' ? '文件太大：' + msg : '文件太大。';
@@ -270,6 +270,9 @@ function reasonOf(code: number, body: string): string {
 /** 发一次请求，返回响应正文；非 2xx 抛带文案的 Error。 */
 async function send(method: http.RequestMethod, path: string, install: string,
   body: string, extra: Record<string, string>, bin?: ArrayBuffer): Promise<string> {
+  if (!isFeedbackEnabled()) {
+    throw new Error('当前版本未启用在线反馈服务');
+  }
   const req: http.HttpRequest = http.createHttp();
   const header: Record<string, string> = { 'x-install': install };
   const keys: string[] = Object.keys(extra);
@@ -385,11 +388,12 @@ export async function upload(id: string, spec: UploadSpec, path: string, name: s
 }
 
 /** base64 上传（截图从相册读出来时已经是字节，这里给的是 uri → 直接读文件）。 */
-export async function uploadText(id: string, spec: UploadSpec, text: string, name: string): Promise<void> {
-  const bytes: Uint8Array = new util.TextEncoder().encodeInto(text);
-  const buf: ArrayBuffer = bytes.buffer as ArrayBuffer;
-  await send(http.RequestMethod.POST, '/v1/tickets/' + encodeURIComponent(id) + '/files?kind=' + spec.kind,
-    installId(), '', { 'content-type': spec.mime, 'x-name': encodeURIComponent(name) }, buf);
+export function uploadText(id: string, spec: UploadSpec, text: string, name: string): Promise<void> {
+  const encoded: Uint8Array | undefined = util.TextEncoder.create('utf-8').encodeInto(text);
+  const data: Uint8Array = encoded !== undefined ? encoded : new Uint8Array(0);
+  const buf: ArrayBuffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+  return send(http.RequestMethod.POST, '/v1/tickets/' + encodeURIComponent(id) + '/files?kind=' + spec.kind,
+    installId(), '', { 'content-type': spec.mime, 'x-name': encodeURIComponent(name) }, buf).then(() => {});
 }
 
 /** 复制用的工单全文：工单号、内容、设备信息、附件清单。 */
@@ -417,7 +421,7 @@ export function ticketText(t: Ticket): string {
     lines.push('— 处理记录 —');
     for (let i = 0; i < t.replies.length; i++) {
       const r: TicketReply = t.replies[i];
-      lines.push(timeText(r.at) + ' ' + (r.author === 'admin' ? '我' : '用户') + '：' + r.text);
+      lines.push(timeText(r.at) + ' ' + (r.author === 'admin' ? '开发者' : '我') + '：' + r.text);
     }
   }
   return lines.join('\n');

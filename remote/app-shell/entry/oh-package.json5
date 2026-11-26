@@ -1,9 +1,9 @@
 {
   "name": "entry",
-  "version": "1.0.0",
-  "description": "DSH Mobile entry module",
+  "version": "3.0.0",
+  "description": "Agent Mobile entry module",
   "main": "",
-  "author": "",
-  "license": "MIT",
+  "author": "Agent Mobile Contributors",
+  "license": "Apache-2.0",
   "dependencies": {}
 }

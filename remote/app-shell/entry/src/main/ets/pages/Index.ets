@@ -1,14 +1,16 @@
 import preferences from '@ohos.data.preferences';
 import ConfigurationConstant from '@ohos.app.ability.ConfigurationConstant';
-import common from '@ohos.app.ability.common';
 import { Configuration } from '@ohos.app.ability.Configuration';
 import { Api } from '../common/Api';
+import { AppCtx } from '../common/AppCtx';
+import { AppIcon, ICON_LIGHT } from '../common/AppIcon';
+import { isLanUrl } from '../common/ApiUtil';
 import { Tokens } from '../common/Tokens';
 import { ChatParam } from '../common/Types';
-import { applyTheme, THEME_AUTO } from '../common/Theme';
+import { applyTheme, resolveDark, THEME_AUTO } from '../common/Theme';
+import { LegalDocKind } from '../common/LegalDocs';
+import { LegalSheet } from '../view/LegalSheet';
 import { ChatPage } from '../view/ChatPage';
-import { AgentsPage } from '../view/AgentsPage';
-import { SettingsPage } from '../view/SettingsPage';
 import { PresetsPage } from '../view/PresetsPage';
 import { PairPage } from '../view/PairPage';
 import { ShellPage } from '../view/ShellPage';
@@ -17,6 +19,7 @@ import { Machines } from '../common/Machines';
 import { Net } from '../common/Net';
 import { Secret } from '../common/Secret';
 import { Toast } from '../common/Toast';
+import { Unread } from '../common/Unread';
 
 // 首次启动没有内置地址与令牌：先在「配对这台电脑」里扫码或输 6 位码，
 // 配对成功后地址与令牌写进本机 preferences，之后的启动都从这里读。
@@ -32,24 +35,61 @@ struct Index {
   @Provide('stack') stack: NavPathStack = new NavPathStack();
   /** 全屏看图的地址：聊天页写，这里负责铺满整屏盖住标题栏 */
   @StorageLink('bigImg') bigImg: string = '';
+  @StorageLink('themeBg') themeBg: string = Tokens.bg;
+  @StorageLink('themeRev') themeRev: number = 0;
+  @StorageLink('sysConfigTick') @Watch('onSysConfigTick') sysConfigTick: number = 0;
+  @StorageLink('netBearerTick') @Watch('onNetBearerTick') netBearerTick: number = 0;
+  @StorageLink('topInset') topInset: number = 40;
+  @StorageLink('bottomInset') bottomInset: number = 20;
   @State private wanBase: string = DEFAULT_BASE;
   @State private token: string = DEFAULT_TOKEN;
   @State private api: Api = new Api(DEFAULT_BASE, DEFAULT_TOKEN, LAN_BASE);
   @State private themeMode: string = THEME_AUTO;
-  @State private forceWan: boolean = false;
   /** 网络策略：auto（自动）/ lan（仅局域网）/ wan（仅公网）。 */
   @State private netMode: string = 'auto';
-  /** 兼容旧字段：由 netMode 推导。 */
-  @State private autoLan: boolean = true;
   /** 当前连着的电脑名字（多台电脑共用同一套界面，切换时整体换地址与令牌）。 */
   @State private machineName: string = '';
   @State private haptics: boolean = true;
   @State private hdsOn: boolean = true;
-  @StorageLink('themeRev') themeRev: number = 0;
+  @StorageLink('appIconStyle') appIconStyle: string = ICON_LIGHT;
+  @State private cfgLoaded: boolean = false;
+  @State private privacyAccepted: boolean = false;
+  @State private legalKind: string = '';
   /** 每次重建导航栈自增，40ms 延迟里若已变化就放弃回填 */
   private navRev: number = 0;
   /** 在线心跳定时器，-1 表示没在跑 */
   private presenceTimer: number = -1;
+  private presenceBusy: boolean = false;
+  private presenceTick: number = 0;
+  private refreshLanBusy: boolean = false;
+  /** 记录是否刚从后台返回前台，供 fgProbe 识别补扫通知不误吞 */
+  private wasBackground: boolean = false;
+
+  private bumpMachineEpoch(): void {
+    const cur: number | undefined = AppStorage.get<number>('machineEpoch');
+    AppStorage.setOrCreate('machineEpoch', (cur !== undefined ? cur : 0) + 1);
+  }
+
+  private onNetBearerTick(): void {
+    if (!this.privacyAccepted || this.token === '' || this.wanBase === '') {
+      return;
+    }
+    // 蜂窝 <-> Wi-Fi 切换时重选一次入口：出门秒切公网，回家秒切局域网
+    void this.refreshLan();
+  }
+
+  private onSysConfigTick(): void {
+    if (this.themeMode !== THEME_AUTO) {
+      return;
+    }
+    const nextDark: boolean = resolveDark(this.themeMode, this.systemDark());
+    if (nextDark !== Tokens.isDark) {
+      this.applyThemeNow();
+      AppStorage.setOrCreate('settingsBack', Date.now());
+      AppStorage.setOrCreate('settingsSub', '');
+      this.rebuildNav();
+    }
+  }
 
   /**
    * 从系统设置返回时会走这里：发一个信号让「通知」页重新读一次开关，
@@ -57,58 +97,106 @@ struct Index {
    */
   onPageShow(): void {
     AppStorage.setOrCreate('notifyProbe', Date.now());
+    const fromBg: boolean = this.wasBackground;
+    this.wasBackground = false;
+    if (fromBg) {
+      // 先标记后台恢复补扫并触发 fgProbe，再置 appFg=true，解除「后台停轮询 + 前台吞通知」死锁
+      AppStorage.setOrCreate('fgResumeFromBg', true);
+      AppStorage.setOrCreate('fgProbe', Date.now());
+    }
     AppStorage.setOrCreate('appFg', true);
+    if (!this.privacyAccepted) {
+      return;
+    }
     this.startPresence();
     // 回到前台先重选一次入口：从外面回到家、或切了 Wi-Fi，这一步就能立刻换回局域网
     void this.refreshLan();
-    AppStorage.setOrCreate('fgProbe', Date.now());
+    if (!fromBg) {
+      AppStorage.setOrCreate('fgProbe', Date.now());
+    }
   }
 
   onPageHide(): void {
+    this.wasBackground = true;
     AppStorage.setOrCreate('appFg', false);
     this.stopPresence(true);
   }
 
   /**
-   * 回前台时的入口自愈：先探一次局域网；走隧道时顺手问一次 /api/info，
-   * 把电脑自报的地址合进候选再探一次——电脑换了 IP 只有这条路能学到，
-   * 以前 info() 只在「电脑」页里调，用户不进那页就永远停在公网上。
+   * 探测 /api/info 并把宿主的 hostId / e2eePub / 新局域网地址回写进 Machines（F08 / L6）。
    */
-  private async refreshLan(): Promise<void> {
-    await this.api.poke();
-    if (!this.autoLan || this.forceWan || this.token === '') {
-      return;
-    }
-    // 已经在局域网直连就不用再折腾
-    if (this.api.isLan()) {
+  private async syncHostMeta(): Promise<void> {
+    if (this.token === '' || this.wanBase === '') {
       return;
     }
     try {
-      await this.api.info();
+      const info = await this.api.info();
+      const active = Machines.active();
+      if (active !== null) {
+        const hid: string = info.hostId !== undefined ? info.hostId : '';
+        const pub: string = info.e2eePub !== undefined ? info.e2eePub : '';
+        Machines.updateMeta(active.id, hid, pub, this.api.lanCandidates());
+      }
     } catch (e) {
-      return;
-    }
-    if (!this.autoLan || this.forceWan) {
-      return;
-    }
-    if (!this.api.isLan() && this.api.lanCandidates().length > 0) {
-      await this.api.poke();
+      // 网络暂不可达时忽略，下次交互重试
     }
   }
 
   /**
-   * 在线心跳：电脑端据此决定 ask_user_question 卡片归谁。
-   *
-   * 在前台每 3 秒一次；电脑端 15 秒没收到就算离线，恢复成桌面回答。
-   * 退到后台立刻发 online:false，不等超时。
+   * 回前台或网络切换时的入口自愈：先选入口（蜂窝直连公网，Wi-Fi 探测局域网）；
+   * 再问一次 /api/info 把电脑自报的新地址、hostId 与 e2eePub 合进设备记录；
+   * 仅当在 Wi-Fi 下发现了之前未探测过的新局域网地址时才补探一次，避免反复重探拖慢公网。
    */
+  private async refreshLan(): Promise<void> {
+    if (this.refreshLanBusy) {
+      return;
+    }
+    this.refreshLanBusy = true;
+    try {
+      const beforeCount: number = this.api.lanCandidates().length;
+      await this.api.poke();
+      if (this.token === '') {
+        return;
+      }
+      await this.syncHostMeta();
+      if (this.netMode === 'wan' || Net.isCellularOnly()) {
+        return;
+      }
+      if (!this.api.isLan() && this.api.lanCandidates().length > beforeCount) {
+        await this.api.poke();
+      }
+    } finally {
+      this.refreshLanBusy = false;
+    }
+  }
+
+  /**
+   * 在线心跳：电脑端据此决定 ask_user_question 卡片归谁（电脑端 15 秒超时）。
+   * 局域网每 3 秒一次；公网隧道降频到每 9 秒一次且严格防重入，避免在弱网下堆积阻塞业务请求。
+   */
+  private sendPresenceOnce(): void {
+    if (this.presenceBusy || this.token === '' || this.wanBase === '') {
+      return;
+    }
+    this.presenceBusy = true;
+    this.api.presence(true).catch(() => {
+    }).finally(() => {
+      this.presenceBusy = false;
+    });
+  }
+
   private startPresence(): void {
     if (this.presenceTimer >= 0) {
       return;
     }
-    void this.api.presence(true);
+    this.presenceTick = 0;
+    this.sendPresenceOnce();
     this.presenceTimer = setInterval(() => {
-      void this.api.presence(true);
+      this.presenceTick++;
+      if (this.api.onWan() && (this.presenceTick % 3 !== 0)) {
+        return;
+      }
+      this.sendPresenceOnce();
     }, 3000);
   }
 
@@ -124,19 +212,29 @@ struct Index {
 
   aboutToAppear(): void {
     AppStorage.setOrCreate('settingsSub', '');
-    Net.start();
     this.applyThemeNow();
-    this.loadCfg();
+    void this.loadCfg();
+  }
+
+  aboutToDisappear(): void {
+    this.stopPresence(false);
+    AppCtx.clearWindow();
   }
 
   /**
-   * 系统返回键：设置里进了二级菜单就先退回一级，别直接退出应用。
-   * 其余情况交给 Navigation 自己弹栈。
+   * 系统返回键：优先关闭全屏看图和合规文档浮层，再退回设置二级页。
    */
   onBackPress(): boolean {
+    if (this.bigImg !== '') {
+      this.bigImg = '';
+      return true;
+    }
+    if (this.legalKind !== '') {
+      this.legalKind = '';
+      return true;
+    }
     const sub = AppStorage.get<string>('settingsSub');
     if (sub !== undefined && sub !== '') {
-      // 让 SettingsPage 自己 pop 二级栈：只清共享状态会把栈留脏，下次返回要按两次。
       AppStorage.setOrCreate('settingsBack', Date.now());
       Haptics.soft();
       return true;
@@ -145,9 +243,12 @@ struct Index {
   }
 
   private systemDark(): boolean {
+    const stored: boolean | undefined = AppStorage.get<boolean>('sysDark');
+    if (stored !== undefined) {
+      return stored;
+    }
     try {
-      const ctx = getContext(this) as common.UIAbilityContext;
-      const cfg: Configuration = ctx.config;
+      const cfg: Configuration = AppCtx.ability().config;
       return cfg.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
     } catch (e) {
       return true;
@@ -158,37 +259,16 @@ struct Index {
     applyTheme(this.themeMode, this.systemDark());
   }
 
-  /**
-   * 这个地址是不是只在家里能通（局域网/回环）。
-   * 用来把「公网地址」和「局域网地址」分开存：配对是在局域网里做的，
-   * 电脑报回来的 base 往往是 192.168.x，一旦被当成公网地址存下来，
-   * 人离开家以后就没有任何可回退的地址了。
-   */
-  private isLanUrl(u: string): boolean {
-    if (u === '') {
-      return false;
-    }
-    const s = u.replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
-    const host = (s.indexOf('[') === 0 ? s.substring(1).split(']')[0] : s.split(':')[0]).toLowerCase();
-    if (host === 'localhost' || host === '::1' || host === '0.0.0.0') {
-      return true;
-    }
-    if (host.startsWith('127.') || host.startsWith('10.') || host.startsWith('192.168.') || host.startsWith('fe80') ||
-      host.startsWith('fc') || host.startsWith('fd')) {
-      return true;
-    }
-    if (host.startsWith('172.')) {
-      const second = Number(host.split('.')[1]);
-      if (second >= 16 && second <= 31) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   private async loadCfg(): Promise<void> {
     try {
-      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
+      const pa = await p.get('privacyAccepted', '0') as string;
+      this.privacyAccepted = pa === '1';
+      const wmc = await p.get('wcMobileCompat', '0') as string;
+      const wmp = await p.get('wcAutoDismissPromo', '0') as string;
+      AppStorage.setOrCreate('wcMobileCompat', wmc === '1');
+      AppStorage.setOrCreate('wcAutoDismissPromo', wmp === '1');
+
       let b = await p.get('base', DEFAULT_BASE) as string;
       const tOldBase: string = b;
       let t = await p.get('token', DEFAULT_TOKEN) as string;
@@ -196,7 +276,6 @@ struct Index {
       const sec: string = Secret.load();
       if (sec !== '') {
         t = sec;
-        // 资产库已有：把 preferences 里的明文抹掉。
         if (await p.get('token', '') !== '') {
           await p.put('token', '');
           await p.flush();
@@ -207,111 +286,154 @@ struct Index {
           await p.flush();
         }
       }
-      let t0FromMachine: string = '';
       const th = await p.get('theme', THEME_AUTO) as string;
       const fw = await p.get('forceWan', '0') as string;
       const al = await p.get('autoLan', '') as string;
       const hp = await p.get('haptics', '1') as string;
       const hd = await p.get('hdsOn', '1') as string;
+      const ic = await p.get('appIconStyle', ICON_LIGHT) as string;
       const nd = await p.get('notifyDone', '1') as string;
       const nb = await p.get('notifyBgOnly', '1') as string;
       const es = await p.get('enterSend', '1') as string;
+      const ch = await p.get('compactHistory', '0') as string;
       const ts = await p.get('textScale', '1') as string;
+      AppStorage.setOrCreate('appIconStyle', AppIcon.normalize(ic));
+      void AppIcon.init();
       AppStorage.setOrCreate('notifyDone', nd !== '0');
       AppStorage.setOrCreate('notifyBgOnly', nb !== '0');
       AppStorage.setOrCreate('enterSend', es !== '0');
+      AppStorage.setOrCreate('compactHistory', ch === '1');
       const tsN: number = Number(ts);
       AppStorage.setOrCreate('textScale', tsN > 0 ? tsN : 1);
       const lan = await p.get('lan', '') as string;
-      // 「忙碌时发送」的偏好已废弃：运行中一律排队，由输入区按钮单独决定插队
       AppStorage.setOrCreate('sendMode', 'queue');
       this.haptics = hp === '1';
       Haptics.enabled = this.haptics;
-      // 沉浸光感开关回到用户手里：默认开，关掉后底栏与顶栏退回普通底色。
       this.hdsOn = hd !== '0';
       AppStorage.setOrCreate('hdsOn', this.hdsOn);
+      // 兼容旧版 forceWan / autoLan 偏好，统一收敛为 netMode
       const nm = await p.get('netMode', '') as string;
-      this.forceWan = fw === '1';
-      // 老用户只有 forceWan，没有 autoLan：用它推出默认值
-      this.autoLan = al === '' ? (fw !== '1') : al === '1';
-      this.netMode = nm !== '' ? nm : (this.forceWan ? 'wan' : (this.autoLan ? 'auto' : 'wan'));
-      // 旧版本把局域网地址写进了 base（配对时电脑报回来的就是它），
-      // 人离开家就再也连不上：这里把它降级成局域网候选，公网地址回退到默认隧道。
+      const legacyForceWan: boolean = fw === '1';
+      const legacyAutoLan: boolean = al === '' ? !legacyForceWan : al === '1';
+      this.netMode = nm !== '' ? nm : (legacyForceWan ? 'wan' : (legacyAutoLan ? 'auto' : 'wan'));
+
       let lanSaved: string = lan;
       if (b === '' && lanSaved === '' && DEFAULT_BASE !== '') {
         b = DEFAULT_BASE;
       }
-      if (this.isLanUrl(b)) {
+      if (isLanUrl(b)) {
         lanSaved = lanSaved !== '' ? lanSaved : b;
         b = DEFAULT_BASE !== '' ? DEFAULT_BASE : '';
         console.info('DSH_CFG migrate lan-in-base -> ' + lanSaved);
       }
-      // 没有公网隧道时（开源版默认），局域网地址就是唯一可用地址
       if (b === '' && lanSaved !== '') {
         b = lanSaved;
         console.info('DSH_CFG base from lan -> ' + b);
       }
-      // 多电脑：有机器列表时以「当前这台」为准，单机配置只在第一次迁移时用
       const cur = Machines.active();
       if (cur !== null) {
         b = cur.wan;
-        t0FromMachine = Secret.loadFor(cur.id);
-        // 旧版全局令牌只用于「就是这台电脑」的迁移：地址不一致时宁可不带令牌，
-        // 也不能把 A 机的令牌配到 B 机的地址上。
-        if (t0FromMachine === '' && (t === '' || b === tOldBase)) {
-          t0FromMachine = t;
+        let mt: string = Secret.loadFor(cur.id);
+        if (mt === '' && cur.token !== undefined && cur.token !== '') {
+          mt = cur.token;
         }
+        if (mt === '' && Machines.list().length === 1 && t !== '' && (b === tOldBase || cur.wan === tOldBase)) {
+          mt = t;
+          Secret.saveFor(cur.id, mt);
+        }
+        t = mt;
         lanSaved = cur.lan.length > 0 ? cur.lan[0] : '';
         console.info('DSH_MACH restore ' + cur.name + ' ' + cur.wan);
       } else if (b !== '' && t !== '') {
         Machines.upsert(b, t, lanSaved !== '' ? [lanSaved] : [], '', true);
       }
-      if (b !== '' && t0FromMachine !== '') {
-        t = t0FromMachine;
-      }
       if (b !== '' && t !== '') {
         this.wanBase = b;
         this.token = t;
-        this.api.rebase(b, t, lanSaved, cur !== null ? cur.lan : (lanSaved !== '' ? [lanSaved] : []));
+        const curHostId: string = cur !== null && cur.hostId !== undefined ? cur.hostId : '';
+        const curE2eePub: string = cur !== null && cur.e2eePub !== undefined ? cur.e2eePub : '';
+        this.api.rebase(
+          b,
+          t,
+          lanSaved,
+          cur !== null ? cur.lan : (lanSaved !== '' ? [lanSaved] : []),
+          curHostId,
+          curE2eePub
+        );
         this.applyNetMode();
         this.machineName = Machines.displayName();
-        console.info('DSH_CFG loaded base=' + b + ' forceWan=' + this.forceWan + ' autoLan=' + this.autoLan + ' lan=' + (lanSaved !== '' ? lanSaved : '-'));
+        Unread.refresh();
+        console.info('DSH_CFG loaded base=' + b + ' netMode=' + this.netMode + ' lan=' + (lanSaved !== '' ? lanSaved : '-'));
+        if (this.privacyAccepted) {
+          void this.syncHostMeta();
+        }
       }
       if (th !== this.themeMode) {
         this.themeMode = th;
         this.applyThemeNow();
       }
+      if (this.privacyAccepted) {
+        Net.start();
+        if (this.token !== '' && this.wanBase !== '') {
+          this.startPresence();
+        }
+      }
     } catch (e) {
       console.error('DSH_CFG load failed :: ' + (e as Error).message);
+    } finally {
+      this.cfgLoaded = true;
     }
   }
 
-  private async saveCfg(b: string, t: string, lan: string[] = [], name: string = ''): Promise<void> {
-    // 先切内存里的连接再落盘：claim 已经把一次性配对码消费掉了，
-    // 若存储失败就什么都不做，用户看到「配对成功」却还连着旧电脑。
-    // 公网地址与局域网地址必须分开存：配对是在局域网里做的，电脑报回来的
-    // base 是 192.168.x，直接当公网地址存下来，人一离开家就没有回退地址了。
+  private async acceptPrivacy(): Promise<void> {
+    Haptics.soft();
+    this.privacyAccepted = true;
+    Net.start();
+    try {
+      const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
+      await p.put('privacyAccepted', '1');
+      await p.flush();
+    } catch (e) {
+      console.error('AM_PRIVACY save failed :: ' + (e as Error).message);
+    }
+    if (this.token !== '' && this.wanBase !== '') {
+      this.startPresence();
+      void this.syncHostMeta();
+    }
+  }
+
+  private async saveCfg(
+    b: string,
+    t: string,
+    lan: string[] = [],
+    name: string = '',
+    hostId: string = '',
+    e2eePub: string = ''
+  ): Promise<void> {
     let lanOne: string = lan.length > 0 ? lan[0] : '';
     let wan: string = b;
-    if (this.isLanUrl(b)) {
+    if (isLanUrl(b)) {
       lanOne = lanOne !== '' ? lanOne : b;
-      wan = this.isLanUrl(this.wanBase) || this.wanBase === '' ? DEFAULT_BASE : this.wanBase;
+      wan = isLanUrl(this.wanBase) || this.wanBase === '' ? DEFAULT_BASE : this.wanBase;
     }
-    // 开源版没有默认公网隧道：配对只给出局域网地址时，它就当 base 存下来，
-    // 否则重启后 base 为空，应用会退回配对向导（token 还在也没用）。
     if (wan === '' && lanOne !== '') {
       wan = lanOne;
     }
-    // 局域网候选要「只增不减」：保存地址时调用方传的是空数组，
-    // 旧实现会把候选整组清掉，之后 probeLan 没有地址可试，手机就永久停在公网了。
-    // 但候选只属于一台电脑：换电脑（令牌不同）时把上一台的地址带过去，
-    // 探针就会带着新令牌去敲旧地址，甚至直接选中旧电脑，所以只在同一台机器上沿用。
     const prev = Machines.active();
+    const prevId: string = prev !== null ? prev.id : '';
     const lanAll: string[] = [];
     if (lanOne !== '') {
       lanAll.push(lanOne);
     }
-    if (prev !== null && t !== '' && prev.token === t) {
+    for (let i = 0; i < lan.length; i++) {
+      if (lan[i] !== '' && lanAll.indexOf(lan[i]) < 0) {
+        lanAll.push(lan[i]);
+      }
+    }
+    const prevTok: string = prev !== null
+      ? (Secret.loadFor(prev.id) !== '' ? Secret.loadFor(prev.id) : prev.token)
+      : '';
+    if (prev !== null && t !== '' && prevTok === t) {
       for (let i = 0; i < prev.lan.length; i++) {
         if (lanAll.indexOf(prev.lan[i]) < 0) {
           lanAll.push(prev.lan[i]);
@@ -324,55 +446,103 @@ struct Index {
         }
       }
     }
-    this.wanBase = wan;
+    const saved = Machines.upsertEx(wan, t, lanAll, name, true, hostId, e2eePub);
+    const savedLanOne: string = saved.lan.length > 0 ? saved.lan[0] : '';
+    const savedHostId: string = saved.hostId !== undefined ? saved.hostId : hostId;
+    const savedPub: string = saved.e2eePub !== undefined ? saved.e2eePub : e2eePub;
+    this.wanBase = saved.wan;
     this.token = t;
-    this.api.rebase(wan, t, lanOne, lanAll);
-    this.machineName = Machines.upsert(wan, t, lanAll, name, true).name;
+    this.machineName = saved.name;
+    this.api.rebase(saved.wan, t, savedLanOne, saved.lan, savedHostId, savedPub);
+    if (saved.id !== prevId) {
+      this.stack.clear(false);
+      this.bumpMachineEpoch();
+    }
+    Unread.refresh();
     AppStorage.setOrCreate('listDirty', Date.now());
     this.applyNetMode();
     try {
-      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
-      await p.put('base', wan);
-      // 令牌能进资产库就不在 preferences 留明文；进不去才回退。
+      const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
+      await p.put('base', saved.wan);
       await p.put('token', Secret.save(t) ? '' : t);
-      await p.put('lan', lanOne);
+      await p.put('lan', savedLanOne);
       await p.flush();
-      console.info('DSH_CFG saved base=' + wan + ' lan=' + (lanOne !== '' ? lanOne : '-'));
+      console.info('DSH_CFG saved base=' + saved.wan + ' lan=' + (savedLanOne !== '' ? savedLanOne : '-'));
     } catch (e) {
       console.error('DSH_CFG save failed :: ' + (e as Error).message);
     }
+    if (this.privacyAccepted) {
+      this.startPresence();
+      void this.syncHostMeta();
+    }
   }
 
-  /** 切到另一台已配对的电脑：地址、令牌、当前名一起换。 */
+  /** 清空当前活跃配对并停止网络活动。 */
+  private async clearActivePairing(): Promise<void> {
+    this.stopPresence(false);
+    this.wanBase = '';
+    this.token = '';
+    this.machineName = '';
+    this.api.rebase('', '', '', [], '', '');
+    this.stack.clear(false);
+    this.bumpMachineEpoch();
+    Secret.clear();
+    Unread.refresh();
+    try {
+      const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
+      await p.put('base', '');
+      await p.put('token', '');
+      await p.put('lan', '');
+      await p.flush();
+    } catch (e) {
+      console.error('DSH_CFG clear failed :: ' + (e as Error).message);
+    }
+  }
+
+  /** 切到另一台已配对的电脑：地址、令牌、当前名严格按机器隔离切换。 */
   private async switchMachine(id: string): Promise<void> {
     const m = Machines.activate(id);
     if (m === null) {
       return;
     }
     let mt: string = Secret.loadFor(m.id);
-    if (m.wan === this.wanBase && this.token !== '') {
-      // 点的就是当前这台：内存里的令牌一定是对的，以它为准并顺手补写别名。
-      // （只信资产库会踩到「别名缺失/写失败 -> 空令牌 -> 401」的坑。）
-      mt = this.token;
-      Secret.saveFor(m.id, mt);
+    if (mt === '' && m.token !== undefined && m.token !== '') {
+      mt = m.token;
+      if (Secret.saveFor(m.id, mt)) {
+        m.token = '';
+      }
     }
     if (mt === '') {
-      mt = Secret.load();
-    }
-    if (mt === '') {
-      Toast.err('这台电脑的访问令牌丢了，请在连接页重新配对');
+      Toast.err('这台电脑的访问令牌已失效，请在连接页重新配对');
+      this.wanBase = m.wan;
+      this.token = '';
+      this.machineName = m.name;
+      this.api.rebase('', '', '', [], '', '');
+      this.stack.clear(false);
+      this.bumpMachineEpoch();
+      Unread.refresh();
       return;
     }
     this.wanBase = m.wan;
     this.token = mt;
     this.machineName = m.name;
-    this.api.rebase(m.wan, m.token, m.lan.length > 0 ? m.lan[0] : '', m.lan);
+    this.api.rebase(
+      m.wan,
+      mt,
+      m.lan.length > 0 ? m.lan[0] : '',
+      m.lan,
+      m.hostId !== undefined ? m.hostId : '',
+      m.e2eePub !== undefined ? m.e2eePub : ''
+    );
+    this.stack.clear(false);
+    this.bumpMachineEpoch();
+    Unread.refresh();
     this.applyNetMode();
     try {
-      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
       await p.put('base', m.wan);
-      const mt2: string = Secret.loadFor(m.id);
-      await p.put('token', mt2 !== '' ? '' : (m.token !== '' ? m.token : ''));
+      const savedPrimary: boolean = Secret.save(mt);
+      await p.put('token', savedPrimary ? '' : mt);
       await p.put('lan', m.lan.length > 0 ? m.lan[0] : '');
       await p.flush();
     } catch (e) {
@@ -380,25 +550,28 @@ struct Index {
     }
     console.info('DSH_MACH switch ' + m.name + ' ' + m.wan);
     AppStorage.setOrCreate('listDirty', Date.now());
+    if (this.privacyAccepted) {
+      this.startPresence();
+      void this.syncHostMeta();
+    }
   }
 
-  /** 忘掉一台电脑；删的是当前这台时自动切到剩下的第一台。 */
+  /** 忘掉一台电脑；删的是最后一台时清空活跃配对，否则切到剩下的第一台。 */
   private async removeMachine(id: string): Promise<void> {
     Machines.remove(id);
     const cur = Machines.active();
     if (cur !== null) {
       await this.switchMachine(cur.id);
     } else {
-      this.machineName = '';
+      await this.clearActivePairing();
     }
   }
 
-  /** 把 netMode 同步到 Api 与兼容字段；三处入口（读配置、保存、切电脑）都走它。 */
+  /** 把 netMode 同步到 Api；三处入口（读配置、保存、切电脑）都走它。 */
   private applyNetMode(): void {
-    this.forceWan = this.netMode === 'wan';
-    this.autoLan = this.netMode !== 'wan';
-    this.api.setForceWan(this.forceWan);
-    this.api.setAutoLan(this.autoLan);
+    const isWan: boolean = this.netMode === 'wan';
+    this.api.setForceWan(isWan);
+    this.api.setAutoLan(!isWan);
     this.api.setLanOnly(this.netMode === 'lan');
   }
 
@@ -407,9 +580,9 @@ struct Index {
     this.applyNetMode();
     console.info('DSH_CFG netMode=' + mode);
     try {
-      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
       await p.put('netMode', mode);
-      // 旧字段继续写，回退旧版本时不至于丢策略；wan 之外的档位都算「自动」。
+      // 保留旧键写入以兼容旧版本回退
       await p.put('forceWan', this.netMode === 'wan' ? '1' : '0');
       await p.put('autoLan', this.netMode === 'auto' ? '1' : '0');
       await p.flush();
@@ -421,12 +594,11 @@ struct Index {
   private async saveTheme(mode: string): Promise<void> {
     this.themeMode = mode;
     this.applyThemeNow();
-    // 换主题会重建 ShellPage：先把二级页收回栈底，否则 settingsSub 残留会让底栏消失。
     AppStorage.setOrCreate('settingsBack', Date.now());
     AppStorage.setOrCreate('settingsSub', '');
     this.rebuildNav();
     try {
-      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
       await p.put('theme', mode);
       await p.flush();
     } catch (e) {
@@ -437,7 +609,6 @@ struct Index {
   /** 换主题后让被压栈的页面用新配色重建，但不把用户送回首页 */
   private rebuildNav(): void {
     try {
-      // getAllPathName() 只含压栈页面，首页不是其中一项，所以不能假设第 0 项是首页
       const names: string[] = this.stack.getAllPathName();
       if (names.length === 0) {
         return;
@@ -446,11 +617,9 @@ struct Index {
       for (let i = 0; i < names.length; i++) {
         params.push(this.stack.getParamByIndex(i) as ChatParam);
       }
-      // 重建不该播转场：清栈和重压栈都关掉动画
       this.stack.clear(false);
       const rev: number = ++this.navRev;
       setTimeout(() => {
-        // 这 40ms 里用户可能已经自己点了新页面：那就别再把旧栈压回去
         if (rev !== this.navRev || this.stack.getAllPathName().length !== 0) {
           return;
         }
@@ -473,10 +642,12 @@ struct Index {
     this.haptics = v;
     Haptics.enabled = v;
     const seq: number = ++this.hapticsSeq;
-    if (v) Haptics.soft();
+    if (v) {
+      Haptics.soft();
+    }
     console.info('DSH_HAP enabled=' + v + ' seq=' + seq);
     try {
-      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
       if (seq !== this.hapticsSeq) {
         return;
       }
@@ -487,14 +658,16 @@ struct Index {
     }
   }
 
-  /** 沉浸光感开关：关掉后所有系统材质退回普通底色，并立即重建界面。 */
+  /** 沉浸光感开关：关掉后所有系统材质退回普通底色，并立即刷新界面。 */
   private async saveHds(v: boolean): Promise<void> {
     this.hdsOn = v;
     AppStorage.setOrCreate('hdsOn', v);
-    if (v) Haptics.soft();
+    if (v) {
+      Haptics.soft();
+    }
     console.info('DSH_HDS switch=' + v);
     try {
-      const p = await preferences.getPreferences(getContext(this), PREF_STORE);
+      const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
       await p.put('hdsOn', v ? '1' : '0');
       await p.flush();
     } catch (e) {
@@ -503,11 +676,137 @@ struct Index {
   }
 
   @Builder
+  splashView() {
+    Column({ space: 12 }) {
+      Image(Tokens.isDark ? $r('app.media.start_window_icon_dark') : $r('app.media.start_window_icon_light'))
+        .width(84)
+        .height(84)
+        .objectFit(ImageFit.Contain)
+      Text('Agent Mobile')
+        .fontSize(20)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Tokens.fg)
+      Text('正在准备本地工作区…')
+        .fontSize(Tokens.fsCaption)
+        .fontColor(Tokens.dim2)
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor(this.themeBg)
+  }
+
+  @Builder
+  privacyGateView() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column() {
+        Column({ space: 14 }) {
+          Image(AppIcon.res(this.appIconStyle))
+            .width(64)
+            .height(64)
+            .borderRadius(16)
+            .border({ width: 0.5, color: Tokens.line })
+          Text('欢迎使用 Agent Mobile')
+            .fontSize(21)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(Tokens.fg)
+          Text('Agent Mobile 是一款智能体远程控制与对话客户端，仅在你主动配对后连接你自己的电脑网关服务。我们不会收集你的聊天记录或上传无关个人数据。')
+            .fontSize(Tokens.fsBody)
+            .fontColor(Tokens.dim)
+            .lineHeight(21)
+            .textAlign(TextAlign.Start)
+            .width('100%')
+          Text('在使用扫码配对、附件上传、通知提醒等能力时，应用仅按需调用相机、文件选择、通知与系统凭据存储，所有令牌和加密私钥均保存在本机受保护存储中。')
+            .fontSize(Tokens.fsCaption)
+            .fontColor(Tokens.dim2)
+            .lineHeight(19)
+            .width('100%')
+          Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center }) {
+            Text('继续前请阅读并同意：')
+              .fontSize(Tokens.fsCaption)
+              .fontColor(Tokens.dim2)
+            Text('《隐私政策》')
+              .fontSize(Tokens.fsCaption)
+              .fontColor(Tokens.accent)
+              .fontWeight(FontWeight.Medium)
+              .margin({ right: 6 })
+              .onClick(() => {
+                Haptics.tap();
+                this.legalKind = 'privacy';
+              })
+            Text('《用户协议》')
+              .fontSize(Tokens.fsCaption)
+              .fontColor(Tokens.accent)
+              .fontWeight(FontWeight.Medium)
+              .onClick(() => {
+                Haptics.tap();
+                this.legalKind = 'terms';
+              })
+          }
+          .width('100%')
+
+          Row({ space: 10 }) {
+            Text('暂不使用')
+              .fontSize(Tokens.fsBody)
+              .fontColor(Tokens.dim)
+              .textAlign(TextAlign.Center)
+              .layoutWeight(1)
+              .padding({ top: 12, bottom: 12 })
+              .backgroundColor(Tokens.surface2)
+              .borderRadius(Tokens.rInput)
+              .onClick(() => {
+                Haptics.tap();
+                try {
+                  void AppCtx.ability().terminateSelf();
+                } catch (e) {
+                }
+              })
+            Text('同意并继续')
+              .fontSize(Tokens.fsBody)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Tokens.accentInk)
+              .textAlign(TextAlign.Center)
+              .layoutWeight(1.4)
+              .padding({ top: 12, bottom: 12 })
+              .backgroundColor(Tokens.accent)
+              .borderRadius(Tokens.rInput)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+              .onClick(() => {
+                void this.acceptPrivacy();
+              })
+          }
+          .width('100%')
+          .margin({ top: 6 })
+        }
+        .width('100%')
+        .constraintSize({ maxWidth: 440 })
+        .padding(22)
+        .backgroundColor(Tokens.surface)
+        .borderRadius(Tokens.rXl)
+        .border({ width: 1, color: Tokens.line })
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20 })
+      .alignItems(HorizontalAlign.Center)
+
+      if (this.legalKind !== '') {
+        LegalSheet({
+          kind: this.legalKind as LegalDocKind,
+          onClose: () => {
+            this.legalKind = '';
+          }
+        })
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(this.themeBg)
+  }
+
+  @Builder
   pageMap(name: string, param: ChatParam) {
     if (name === 'chat') {
       ChatPage({ api: this.api, param: param })
-    } else if (name === 'agents') {
-      AgentsPage({ api: this.api })
     } else if (name === 'presets') {
       PresetsPage({ api: this.api, param: param })
     }
@@ -515,106 +814,110 @@ struct Index {
 
   build() {
     Stack({ alignContent: Alignment.Center }) {
-    Navigation(this.stack) {
-      Stack() {
-        ForEach([this.themeRev], (rev: number) => {
-          ShellPage({
-            api: this.api,
-            wanBase: this.wanBase,
-            token0: this.token,
-            themeMode: this.themeMode,
-            systemDark: this.systemDark(),
-            forceWan: this.forceWan,
-            autoLan: this.autoLan,
-            netMode: this.netMode,
-            haptics: this.haptics,
-            defaultLan: LAN_BASE,
-            onReset: () => {
-              this.saveCfg(DEFAULT_BASE, DEFAULT_TOKEN, [LAN_BASE]);
-            },
-            onSave: (b: string, t: string) => {
-              this.saveCfg(b, t, []);
-            },
-            machineName: this.machineName,
-            onPickMachine: (id: string) => {
-              this.switchMachine(id);
-            },
-            onRemoveMachine: (id: string) => {
-              this.removeMachine(id);
-            },
-            onAddMachine: (wan: string, token: string, name: string) => {
-              this.saveCfg(wan, token, [], name);
-            },
-            onSaveLan: (b: string, t: string, lan: string[]) => {
-              this.saveCfg(b, t, lan);
-            },
-            onTheme: (m: string) => {
-              this.saveTheme(m);
-            },
-            onAutoLan: (v: boolean) => {
-            this.saveNetMode(v ? 'auto' : 'wan');
-          },
-            onNetMode: (m: string) => {
-              this.saveNetMode(m);
-            },
-          onWan: (v: boolean) => {
-              this.saveNetMode(v ? 'wan' : 'auto');
-            },
-            onHaptics: (v: boolean) => {
-              this.saveHaptics(v);
-            },
-            onHds: (v: boolean) => {
-              this.saveHds(v);
+      if (!this.cfgLoaded) {
+        this.splashView()
+      } else if (!this.privacyAccepted) {
+        this.privacyGateView()
+      } else {
+        Navigation(this.stack) {
+          Stack() {
+            if (this.token !== '') {
+              ForEach([this.themeRev], (rev: number) => {
+                ShellPage({
+                  api: this.api,
+                  wanBase: this.wanBase,
+                  token0: this.token,
+                  themeMode: this.themeMode,
+                  systemDark: this.systemDark(),
+                  netMode: this.netMode,
+                  haptics: this.haptics,
+                  defaultLan: LAN_BASE,
+                  onReset: () => {
+                    const cur = Machines.active();
+                    if (cur !== null) {
+                      Machines.remove(cur.id);
+                    }
+                    const next = Machines.active();
+                    if (next !== null) {
+                      void this.switchMachine(next.id);
+                    } else {
+                      void this.clearActivePairing();
+                    }
+                  },
+                  onSave: (b: string, t: string) => {
+                    void this.saveCfg(b, t, []);
+                  },
+                  machineName: this.machineName,
+                  onPickMachine: (id: string) => {
+                    void this.switchMachine(id);
+                  },
+                  onRemoveMachine: (id: string) => {
+                    void this.removeMachine(id);
+                  },
+                  onAddMachine: (wan: string, token: string, name: string) => {
+                    void this.saveCfg(wan, token, [], name);
+                  },
+                  onSaveLan: (b: string, t: string, lan: string[], hostId?: string, e2eePub?: string, hostName?: string) => {
+                    void this.saveCfg(b, t, lan, hostName !== undefined ? hostName : '',
+                      hostId !== undefined ? hostId : '', e2eePub !== undefined ? e2eePub : '');
+                  },
+                  onTheme: (m: string) => {
+                    void this.saveTheme(m);
+                  },
+                  onNetMode: (m: string) => {
+                    void this.saveNetMode(m);
+                  },
+                  onHaptics: (v: boolean) => {
+                    void this.saveHaptics(v);
+                  },
+                  onHds: (v: boolean) => {
+                    void this.saveHds(v);
+                  }
+                })
+              }, (rev: number) => 'shell-' + rev)
+            } else {
+              PairPage({
+                api: this.api,
+                defaultBase: '',
+                hasBack: false,
+                onExit: () => {
+                },
+                onPaired: (b: string, t: string, host: string, lan: string[], hostId?: string, e2eePub?: string) => {
+                  void this.saveCfg(b, t, lan, host, hostId !== undefined ? hostId : '', e2eePub !== undefined ? e2eePub : '');
+                }
+              })
             }
-          })
-        }, (rev: number) => 'shell-' + rev)
-
-        // 还没配对过：整屏做成连接向导
-        if (this.token === '') {
-          PairPage({
-            api: this.api,
-            defaultBase: '',
-            onExit: () => {
-            },
-            onPaired: (b: string, t: string, host: string, lan: string[]) => {
-              this.saveCfg(b, t, lan, host);
-            }
-          })
-            .width('100%')
-            .height('100%')
-            .backgroundColor(Tokens.bg)
-        }
-      }
-      .width('100%')
-      .height('100%')
-    }
-    .navDestination(this.pageMap)
-    // 页面转场交给系统：原生推入（新页右侧滑入、旧页视差左移+压暗、左缘右滑跟手返回）
-    .mode(NavigationMode.Stack)
-    .hideTitleBar(true)
-    .hideToolBar(true)
-    .backgroundColor(Tokens.bg)
-    .width('100%')
-    .height('100%')
-
-    // 全屏看图：挂在 Navigation 外面，才能盖住状态栏和标题栏
-    if (this.bigImg !== '') {
-      Stack({ alignContent: Alignment.Center }) {
-        Row()
+          }
           .width('100%')
           .height('100%')
-          .backgroundColor('#F2000000')
-        Image(this.bigImg)
-          .width('100%')
-          .objectFit(ImageFit.Contain)
+        }
+        .navDestination(this.pageMap)
+        .mode(NavigationMode.Stack)
+        .hideTitleBar(true)
+        .hideToolBar(true)
+        .backgroundColor(this.themeBg)
+        .width('100%')
+        .height('100%')
       }
-      .width('100%')
-      .height('100%')
-      .onClick(() => {
-        this.bigImg = '';
-      })
-      .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
-    }
+
+      // 全屏看图：挂在 Navigation 外面，才能盖住状态栏和标题栏
+      if (this.bigImg !== '') {
+        Stack({ alignContent: Alignment.Center }) {
+          Row()
+            .width('100%')
+            .height('100%')
+            .backgroundColor('#F2000000')
+          Image(this.bigImg)
+            .width('100%')
+            .objectFit(ImageFit.Contain)
+        }
+        .width('100%')
+        .height('100%')
+        .onClick(() => {
+          this.bigImg = '';
+        })
+        .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
+      }
     }
     .width('100%')
     .height('100%')

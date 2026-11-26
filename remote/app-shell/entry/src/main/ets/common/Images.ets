@@ -38,28 +38,42 @@ function mediaTypeOf(uri: string): string {
 /** Last path segment, used only as a display name. */
 function nameOf(uri: string): string {
   const cut: number = uri.lastIndexOf('/');
-  const tail: string = cut >= 0 ? uri.slice(cut + 1) : uri;
+  let tail: string = cut >= 0 ? uri.slice(cut + 1) : uri;
+  try {
+    tail = decodeURIComponent(tail);
+  } catch (e) {
+  }
   return tail.length > 80 ? tail.slice(tail.length - 80) : tail;
 }
 
 /** Read one picked uri into an `ImagePart`; `undefined` when it is too large. */
-function readOne(uri: string): ImagePart | undefined {
-  const file = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
+async function readOne(uri: string): Promise<ImagePart | undefined> {
+  const file: fileIo.File = await fileIo.open(uri, fileIo.OpenMode.READ_ONLY);
   try {
-    const st = fileIo.statSync(file.fd);
+    const st: fileIo.Stat = await fileIo.stat(file.fd);
     if (st.size <= 0 || st.size > MAX_IMAGE_BYTES) {
       return undefined;
     }
-    const buf = new ArrayBuffer(st.size);
-    const read = fileIo.readSync(file.fd, buf);
-    if (read <= 0) {
+    const buf: ArrayBuffer = new ArrayBuffer(st.size);
+    let offset: number = 0;
+    while (offset < st.size) {
+      const n: number = await fileIo.read(file.fd, buf, { offset: offset, length: st.size - offset });
+      if (n <= 0) {
+        break;
+      }
+      offset += n;
+    }
+    if (offset <= 0) {
       return undefined;
     }
-    const bytes = new Uint8Array(buf.slice(0, read));
+    const bytes: Uint8Array = new Uint8Array(buf, 0, offset);
     const data: string = new util.Base64Helper().encodeToStringSync(bytes);
     return { mediaType: mediaTypeOf(uri), data: data, name: nameOf(uri) };
   } finally {
-    fileIo.closeSync(file);
+    try {
+      await fileIo.close(file);
+    } catch (e) {
+    }
   }
 }
 
@@ -75,7 +89,7 @@ export async function pickImages(limit: number): Promise<ImagePart[]> {
   const picked: photoAccessHelper.PhotoSelectResult = await picker.select(opt);
   const out: ImagePart[] = [];
   for (const uri of picked.photoUris) {
-    const part = readOne(uri);
+    const part = await readOne(uri);
     if (part !== undefined) {
       out.push(part);
     }
@@ -84,10 +98,10 @@ export async function pickImages(limit: number): Promise<ImagePart[]> {
 }
 
 /** Turn already-granted uris (e.g. from the camera picker) into image parts. */
-export function fromUris(uris: string[]): ImagePart[] {
+export async function fromUris(uris: string[]): Promise<ImagePart[]> {
   const out: ImagePart[] = [];
   for (const uri of uris) {
-    const part = readOne(uri);
+    const part = await readOne(uri);
     if (part !== undefined) {
       out.push(part);
     }

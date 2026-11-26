@@ -1,95 +1,406 @@
-import common from '@ohos.app.ability.common';
-import pasteboard from '@ohos.pasteboard';
-import scanBarcode from '@hms.core.scan.scanBarcode';
+import { scanBarcode } from '@kit.ScanKit';
+import http from '@ohos.net.http';
 import { Api } from '../common/Api';
-import { Tokens } from '../common/Tokens';
+import { isLanUrl } from '../common/ApiUtil';
+import { AppCtx } from '../common/AppCtx';
+import { AppIcon, ICON_LIGHT } from '../common/AppIcon';
+import { PageHeader, TopFade } from '../common/Chrome';
+import { copyText } from '../common/Clipboard';
 import { Haptics } from '../common/Haptics';
-import { Pairing, PairClaim, PairLink } from '../common/Pairing';
+import { Mat } from '../common/Mat';
+import { Motion } from '../common/Motion';
+import { PairClaim, PairError, PairInfo, Pairing, PairLink } from '../common/Pairing';
+import { Tokens } from '../common/Tokens';
+import { ConnectionStageCard, SheetHeader } from '../common/Widgets';
+
+const PAIR_CMD: string = 'dsh plugin --profile desktop add agent-mobile-gateway';
+
+const PAIR_STAGES: string[] = [
+  '整理连接地址',
+  '探测可达入口',
+  '核验身份与密钥',
+  '保存凭据完成配对'
+];
+
+interface ManualInfoResp {
+  ok?: boolean;
+  host?: string;
+  hostId?: string;
+  e2eePub?: string;
+  port?: number;
+  addresses?: string[];
+}
 
 /**
- * 配对向导：对齐桌面端控制台的「第 1 步电脑端准备 / 第 2 步扫码连接」。
- * 两步都留在设置里，进来一次就能走完，不用记地址与令牌。
+ * 原创两屏配对向导：
+ * - connect（快速连接）：扫码配对主卡 + [6位配对码 | 手动地址与令牌] 分段切换 + 主机实时预览 + 排查抽屉；
+ * - prepare（电脑端准备）：三步极简引导与一键复制网关安装命令。
  */
 @Component
 export struct PairPage {
   api: Api = new Api('', '');
-  defaultBase: string = '';
-  /** 从「设置 → 连接」直接进来时的落点：code / scan / guide；空串按向导从头走 */
+  @Prop defaultBase: string = '';
   @Prop entry: string = '';
+  @Prop hasBack: boolean = false;
   onExit: () => void = () => {};
-  onPaired: (base: string, token: string, host: string, lan: string[]) => void = () => {};
-  @State private step: number = 1;
+  onPaired: (b: string, t: string, host: string, lan: string[], hostId?: string, e2eePub?: string) => void = () => {};
+
+  @StorageLink('topInset') topInset: number = 40;
+  @StorageLink('bottomInset') bottomInset: number = 20;
+  @StorageLink('wideScreen') wideScreen: boolean = false;
+  @StorageLink('themeBg') themeBg: string = Tokens.bg;
+  @StorageLink('hdsOn') hdsOn: boolean = true;
+  @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('appIconStyle') appIconStyle: string = ICON_LIGHT;
+
+  @State private screen: string = 'connect';
+  @State private tab: string = 'code';
   @State private code: string = '';
-  @State private manual: string = '';
-  @State private showManual: boolean = false;
+  @State private addr: string = '';
+  @State private manualBase: string = '';
+  @State private manualToken: string = '';
+  @State private manualName: string = '';
+
   @State private busy: boolean = false;
   @State private err: string = '';
   @State private okMsg: string = '';
   @State private hint: string = '';
 
+  @State private stageActive: boolean = false;
+  @State private stageIdx: number = 0;
+  @State private stageDetail: string = '';
+  @State private stageErr: string = '';
+  @State private elapsedSec: number = 0;
+  @State private lastBases: string[] = [];
+  @State private lastCode: string = '';
+
+  @State private probing: boolean = false;
+  @State private previewInfo: PairInfo | null = null;
+  @State private previewErr: string = '';
+  @State private helpSheet: boolean = false;
+
+  private claimSeq: number = 0;
+  private probeTimer: number = -1;
+  private elapsedTimer: number = -1;
+  private scroller: Scroller = new Scroller();
+
   aboutToAppear(): void {
-    // 手动输入留空：预填会让用户先删一遍，反而更容易输错
-    this.manual = '';
-    if (this.entry === 'code' || this.entry === 'scan') {
-      this.step = 2;
-    }
-    if (this.entry === 'scan') {
-      // 扫码是系统半模态，等这一页真正上屏再拉起来
-      setTimeout(() => {
-        this.scan();
-      }, 260);
+    this.screen = this.entry === 'guide' ? 'prepare' : 'connect';
+    if (this.defaultBase !== '') {
+      this.addr = this.defaultBase;
+      this.manualBase = this.defaultBase;
     }
   }
 
-  private async doClaim(bases: string[], code: string): Promise<void> {
-    const list: string[] = [];
+  aboutToDisappear(): void {
+    this.stopTimer();
+    if (this.probeTimer >= 0) {
+      clearTimeout(this.probeTimer);
+      this.probeTimer = -1;
+    }
+  }
+
+  private startTimer(): void {
+    this.stopTimer();
+    this.elapsedSec = 0;
+    this.elapsedTimer = setInterval(() => {
+      this.elapsedSec++;
+    }, 1000);
+  }
+
+  private stopTimer(): void {
+    if (this.elapsedTimer >= 0) {
+      clearInterval(this.elapsedTimer);
+      this.elapsedTimer = -1;
+    }
+  }
+
+  private cancelClaim(): void {
+    this.claimSeq++;
+    this.stopTimer();
+    this.busy = false;
+    this.stageActive = false;
+    this.stageErr = '';
+    this.hint = '已取消本次连接，可修改参数后重试';
+  }
+
+  private switchScreen(next: string): void {
+    this.err = '';
+    this.okMsg = '';
+    this.stageErr = '';
+    this.stageActive = false;
+    this.getUIContext().animateTo({ duration: Motion.move, curve: Motion.std }, () => {
+      this.screen = next;
+    });
+    this.scroller.scrollTo({ xOffset: 0, yOffset: 0, animation: true });
+  }
+
+  private scheduleProbe(rawAddr: string): void {
+    if (this.probeTimer >= 0) {
+      clearTimeout(this.probeTimer);
+      this.probeTimer = -1;
+    }
+    const clean: string = rawAddr.trim();
+    if (clean === '') {
+      this.previewInfo = null;
+      this.previewErr = '';
+      this.probing = false;
+      return;
+    }
+    const norm: string = Pairing.normalizeBase(clean);
+    if (!/^https?:\/\/[^\s/:]+(:\d+)?$/i.test(norm)) {
+      this.previewInfo = null;
+      return;
+    }
+    this.probeTimer = setTimeout(() => {
+      this.probeTimer = -1;
+      void this.probeHost(norm);
+    }, 380);
+  }
+
+  private async probeHost(normBase: string): Promise<void> {
+    if (normBase === '') {
+      return;
+    }
+    this.probing = true;
+    this.previewErr = '';
+    try {
+      const info: PairInfo = await Pairing.info(normBase);
+      if (Pairing.normalizeBase(this.addr) === normBase) {
+        this.previewInfo = info;
+      }
+    } catch (e) {
+      if (Pairing.normalizeBase(this.addr) === normBase) {
+        this.previewInfo = null;
+        this.previewErr = (e as Error).message ?? '无法识别此地址';
+      }
+    } finally {
+      this.probing = false;
+    }
+  }
+
+  private hasInsecureWanHttp(bases: readonly string[]): string {
     for (let i = 0; i < bases.length; i++) {
-      const one = Pairing.normalizeBase(bases[i]);
-      if (one !== '' && list.indexOf(one) < 0) {
-        list.push(one);
+      const n: string = Pairing.normalizeBase(bases[i]);
+      if (n.toLowerCase().startsWith('http://') && !isLanUrl(n)) {
+        return n;
       }
     }
-    const c = code.trim();
-    if (list.length === 0) {
-      this.err = '先填电脑地址';
+    return '';
+  }
+
+  private confirmIfInsecureWan(bases: readonly string[], proceed: () => void): void {
+    const insecureUrl: string = this.hasInsecureWanHttp(bases);
+    if (insecureUrl === '') {
+      proceed();
       return;
     }
-    if (c.length !== 6) {
-      this.err = '配对码是 6 位数字';
-      return;
-    }
+    AppCtx.confirm(
+      '非局域网明文连接提醒',
+      '检测到公网地址 ' + insecureUrl + ' 使用了未加密的 http:// 传输。外网访问强烈建议配置 HTTPS 或 Cloudflare 隧道，确认继续连接吗？',
+      '仍然连接',
+      proceed,
+      false,
+      '取消'
+    );
+  }
+
+  private async runClaim(bases: readonly string[], codeStr: string): Promise<void> {
     if (this.busy) {
       return;
     }
+    const list: string[] = [];
+    for (let i = 0; i < bases.length; i++) {
+      const n: string = Pairing.normalizeBase(bases[i]);
+      if (n !== '' && list.indexOf(n) < 0) {
+        list.push(n);
+      }
+    }
+    if (list.length === 0) {
+      this.stageActive = false;
+      this.err = '请填写电脑服务地址，或在电脑面板直接扫二维码。';
+      return;
+    }
+    const c: string = codeStr.trim();
+    if (c.length !== 6) {
+      this.stageActive = false;
+      this.err = '请输入电脑面板显示的 6 位数字配对码。';
+      return;
+    }
+
+    const seq: number = ++this.claimSeq;
+    this.lastBases = list.slice();
+    this.lastCode = c;
     this.busy = true;
     this.err = '';
-    this.okMsg = list.length > 1
-      ? '正在连 ' + list[0] + '（另有 ' + (list.length - 1) + ' 个备选）…'
-      : '正在连 ' + list[0] + ' …';
+    this.okMsg = '';
+    this.hint = '';
+    this.stageErr = '';
+    this.stageActive = true;
+    this.stageIdx = 0;
+    this.stageDetail = '已准备 ' + String(list.length) + ' 个连接入口';
+    this.startTimer();
+
     try {
-      const r: PairClaim = await Pairing.claimAny(list, c);
-      const used = r.usedBase !== undefined && r.usedBase !== '' ? r.usedBase : list[0];
-      this.okMsg = '配对成功 · ' + (r.host !== undefined ? r.host : '');
-      console.info('DSH_PAIR ok base=' + used + ' host=' + r.host);
-      Haptics.tap();
-      await this.wait(320);
-      this.onPaired(used, r.token, r.host, r.lan !== undefined ? r.lan : []);
+      await new Promise<void>((r: () => void) => setTimeout(r, 60));
+      if (seq !== this.claimSeq) {
+        return;
+      }
+      this.stageIdx = 1;
+      this.stageDetail = '正在连通 ' + list[0];
+
+      const res: PairClaim = await Pairing.claimAny(list, c, (st: number, detail: string) => {
+        if (seq !== this.claimSeq) {
+          return;
+        }
+        this.stageIdx = st <= 0 ? 1 : 2;
+        this.stageDetail = detail;
+      });
+      if (seq !== this.claimSeq) {
+        return;
+      }
+
+      const used: string = res.usedBase !== undefined && res.usedBase !== '' ? res.usedBase : list[0];
+      const hostLabel: string = res.host !== undefined && res.host !== '' ? res.host : used;
+      const hostId: string = res.hostId !== undefined && res.hostId !== ''
+        ? res.hostId
+        : (this.previewInfo !== null && this.previewInfo.hostId !== undefined ? this.previewInfo.hostId : '');
+      const e2eePub: string = res.e2eePub !== undefined && res.e2eePub !== ''
+        ? res.e2eePub
+        : (this.previewInfo !== null && this.previewInfo.e2eePub !== undefined ? this.previewInfo.e2eePub : '');
+
+      this.stageIdx = 3;
+      this.stageDetail = '正在写入本机加密凭据 · ' + hostLabel;
+      this.okMsg = '已连接 · ' + hostLabel;
+      Haptics.soft();
+      await new Promise<void>((r: () => void) => setTimeout(r, 240));
+      if (seq !== this.claimSeq) {
+        return;
+      }
+      this.onPaired(used, res.token, hostLabel, res.lan !== undefined ? res.lan : [], hostId, e2eePub);
     } catch (e) {
-      const msg = (e as Error).message;
+      if (seq !== this.claimSeq) {
+        return;
+      }
+      const msg: string = (e as Error).message !== undefined && (e as Error).message !== ''
+        ? (e as Error).message
+        : '连接未成功，请确认电脑端网关正在运行';
+      this.stageIdx = e instanceof PairError ? 2 : 1;
+      this.stageErr = msg;
       this.err = msg;
-      this.okMsg = '';
-      console.error('DSH_PAIR fail :: ' + msg);
     } finally {
-      this.busy = false;
+      if (seq === this.claimSeq) {
+        this.stopTimer();
+        this.busy = false;
+      }
     }
   }
 
-  private async wait(ms: number): Promise<void> {
-    await new Promise<void>((resolve: () => void) => {
-      setTimeout(() => {
-        resolve();
-      }, ms);
+  private startManualConnect(): void {
+    const rawBase: string = this.manualBase.trim();
+    const rawToken: string = this.manualToken.trim();
+    if (rawBase === '') {
+      this.err = '请填写电脑连接地址。';
+      return;
+    }
+    const norm: string = Pairing.normalizeBase(rawBase);
+    if (!/^https?:\/\/[^\s/]+/i.test(norm)) {
+      this.err = '地址格式无效，例如 192.168.1.10:8901 或 https://example.com';
+      return;
+    }
+    if (rawToken === '') {
+      this.err = '请填写访问令牌。';
+      return;
+    }
+    this.confirmIfInsecureWan([norm], () => {
+      void this.runManualVerifyAndSave(norm, rawToken, this.manualName.trim());
     });
+  }
+
+  private async runManualVerifyAndSave(normBase: string, rawToken: string, customName: string): Promise<void> {
+    if (this.busy) {
+      return;
+    }
+    const seq: number = ++this.claimSeq;
+    this.busy = true;
+    this.err = '';
+    this.okMsg = '';
+    this.stageErr = '';
+    this.stageActive = true;
+    this.stageIdx = 1;
+    this.stageDetail = '正在校验令牌与主机指纹 · ' + normBase;
+    this.startTimer();
+
+    const client: http.HttpRequest = http.createHttp();
+    try {
+      const resp = await client.request(normBase + '/api/info', {
+        method: http.RequestMethod.GET,
+        header: { 'Authorization': 'Bearer ' + rawToken },
+        connectTimeout: 4500,
+        readTimeout: 7000,
+        expectDataType: http.HttpDataType.STRING
+      });
+      if (seq !== this.claimSeq) {
+        return;
+      }
+      if (resp.responseCode === 401 || resp.responseCode === 403) {
+        throw new PairError(resp.responseCode, '电脑拒绝了该访问令牌，请核对后重试');
+      }
+      if (resp.responseCode < 200 || resp.responseCode >= 300) {
+        throw new Error('电脑返回异常状态（HTTP ' + String(resp.responseCode) + '）');
+      }
+      let info: ManualInfoResp = {};
+      try {
+        info = JSON.parse(resp.result as string) as ManualInfoResp;
+      } catch (e) {
+        throw new Error('返回内容格式异常，请确认地址指向 Agent Mobile 网关');
+      }
+      const hostName: string = customName !== ''
+        ? customName
+        : (info.host !== undefined && info.host !== '' ? info.host : normBase);
+      const hid: string = info.hostId !== undefined ? info.hostId : '';
+      const pub: string = info.e2eePub !== undefined ? info.e2eePub : '';
+      const lanList: string[] = [];
+      if (isLanUrl(normBase)) {
+        lanList.push(normBase);
+      }
+      if (info.addresses !== undefined && info.port !== undefined) {
+        for (let i = 0; i < info.addresses.length; i++) {
+          const ip: string = info.addresses[i];
+          if (ip !== '' && ip !== '127.0.0.1' && ip.indexOf(':') < 0) {
+            const url: string = 'http://' + ip + ':' + String(info.port);
+            if (lanList.indexOf(url) < 0) {
+              lanList.push(url);
+            }
+          }
+        }
+      }
+      this.stageIdx = 3;
+      this.stageDetail = '正在写入本机加密凭据 · ' + hostName;
+      this.okMsg = '已验证 · ' + hostName;
+      Haptics.soft();
+      await new Promise<void>((r: () => void) => setTimeout(r, 200));
+      if (seq !== this.claimSeq) {
+        return;
+      }
+      this.onPaired(normBase, rawToken, hostName, lanList, hid, pub);
+    } catch (e) {
+      if (seq !== this.claimSeq) {
+        return;
+      }
+      const msg: string = (e as Error).message !== undefined && (e as Error).message !== ''
+        ? (e as Error).message
+        : '连不上指定地址';
+      this.stageIdx = e instanceof PairError ? 2 : 1;
+      this.stageErr = msg;
+      this.err = msg;
+    } finally {
+      client.destroy();
+      if (seq === this.claimSeq) {
+        this.stopTimer();
+        this.busy = false;
+      }
+    }
   }
 
   private async scan(): Promise<void> {
@@ -97,473 +408,671 @@ export struct PairPage {
       return;
     }
     this.err = '';
+    this.stageErr = '';
     Haptics.soft();
     try {
-      const ctx = getContext(this) as common.UIAbilityContext;
-      const res = await scanBarcode.startScanForResult(ctx);
+      const res = await scanBarcode.startScanForResult(AppCtx.ability());
       const raw: string = res.originalValue;
-      console.info('DSH_PAIR scan raw len=' + raw.length);
       const link: PairLink | null = Pairing.parseLink(raw);
       if (link === null) {
-        // 也可能扫到「面板上别的二维码」，直接把内容当地址再要一次码
-        this.err = '这个二维码不是配对码，用下面的 6 位码更稳';
+        this.stageActive = false;
+        this.err = '未能识别该二维码，请扫描电脑端「Agent Mobile」面板中的配对二维码。';
         return;
       }
-      this.hint = '已扫到 ' + link.base + (link.alts.length > 0 ? '（含 ' + link.alts.length + ' 个备选）' : '');
-      this.step = 2;
+      this.hint = '已识别入口 ' + link.base;
       const bases: string[] = [link.base];
       for (let i = 0; i < link.alts.length; i++) {
         bases.push(link.alts[i]);
       }
-      await this.doClaim(bases, link.code);
+      this.confirmIfInsecureWan(bases, () => {
+        void this.runClaim(bases, link.code);
+      });
     } catch (e) {
-      const msg = (e as Error).message;
-      this.err = '打开扫码失败：' + msg;
-      console.error('DSH_PAIR scan fail :: ' + msg);
-    }
-  }
-
-  private async copyCmd(): Promise<void> {
-    try {
-      const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN,
-      'dsh plugin --profile desktop add dsh-mobile-connect');
-      await pasteboard.getSystemPasteboard().setData(data);
-      Haptics.tap();
-      this.hint = '已复制命令，在电脑的终端里运行';
-    } catch (e) {
-      this.hint = '复制失败，手动记一下：dsh plugin --profile desktop add dsh-mobile-connect';
-    }
-  }
-
-  // ---------- 通用件 ----------
-
-  @Builder
-  backRow(title: string) {
-    Row() {
-      Stack() {
-        Image($r('app.media.ic_back'))
-          .width(21)
-          .height(21)
-          .fillColor(Tokens.fg)
-          .objectFit(ImageFit.Contain)
+      const msg: string = (e as Error).message !== undefined ? (e as Error).message : '';
+      if (msg.indexOf('cancel') >= 0 || msg.indexOf('Cancel') >= 0 || msg.indexOf('1000500002') >= 0) {
+        return;
       }
-      .width(40)
-      .height(40)
-      .borderRadius(999)
-      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+      this.stageActive = false;
+      this.err = '无法调起扫码：' + (msg !== '' ? msg : '请直接使用下方 6 位配对码连接');
+    }
+  }
+
+  private digitAt(idx: number): string {
+    return idx < this.code.length ? this.code.charAt(idx) : '';
+  }
+
+  @Builder
+  digitBoxes() {
+    Stack({ alignContent: Alignment.Center }) {
+      Row({ space: 8 }) {
+        ForEach([0, 1, 2, 3, 4, 5], (i: number) => {
+          Stack({ alignContent: Alignment.Center }) {
+            Text(this.digitAt(i))
+              .fontSize(22)
+              .fontWeight(FontWeight.Bold)
+              .fontFamily('monospace')
+              .fontColor(Tokens.fg)
+          }
+          .layoutWeight(1)
+          .height(50)
+          .backgroundColor(Tokens.surface2)
+          .borderRadius(Tokens.rSm)
+          .border({
+            width: this.code.length === i || (i === 5 && this.code.length === 6) ? 1.5 : 1,
+            color: this.code.length === i ? Tokens.accent : Tokens.lineSoft
+          })
+        }, (i: number) => 'box-' + String(i))
+      }
+      .width('100%')
+
+      TextInput({ text: this.code })
+        .id('pairCodeInput')
+        .type(InputType.Number)
+        .maxLength(6)
+        .caretColor(Color.Transparent)
+        .fontColor(Color.Transparent)
+        .backgroundColor(Color.Transparent)
+        .width('100%')
+        .height(54)
+        .onChange((v: string) => {
+          this.code = v.replace(/\D/g, '').slice(0, 6);
+          if (this.err !== '') {
+            this.err = '';
+          }
+        })
+    }
+    .width('100%')
+    .onClick(() => {
+      try {
+        this.getUIContext().getFocusController().requestFocus('pairCodeInput');
+      } catch (e) {
+      }
+    })
+  }
+
+  @Builder
+  heroScanCard() {
+    Column({ space: 14 }) {
+      Row({ space: 12 }) {
+        Image(AppIcon.res(this.appIconStyle))
+          .width(46)
+          .height(46)
+          .borderRadius(12)
+          .border({ width: 0.5, color: Tokens.line })
+        Column({ space: 3 }) {
+          Row({ space: 8 }) {
+            Text('Agent Mobile 快速连接')
+              .fontSize(Tokens.fsTitle)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(Tokens.fg)
+          }
+          Text('扫描电脑端面板二维码，自动匹配局域网并开启端到端加密')
+            .fontSize(Tokens.fsFoot)
+            .fontColor(Tokens.dim2)
+            .lineHeight(17)
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      Row({ space: 8 }) {
+        Image($r('app.media.ic_scan'))
+          .width(18)
+          .height(18)
+          .fillColor(Tokens.accentInk)
+          .objectFit(ImageFit.Contain)
+        Text(this.busy ? '正在建立连接…' : '扫一扫配对二维码')
+          .fontSize(Tokens.fsBodyLg)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.accentInk)
+      }
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
+      .width('100%')
+      .height(48)
+      .backgroundColor(Tokens.accent)
+      .borderRadius(Tokens.rPill)
+      .opacity(this.busy ? 0.65 : 1)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
       .onClick(() => {
-        Haptics.soft();
-        this.onExit();
+        if (!this.busy) {
+          void this.scan();
+        }
       })
-      Text(title)
-        .fontSize(20)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(Tokens.fg)
-        .margin({ left: 2 })
-      Blank()
     }
     .width('100%')
-    .height(52)
-    .margin({ bottom: 10 })
+    .padding(18)
+    .backgroundColor(Mat.cardBg(this.hdsOn))
+    .borderRadius(Tokens.rXl)
+    .border({ width: 1, color: this.hdsOn ? Mat.cardBorderColor(true) : Tokens.accentGlass })
+    .shadow(Mat.cardShadow(this.hdsOn))
   }
 
   @Builder
-  progress() {
-    Row() {
-      Row()
-        .layoutWeight(1)
-        .height(4)
-        .borderRadius(6)
-        .backgroundColor(Tokens.accent)
-      Row()
-        .layoutWeight(1)
-        .height(4)
-        .borderRadius(6)
-        .backgroundColor(this.step >= 2 ? Tokens.accent : Tokens.surface3)
-        .margin({ left: 8 })
-    }
-    .width('100%')
-    .margin({ top: 6, bottom: 10 })
-  }
+  hostPreviewBadge() {
+    if (this.probing) {
+      Row({ space: 8 }) {
+        LoadingProgress().width(14).height(14).color(Tokens.accent)
+        Text('正在识别电脑主机信息…')
+          .fontSize(Tokens.fsCaption)
+          .fontColor(Tokens.dim2)
+      }
+      .width('100%')
+      .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+      .backgroundColor(Tokens.surface2)
+      .borderRadius(Tokens.rSm)
+    } else if (this.previewInfo !== null) {
+      Column({ space: 4 }) {
+        Row({ space: 8 }) {
+          Row()
+            .width(7)
+            .height(7)
+            .borderRadius(Tokens.rPill)
+            .backgroundColor(Tokens.ok)
+          Text(this.previewInfo.name !== '' ? this.previewInfo.name : this.previewInfo.host)
+            .fontSize(Tokens.fsFoot)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.fg)
+            .layoutWeight(1)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(this.previewInfo.e2ee !== false ? '支持 E2EE' : '直连')
+            .fontSize(Tokens.fsCaption)
+            .fontColor(Tokens.doneInk)
+            .backgroundColor(Tokens.doneBg)
+            .borderRadius(Tokens.rPill)
+            .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+        }
+        .width('100%')
 
-  /** 读 this.step 而不是收参数：@Builder 的值传参不会随状态刷新。 */
-  @Builder
-  stepText() {
-    Row() {
-      Text(this.step === 1 ? '第一步 · 在电脑上' : '第二步 · 用手机连')
-        .fontSize(12)
+        Text('v' + this.previewInfo.version +
+          (this.previewInfo.hostId !== undefined && this.previewInfo.hostId !== ''
+            ? ' · 指纹 ' + this.previewInfo.hostId.slice(0, 10)
+            : ''))
+          .fontSize(Tokens.fsCaption)
+          .fontColor(Tokens.dim2)
+          .fontFamily('monospace')
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .backgroundColor(Tokens.doneBg)
+      .borderRadius(Tokens.rSm)
+      .alignItems(HorizontalAlign.Start)
+    } else if (this.previewErr !== '') {
+      Text(this.previewErr)
+        .fontSize(Tokens.fsCaption)
         .fontColor(Tokens.dim2)
-        .layoutWeight(1)
-    }
-    .width('100%')
-    .margin({ bottom: 14 })
-  }
-
-  @Builder
-  head(big: string, sub: string) {
-    Column() {
-      Text(big)
-        .fontSize(30)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(Tokens.fg)
-      Text(sub)
-        .fontSize(12)
-        .fontColor(Tokens.dim2)
-        .margin({ top: 8 })
-        .lineHeight(18)
+        .lineHeight(16)
         .width('100%')
     }
-    .alignItems(HorizontalAlign.Start)
-    .width('100%')
-    .margin({ bottom: 16 })
   }
 
   @Builder
-  stepCard(n: number, tone: string, title: string, body: string) {
-    Row() {
-      Text('' + n)
-        .fontSize(13)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(tone === Tokens.accent ? Tokens.fg : Tokens.dim)
-        .width(26)
-        .height(26)
-        .borderRadius(14)
+  segmentedTabs() {
+    Row({ space: 4 }) {
+      Text('6 位配对码')
+        .fontSize(Tokens.fsBody)
+        .fontWeight(this.tab === 'code' ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(this.tab === 'code' ? Tokens.fg : Tokens.dim2)
         .textAlign(TextAlign.Center)
-        .backgroundColor(tone)
+        .layoutWeight(1)
+        .padding({ top: 9, bottom: 9 })
+        .backgroundColor(this.tab === 'code' ? Tokens.surface : Color.Transparent)
+        .borderRadius(Tokens.rSm)
+        .onClick(() => {
+          if (this.tab !== 'code') {
+            Haptics.tap();
+            this.err = '';
+            this.tab = 'code';
+          }
+        })
+
+      Text('手动地址与令牌')
+        .fontSize(Tokens.fsBody)
+        .fontWeight(this.tab === 'manual' ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(this.tab === 'manual' ? Tokens.fg : Tokens.dim2)
+        .textAlign(TextAlign.Center)
+        .layoutWeight(1)
+        .padding({ top: 9, bottom: 9 })
+        .backgroundColor(this.tab === 'manual' ? Tokens.surface : Color.Transparent)
+        .borderRadius(Tokens.rSm)
+        .onClick(() => {
+          if (this.tab !== 'manual') {
+            Haptics.tap();
+            this.err = '';
+            this.tab = 'manual';
+          }
+        })
+    }
+    .width('100%')
+    .padding(4)
+    .backgroundColor(Tokens.surface2)
+    .borderRadius(Tokens.rMd)
+    .margin({ top: 14 })
+  }
+
+  @Builder
+  modeContentCard() {
+    Column({ space: 12 }) {
+      if (this.tab === 'code') {
+        Row({ space: 8 }) {
+          TextInput({ text: this.addr, placeholder: '电脑地址（IP:端口 或域名）' })
+            .fontSize(Tokens.fsBody)
+            .fontColor(Tokens.fg)
+            .placeholderColor(Tokens.dim2)
+            .height(44)
+            .layoutWeight(1)
+            .backgroundColor(Tokens.surface2)
+            .borderRadius(Tokens.rInput)
+            .onChange((v: string) => {
+              this.addr = v;
+              if (this.err !== '') {
+                this.err = '';
+              }
+              this.scheduleProbe(v);
+            })
+
+          Text('探测')
+            .fontSize(Tokens.fsFoot)
+            .fontColor(Tokens.accent)
+            .padding({ left: 12, right: 12, top: 11, bottom: 11 })
+            .backgroundColor(Tokens.accentSoft)
+            .borderRadius(Tokens.rInput)
+            .onClick(() => {
+              Haptics.tap();
+              void this.probeHost(Pairing.normalizeBase(this.addr));
+            })
+        }
+        .width('100%')
+
+        this.hostPreviewBadge()
+
+        Text('输入面板显示的 6 位一次性配对码')
+          .fontSize(Tokens.fsFoot)
+          .fontColor(Tokens.dim2)
+          .width('100%')
+
+        this.digitBoxes()
+
+        Text(this.busy ? '正在连接…' : '验证配对码并连接')
+          .fontSize(Tokens.fsBodyLg)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(!this.busy && this.code.length === 6 && this.addr.trim() !== '' ? Tokens.accentInk : Tokens.dim)
+          .textAlign(TextAlign.Center)
+          .width('100%')
+          .height(46)
+          .backgroundColor(!this.busy && this.code.length === 6 && this.addr.trim() !== '' ? Tokens.accentStrong : Tokens.surface3)
+          .borderRadius(Tokens.rPill)
+          .opacity(!this.busy && this.code.length === 6 && this.addr.trim() !== '' ? 1 : 0.6)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+          .onClick(() => {
+            const target: string = this.addr.trim();
+            if (this.busy || target === '' || this.code.length !== 6) {
+              return;
+            }
+            const cands: string[] = [target];
+            if (this.previewInfo !== null && this.previewInfo.lan !== undefined) {
+              for (let i = 0; i < this.previewInfo.lan.length; i++) {
+                if (cands.indexOf(this.previewInfo.lan[i]) < 0) {
+                  cands.push(this.previewInfo.lan[i]);
+                }
+              }
+            }
+            this.confirmIfInsecureWan(cands, () => {
+              void this.runClaim(cands, this.code);
+            });
+          })
+      } else {
+        TextInput({ text: this.manualName, placeholder: '电脑备注名称（可选）' })
+          .fontSize(Tokens.fsBody)
+          .fontColor(Tokens.fg)
+          .placeholderColor(Tokens.dim2)
+          .height(44)
+          .backgroundColor(Tokens.surface2)
+          .borderRadius(Tokens.rInput)
+          .onChange((v: string) => {
+            this.manualName = v;
+          })
+
+        TextInput({ text: this.manualBase, placeholder: '服务地址，如 https://am.example.com 或 192.168.1.10:8901' })
+          .fontSize(Tokens.fsBody)
+          .fontColor(Tokens.fg)
+          .placeholderColor(Tokens.dim2)
+          .height(44)
+          .backgroundColor(Tokens.surface2)
+          .borderRadius(Tokens.rInput)
+          .onChange((v: string) => {
+            this.manualBase = v;
+            if (this.err !== '') {
+              this.err = '';
+            }
+          })
+
+        TextInput({ text: this.manualToken, placeholder: '访问令牌（在电脑端面板复制）' })
+          .type(InputType.Password)
+          .fontSize(Tokens.fsBody)
+          .fontColor(Tokens.fg)
+          .placeholderColor(Tokens.dim2)
+          .height(44)
+          .backgroundColor(Tokens.surface2)
+          .borderRadius(Tokens.rInput)
+          .onChange((v: string) => {
+            this.manualToken = v;
+            if (this.err !== '') {
+              this.err = '';
+            }
+          })
+
+        Text(this.busy ? '正在校验令牌…' : '校验并连接')
+          .fontSize(Tokens.fsBodyLg)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(!this.busy && this.manualBase.trim() !== '' && this.manualToken.trim() !== '' ? Tokens.accentInk : Tokens.dim)
+          .textAlign(TextAlign.Center)
+          .width('100%')
+          .height(46)
+          .backgroundColor(!this.busy && this.manualBase.trim() !== '' && this.manualToken.trim() !== ''
+            ? Tokens.accentStrong : Tokens.surface3)
+          .borderRadius(Tokens.rPill)
+          .opacity(!this.busy && this.manualBase.trim() !== '' && this.manualToken.trim() !== '' ? 1 : 0.6)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+          .onClick(() => {
+            if (!this.busy) {
+              this.startManualConnect();
+            }
+          })
+      }
+    }
+    .width('100%')
+    .padding(16)
+    .backgroundColor(Mat.cardBg(this.hdsOn))
+    .borderRadius(Tokens.rCard)
+    .border(Mat.cardBorder(this.hdsOn))
+    .shadow(Mat.cardShadow(this.hdsOn))
+    .margin({ top: 10 })
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  feedbackBlock() {
+    if (this.busy && this.stageActive) {
       Column() {
+        ConnectionStageCard({
+          stages: PAIR_STAGES,
+          currentStage: this.stageIdx,
+          elapsedSec: this.elapsedSec,
+          detail: this.stageDetail,
+          errorText: '',
+          onCancel: (): void => {
+            this.cancelClaim();
+          }
+        })
+      }
+      .width('100%')
+      .margin({ top: 12 })
+    } else if (this.err !== '') {
+      Column({ space: 10 }) {
+        if (this.stageActive && this.stageErr !== '') {
+          ConnectionStageCard({
+            stages: PAIR_STAGES,
+            currentStage: this.stageIdx,
+            elapsedSec: this.elapsedSec,
+            detail: this.stageDetail,
+            errorText: this.stageErr
+          })
+        } else {
+          Column({ space: 6 }) {
+            Text('连接未成功')
+              .fontSize(Tokens.fsBody)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Tokens.err)
+            Text(this.err)
+              .fontSize(Tokens.fsFoot)
+              .fontColor(Tokens.err)
+              .lineHeight(18)
+              .width('100%')
+          }
+          .width('100%')
+          .padding(14)
+          .backgroundColor(Tokens.intrBg)
+          .border({ width: 1, color: Tokens.err })
+          .borderRadius(Tokens.rCard)
+          .alignItems(HorizontalAlign.Start)
+        }
+
+        Row({ space: 8 }) {
+          if (this.tab === 'code' && this.lastBases.length > 0 && this.lastCode.length === 6) {
+            Text('重试')
+              .fontSize(Tokens.fsFoot)
+              .fontColor(Tokens.accent)
+              .backgroundColor(Tokens.accentSoft)
+              .borderRadius(Tokens.rPill)
+              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+              .onClick(() => {
+                void this.runClaim(this.lastBases, this.lastCode);
+              })
+          }
+          Text(this.tab === 'code' ? '改用手动地址与令牌' : '改用 6 位配对码')
+            .fontSize(Tokens.fsFoot)
+            .fontColor(Tokens.fg)
+            .backgroundColor(Tokens.surface2)
+            .borderRadius(Tokens.rPill)
+            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+            .onClick(() => {
+              Haptics.tap();
+              this.err = '';
+              this.stageActive = false;
+              this.tab = this.tab === 'code' ? 'manual' : 'code';
+            })
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .margin({ top: 12 })
+    } else if (this.okMsg !== '') {
+      Text(this.okMsg)
+        .fontSize(Tokens.fsBody)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.doneInk)
+        .width('100%')
+        .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+        .backgroundColor(Tokens.doneBg)
+        .borderRadius(Tokens.rMd)
+        .margin({ top: 12 })
+    } else if (this.hint !== '') {
+      Text(this.hint)
+        .fontSize(Tokens.fsFoot)
+        .fontColor(Tokens.dim2)
+        .width('100%')
+        .margin({ top: 10 })
+    }
+  }
+
+  @Builder
+  helpSheetContent() {
+    Column({ space: 12 }) {
+      SheetHeader({
+        title: '无法连接电脑排查清单',
+        subtitle: 'Agent Mobile 连接诊断建议',
+        onClose: () => {
+          this.helpSheet = false;
+        }
+      })
+
+      Column({ space: 10 }) {
+        Text('1. 确认手机与电脑处于同一 Wi-Fi（未开启访客网络或 AP 隔离），且系统防火墙放行 8901 端口。')
+          .fontSize(Tokens.fsBody)
+          .fontColor(Tokens.fg)
+          .lineHeight(20)
+        Text('2. 确认电脑端已启动 agent-mobile-gateway，且「允许新设备配对」处于开启状态；6 位配对码仅单次有效。')
+          .fontSize(Tokens.fsBody)
+          .fontColor(Tokens.fg)
+          .lineHeight(20)
+        Text('3. 若当前在 4G/5G 外网环境，请先在电脑端配置 HTTPS / Cloudflare 隧道并将公网地址填到面板。')
+          .fontSize(Tokens.fsBody)
+          .fontColor(Tokens.fg)
+          .lineHeight(20)
+        Text('4. 若扫码失败或无网络权限，可切换「手动地址与令牌」直接粘贴服务地址与访问令牌验证。')
+          .fontSize(Tokens.fsBody)
+          .fontColor(Tokens.fg)
+          .lineHeight(20)
+      }
+      .width('100%')
+      .padding(14)
+      .backgroundColor(Tokens.surface2)
+      .borderRadius(Tokens.rCard)
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .padding({ left: 18, right: 18, top: 16, bottom: this.bottomInset + 22 })
+  }
+
+  @Builder
+  prepareStepCard(num: string, title: string, desc: string) {
+    Row({ space: 12 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        Text(num)
+          .fontSize(Tokens.fsBody)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Tokens.accent)
+      }
+      .width(28)
+      .height(28)
+      .borderRadius(Tokens.rPill)
+      .backgroundColor(Tokens.accentSoft)
+
+      Column({ space: 4 }) {
         Text(title)
-          .fontSize(15)
+          .fontSize(Tokens.fsBodyLg)
           .fontWeight(FontWeight.Medium)
           .fontColor(Tokens.fg)
-        Text(body)
-          .fontSize(12)
+        Text(desc)
+          .fontSize(Tokens.fsFoot)
           .fontColor(Tokens.dim2)
-          .margin({ top: 4 })
-          .lineHeight(17)
+          .lineHeight(18)
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
-      .margin({ left: 12 })
     }
     .width('100%')
-    .padding(14)
+    .padding(15)
+    .backgroundColor(Mat.cardBg(this.hdsOn))
+    .borderRadius(Tokens.rCard)
+    .border(Mat.cardBorder(this.hdsOn))
+    .shadow(Mat.cardShadow(this.hdsOn))
     .alignItems(VerticalAlign.Top)
-    .backgroundColor(Tokens.surface2)
-    .borderRadius(Tokens.rCard)
   }
 
   @Builder
-  cmdBlock() {
-    Row() {
-      Text('$')
-        .fontSize(12)
-        .fontColor(Tokens.ok)
-        .fontFamily('monospace')
-      Text('  dsh plugin --profile desktop\n  add dsh-mobile-connect')
-        .fontSize(12)
-        .fontColor(Tokens.fg)
-        .fontFamily('monospace')
-        .layoutWeight(1)
-      Text('复制')
-        .fontSize(11)
-        .fontColor(Tokens.accent)
-        .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-        .backgroundColor(Tokens.accentSoft)
-        .borderRadius(Tokens.rPill)
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-        .onClick(() => {
-          this.copyCmd();
-        })
-    }
-    .width('100%')
-    .padding({ left: 12, right: 10, top: 12, bottom: 12 })
-    .alignItems(VerticalAlign.Center)
-    .backgroundColor(Tokens.bgEl)
-    .border({ width: 1, color: Tokens.lineSoft })
-    .borderRadius(14)
-    .margin({ top: 10 })
-  }
-
-  private btnText(kind: string): string {
-    if (kind === 'next') {
-      return '电脑好了，下一步 ›';
-    }
-    if (kind === 'scan') {
-      return this.busy ? '连接中…' : '打开扫一扫';
-    }
-    return this.busy ? '连接中…' : '连接';
-  }
-
-  private btnOn(kind: string): boolean {
-    if (kind === 'next') {
-      return true;
-    }
-    if (kind === 'scan') {
-      return !this.busy;
-    }
-    return !this.busy && this.code.length === 6;
-  }
-
-  /** kind 是静态字符串，真正的可变状态在函数里读，避免值传参不刷新。 */
-  @Builder
-  primaryBtn(kind: string, tap: () => void) {
-    Text(this.btnText(kind))
-      .fontSize(15)
-      .fontWeight(FontWeight.Medium)
-      .fontColor(Tokens.accentInk)
-      .textAlign(TextAlign.Center)
-      .width('100%')
-      .height(48)
-      .borderRadius(Tokens.rPill)
-      .backgroundColor(this.btnOn(kind) ? Tokens.accentStrong : Tokens.surface3)
-      .opacity(this.btnOn(kind) ? 1 : 0.6)
-      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
-      .margin({ top: 12 })
-      .onClick(() => {
-        if (this.btnOn(kind)) {
-          tap();
-        }
-      })
-  }
-
-  @Builder
-  errLine() {
-    if (this.err !== '') {
-      Text(this.err)
-        .fontSize(12)
-        .fontColor(Tokens.err)
-        .width('100%')
-        .margin({ top: 10 })
-        .lineHeight(17)
-    } else if (this.okMsg !== '') {
-      Text(this.okMsg)
-        .fontSize(12)
-        .fontColor(Tokens.ok)
-        .width('100%')
-        .margin({ top: 10 })
-        .lineHeight(17)
-    } else if (this.hint !== '') {
-      Text(this.hint)
-        .fontSize(12)
-        .fontColor(Tokens.dim2)
-        .width('100%')
-        .margin({ top: 10 })
-        .lineHeight(17)
-    }
-  }
-
-  // ---------- 第 1 步 ----------
-
-  @Builder
-  stepOne() {
+  connectScreen() {
     Column() {
-      this.head('先把电脑准备好', '三件事，做完手机就能连上来。')
+      this.heroScanCard()
+      this.segmentedTabs()
+      this.modeContentCard()
+      this.feedbackBlock()
 
-      this.stepCard(1, Tokens.ok, '给电脑装上「DSH 手机连接」插件',
-        '插件已经发布到 npm：电脑上有 npm 就跑下面这条命令，最省事。没有 npm 也行 —— 在 App 发布页下载 dsh-mobile-plugin-*.zip 解压，打开 DSH 侧栏「插件 → 添加插件」，直接选解压出来的那个目录。')
-      this.cmdBlock()
-      Row().height(10)
-
-      this.stepCard(2, Tokens.accent, '重启 DSH',
-        '退出并重新打开 DSH，插件加载生效，不会丢失会话记录。')
-      Row().height(10)
-
-      this.stepCard(3, Tokens.surface3, '打开电脑上的连接面板',
-        '在 DSH 里打开「设置 → 手机连接」，面板里有二维码和 6 位一次性配对码。')
-
-      this.primaryBtn('next', () => {
-        Haptics.tap();
-        this.err = '';
-        this.okMsg = '';
-        this.step = 2;
-      })
-      this.errLine()
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  // ---------- 第 2 步 ----------
-
-  @Builder
-  scanCard() {
-    Column() {
-      Row() {
-        Text('▣')
-          .fontSize(13)
+      Row({ space: 10 }) {
+        Text('电脑端安装与启用引导 ›')
+          .fontSize(Tokens.fsFoot)
           .fontColor(Tokens.accent)
-          .width(34)
-          .height(34)
-          .borderRadius(10)
-          .textAlign(TextAlign.Center)
-          .backgroundColor(Tokens.accentSoft)
-        Text('扫一扫')
-          .fontSize(15)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Tokens.fg)
-          .margin({ left: 10 })
-        Blank()
-        Text('最快')
-          .fontSize(11)
-          .fontColor(Tokens.accent)
-          .padding({ left: 9, right: 9, top: 3, bottom: 3 })
+          .padding({ left: 12, right: 12, top: 8, bottom: 8 })
           .backgroundColor(Tokens.accentSoft)
           .borderRadius(Tokens.rPill)
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-
-      this.primaryBtn('scan', () => {
-        this.scan();
-      })
-      Text('对着电脑 DSH 面板上的二维码扫一下，扫完直接连上。')
-        .fontSize(11)
-        .fontColor(Tokens.dim2)
-        .width('100%')
-        .margin({ top: 8 })
-    }
-    .width('100%')
-    .padding(16)
-    .backgroundColor(Tokens.surface)
-    .borderRadius(Tokens.rCard)
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
-  codeCard() {
-    Column() {
-      Row() {
-        Text('#')
-          .fontSize(13)
-          .fontColor(Tokens.dim)
-          .width(34)
-          .height(34)
-          .borderRadius(10)
-          .textAlign(TextAlign.Center)
-          .backgroundColor(Tokens.surface3)
-        Text('配对码')
-          .fontSize(15)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Tokens.fg)
-          .margin({ left: 10 })
-        Blank()
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-
-      TextInput({ text: this.code, placeholder: '6 位数字' })
-        .type(InputType.Number)
-        .maxLength(6)
-        .fontSize(20)
-        .letterSpacing(8)
-        .textAlign(TextAlign.Center)
-        .height(50)
-        .backgroundColor(Tokens.surface2)
-        .borderRadius(Tokens.rInput)
-        .margin({ top: 12 })
-        .onChange((v: string) => {
-          this.code = v;
-        })
-
-      this.primaryBtn('code', () => {
-        this.doClaim([this.manual !== '' ? this.manual : this.defaultBase], this.code);
-      })
-      Text('把电脑端「设置 → 手机连接」面板上显示的 6 位码填到上面。')
-        .fontSize(11)
-        .fontColor(Tokens.dim2)
-        .width('100%')
-        .margin({ top: 8 })
-    }
-    .width('100%')
-    .padding(16)
-    .backgroundColor(Tokens.surface)
-    .borderRadius(Tokens.rCard)
-    .alignItems(HorizontalAlign.Start)
-    .margin({ top: 12 })
-  }
-
-  @Builder
-  helpCard() {
-    Column() {
-      Row() {
-        Text('?')
-          .fontSize(12)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(Tokens.dim)
-          .width(22)
-          .height(22)
-          .borderRadius(10)
-          .textAlign(TextAlign.Center)
-          .backgroundColor(Tokens.surface3)
-        Text('连不上？')
-          .fontSize(13)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Tokens.fg)
-          .margin({ left: 8 })
-        Blank()
-        Text(this.showManual ? '收起' : '手动输入电脑IP')
-          .fontSize(11)
-          .fontColor(Tokens.accent)
-          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-          .backgroundColor(Tokens.accentSoft)
-          .borderRadius(Tokens.rPill)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
           .onClick(() => {
-            this.showManual = !this.showManual;
+            Haptics.tap();
+            this.switchScreen('prepare');
+          })
+
+        Blank()
+
+        Text('连不上排查')
+          .fontSize(Tokens.fsFoot)
+          .fontColor(Tokens.dim)
+          .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+          .backgroundColor(Tokens.surface2)
+          .borderRadius(Tokens.rPill)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+          .onClick(() => {
+            Haptics.tap();
+            this.helpSheet = true;
           })
       }
       .width('100%')
-      .alignItems(VerticalAlign.Center)
-
-      if (this.showManual) {
-        TextInput({ text: this.manual, placeholder: '电脑地址，例如 192.168.1.10:8901' })
-          .fontSize(13)
-          .height(46)
-          .backgroundColor(Tokens.surface2)
-          .borderRadius(Tokens.rInput)
-          .margin({ top: 10 })
-          .onChange((v: string) => {
-            this.manual = v;
-          })
-      }
-
-      Text('· 手机和电脑连的是同一个 WiFi（别用手机流量）；同一 WiFi 也可能互相隔离\n' +
-        '· 电脑 DSH 需常驻；配对码用过一次就作废，过期回面板重新看\n' +
-        '· 异地首次配对：先在电脑端「设置 → 手机连接」里打开「公网访问」\n' +
-        '· 想在家门外也能用：配对完进 设置 → 连接，里面写了怎么开隧道')
-        .fontSize(11)
-        .fontColor(Tokens.dim2)
-        .lineHeight(18)
-        .width('100%')
-        .margin({ top: 10 })
+      .margin({ top: 16 })
+      .bindSheet($$this.helpSheet, this.helpSheetContent(),
+        Mat.sheetOpts(this.hdsOn, SheetSize.FIT_CONTENT, () => {
+          this.helpSheet = false;
+        }))
     }
     .width('100%')
-    .padding(14)
-    .backgroundColor(Tokens.surface2)
-    .borderRadius(Tokens.rCard)
     .alignItems(HorizontalAlign.Start)
-    .margin({ top: 12 })
   }
 
   @Builder
-  stepTwo() {
-    Column() {
-      this.head('扫一下就连上', '扫电脑面板上的二维码，或手输 6 位配对码。')
-      this.scanCard()
-      this.codeCard()
-      this.helpCard()
-      this.errLine()
-      Text('上一步')
-        .fontSize(13)
-        .fontColor(Tokens.dim)
-        .width('100%')
+  prepareScreen() {
+    Column({ space: 10 }) {
+      Column({ space: 4 }) {
+        Text('在电脑上准备 Agent Mobile 网关')
+          .fontSize(Tokens.fsDisplay)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Tokens.fg)
+        Text('完成以下三步后，回到快速连接页扫码或输入 6 位码即可控制电脑上的多个智能体。')
+          .fontSize(Tokens.fsBody)
+          .fontColor(Tokens.dim2)
+          .lineHeight(19)
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .margin({ bottom: 6 })
+
+      this.prepareStepCard('1', '安装并启用 agent-mobile-gateway',
+        '在电脑终端添加网关插件后重启服务，保持网关监听在本地端口（默认 8901）。')
+
+      Row({ space: 8 }) {
+        Text(PAIR_CMD)
+          .fontSize(Tokens.fsFoot)
+          .fontFamily('monospace')
+          .fontColor(Tokens.fg)
+          .layoutWeight(1)
+        Text('复制')
+          .fontSize(Tokens.fsCaption)
+          .fontColor(Tokens.accent)
+          .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+          .backgroundColor(Tokens.accentSoft)
+          .borderRadius(Tokens.rPill)
+          .onClick(() => {
+            Haptics.tap();
+            void copyText(PAIR_CMD, '已复制安装命令');
+          })
+      }
+      .width('100%')
+      .padding({ left: 14, right: 10, top: 12, bottom: 12 })
+      .backgroundColor(Tokens.bgEl)
+      .borderRadius(Tokens.rMd)
+      .border({ width: 1, color: Tokens.lineSoft })
+
+      this.prepareStepCard('2', '打开电脑端「Agent Mobile」面板',
+        '在桌面侧栏打开 Agent Mobile 面板，页面上方会展示配对二维码、6 位配对码与入口地址。')
+
+      this.prepareStepCard('3', '外网访问准备（可选）',
+        '同 Wi-Fi 下可直接扫描连接；异地使用建议通过 HTTPS 或 Cloudflare 隧道暴露入口。')
+
+      Text('我已准备好，前往连接')
+        .fontSize(Tokens.fsBodyLg)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Tokens.accentInk)
         .textAlign(TextAlign.Center)
-        .padding({ top: 18, bottom: 8 })
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+        .width('100%')
+        .height(48)
+        .backgroundColor(Tokens.accent)
+        .borderRadius(Tokens.rPill)
+        .margin({ top: 10 })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
         .onClick(() => {
-          this.err = '';
-          this.okMsg = '';
-          this.step = 1;
+          Haptics.tap();
+          this.switchScreen('connect');
         })
     }
     .width('100%')
@@ -571,20 +1080,57 @@ export struct PairPage {
   }
 
   build() {
-    Column() {
-      this.backRow('连接电脑')
-      this.progress()
-      this.stepText()
-      if (this.step === 1) {
-        this.stepOne()
-      } else {
-        this.stepTwo()
+    Stack({ alignContent: Alignment.Top }) {
+      Scroll(this.scroller) {
+        Column() {
+          Column() {
+            if (this.screen === 'prepare') {
+              this.prepareScreen()
+            } else {
+              this.connectScreen()
+            }
+          }
+          .width('100%')
+          .constraintSize({ maxWidth: this.wideScreen ? 560 : 520 })
+          .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+        .padding({
+          left: 16,
+          right: 16,
+          top: this.topInset + 68,
+          bottom: this.bottomInset + 36
+        })
+        .alignItems(HorizontalAlign.Center)
       }
+      .width('100%')
+      .height('100%')
+      .scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring)
+      .align(Alignment.Top)
+
+      TopFade({ fadeHeight: this.topInset + 68 })
+      Column() {
+        PageHeader({
+          title: this.screen === 'prepare' ? '电脑端准备' : '连接电脑',
+          hasBack: this.hasBack || this.screen === 'prepare',
+          padTop: true,
+          onBack: () => {
+            if (this.screen === 'prepare' && this.entry !== 'guide') {
+              this.switchScreen('connect');
+            } else if (this.hasBack) {
+              this.onExit();
+            } else {
+              this.switchScreen('connect');
+            }
+          }
+        })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16 })
     }
     .width('100%')
-    .alignItems(HorizontalAlign.Start)
-    .transition(TransitionEffect.OPACITY
-      .combine(TransitionEffect.translate({ x: this.step === 1 ? -16 : 16 }))
-      .animation({ duration: 240, curve: Curve.EaseOut }))
+    .height('100%')
+    .backgroundColor(this.themeBg)
   }
 }

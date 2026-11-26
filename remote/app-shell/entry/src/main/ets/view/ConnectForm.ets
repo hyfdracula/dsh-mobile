@@ -1,67 +1,205 @@
+import { Haptics } from '../common/Haptics';
+import { Mat } from '../common/Mat';
+import { Motion } from '../common/Motion';
+import { Pairing } from '../common/Pairing';
 import { Tokens } from '../common/Tokens';
+import { ConnectionStageCard } from '../common/Widgets';
+
+const SAVE_STAGES: string[] = [
+  '保存地址与令牌',
+  '探测局域网与公网入口',
+  '验证令牌与电脑状态'
+];
 
 /**
- * 「连接地址」表单：地址 + 访问令牌 + 保存并重连。
- * 两个字段用 @Link 与设置页双向绑定，保存动作仍由页面执行（它要同时写资产库与重连）。
+ * 「连接地址」表单：地址 + 访问令牌 + 校验与连通性探测。
+ * 两个字段用 @Link 与父级双向绑定；校验不通过或探测失败时以红色错误卡明确提示。
  */
 @Component
 export struct ConnectForm {
   @Link base: string;
   @Link token: string;
   @Prop saved: string = '';
+  @Prop errMsg: string = '';
+  @Prop saving: boolean = false;
+  @Prop stageIdx: number = 0;
+  @Prop stageDetail: string = '';
+  @Prop elapsedSec: number = 0;
   onSave: () => void = () => {};
+  onRePair?: () => void;
+
+  @State private localErr: string = '';
+  @StorageLink('hdsOn') hdsOn: boolean = true;
+  @StorageLink('themeDark') themeDark: boolean = true;
+
+  private activeErr(): string {
+    return this.localErr !== '' ? this.localErr : this.errMsg;
+  }
+
+  private validateAndSubmit(): void {
+    if (this.saving) {
+      return;
+    }
+    const rawBase: string = this.base.trim();
+    const rawToken: string = this.token.trim();
+    if (rawBase === '') {
+      Haptics.tap();
+      this.localErr = '请填写电脑连接地址（例如 http://192.168.1.10:8901 或 https://域名）。';
+      return;
+    }
+    if (rawBase.indexOf('://') >= 0 &&
+      !/^https?:\/\//i.test(rawBase)) {
+      Haptics.tap();
+      this.localErr = '地址协议不受支持，请使用 http:// 或 https:// 开头。';
+      return;
+    }
+    const norm: string = Pairing.normalizeBase(rawBase);
+    if (!/^https?:\/\/[^\s/]+/i.test(norm)) {
+      Haptics.tap();
+      this.localErr = '连接地址格式不正确，请检查域名或 IP 端口是否填写完整且不含空格。';
+      return;
+    }
+    if (rawToken === '') {
+      Haptics.tap();
+      this.localErr = '请填写访问令牌，或点下方「重新扫码配对」自动获取。';
+      return;
+    }
+    Haptics.tap();
+    this.localErr = '';
+    this.base = norm;
+    this.token = rawToken;
+    this.onSave();
+  }
 
   build() {
     Column() {
       Text('地址')
-        .fontSize(12)
-        .fontColor(Tokens.dim2)
+        .fontSize(Tokens.fsFoot)
+        .fontColor(Tokens.dim)
         .margin({ bottom: 6 })
-      TextInput({ text: this.base, placeholder: 'https://your-tunnel.example.com' })
+      TextInput({ text: this.base, placeholder: 'https://your-tunnel.example.com 或 192.168.1.3:8901' })
         .height(44)
-        .fontSize(13)
+        .fontSize(Tokens.fsBody)
+        .fontColor(Tokens.fg)
+        .placeholderColor(Tokens.dim2)
         .borderRadius(Tokens.rInput)
         .backgroundColor(Tokens.surface2)
+        .enabled(!this.saving)
         .onChange((v: string) => {
           this.base = v;
+          if (this.localErr !== '') {
+            this.localErr = '';
+          }
         })
+
       Text('访问令牌')
-        .fontSize(12)
-        .fontColor(Tokens.dim2)
+        .fontSize(Tokens.fsFoot)
+        .fontColor(Tokens.dim)
         .margin({ top: 12, bottom: 6 })
-      TextInput({ text: this.token, placeholder: '访问令牌' })
+      TextInput({ text: this.token, placeholder: '电脑端面板上的访问令牌' })
         .type(InputType.Password)
         .height(44)
-        .fontSize(13)
+        .fontSize(Tokens.fsBody)
+        .fontColor(Tokens.fg)
+        .placeholderColor(Tokens.dim2)
         .borderRadius(Tokens.rInput)
         .backgroundColor(Tokens.surface2)
+        .enabled(!this.saving)
         .onChange((v: string) => {
           this.token = v;
+          if (this.localErr !== '') {
+            this.localErr = '';
+          }
         })
+
       Row() {
-        Text(this.saved)
-          .fontSize(12)
-          .fontColor(Tokens.ok)
-          .layoutWeight(1)
-        Button(this.saved === '已保存' ? '已保存' : '保存并重连')
-          .fontSize(13)
+        if (!this.saving && this.activeErr() === '' && this.saved !== '') {
+          Text('√ ' + this.saved)
+            .fontSize(Tokens.fsFoot)
+            .fontColor(Tokens.ok)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+            .margin({ right: 10 })
+        } else {
+          Blank()
+        }
+
+        Button(this.saving ? '正在验证…' : '保存并重连')
+          .fontSize(Tokens.fsBody)
           .height(38)
           .padding({ left: 18, right: 18 })
-          .backgroundColor(Tokens.accent)
-          .fontColor(Tokens.accentInk)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          .backgroundColor(this.saving ? Tokens.surface3 : Tokens.accent)
+          .fontColor(this.saving ? Tokens.dim : Tokens.accentInk)
+          .enabled(!this.saving)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
           .onClick(() => {
-            this.onSave();
+            this.validateAndSubmit();
           })
       }
       .width('100%')
       .margin({ top: 14 })
       .alignItems(VerticalAlign.Center)
+
+      if (this.saving) {
+        Column() {
+          ConnectionStageCard({
+            stages: SAVE_STAGES,
+            currentStage: this.stageIdx,
+            elapsedSec: this.elapsedSec,
+            detail: this.stageDetail,
+            errorText: ''
+          })
+        }
+        .width('100%')
+        .margin({ top: 12 })
+        .transition(TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std }))
+      } else if (this.activeErr() !== '') {
+        Column() {
+          Text(this.activeErr())
+            .fontSize(Tokens.fsFoot)
+            .fontColor(Tokens.err)
+            .lineHeight(18)
+            .maxLines(5)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+
+          if (this.onRePair !== undefined) {
+            Row() {
+              Text('重新扫码配对 ›')
+                .fontSize(Tokens.fsFoot)
+                .fontColor(Tokens.accent)
+                .backgroundColor(Tokens.accentSoft)
+                .borderRadius(Tokens.rPill)
+                .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+                .onClick(() => {
+                  Haptics.tap();
+                  if (this.onRePair !== undefined) {
+                    this.onRePair();
+                  }
+                })
+            }
+            .width('100%')
+            .margin({ top: 8 })
+          }
+        }
+        .width('100%')
+        .padding(12)
+        .margin({ top: 12 })
+        .backgroundColor(Tokens.intrBg)
+        .border({ width: 1, color: Tokens.err })
+        .borderRadius(Tokens.rMd)
+        .alignItems(HorizontalAlign.Start)
+        .transition(TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std }))
+      }
     }
     .alignItems(HorizontalAlign.Start)
     .width('100%')
     .padding(16)
-    .backgroundColor(Tokens.surface)
+    .backgroundColor(Mat.cardBg(this.hdsOn))
+    .border(Mat.cardBorder(this.hdsOn))
+    .shadow(Mat.cardShadow(this.hdsOn))
     .borderRadius(Tokens.rGroup)
     .clip(true)
   }

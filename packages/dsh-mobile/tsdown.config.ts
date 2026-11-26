@@ -1,14 +1,60 @@
 /**
- * Standalone build config for dsh-mobile.
- *
- * Two halves from one entry: the host gateway (`lib/index.js`, ESM, node
- * externals kept intact) and the settings-dialog bundle (`lib/client.js`, the
- * loader's closure-factory artifact). `qrcode` stays external on the node half
- * — it is imported lazily and only when the panel asks for a QR, so loading the
- * plugin never pays for it.
+ * Standalone tsdown build config for agent-mobile-gateway.
+ * Zero shared-monorepo imports and zero MPL/GPL bundler plugins.
  */
-import { clientBundle } from '../../shared/tsdown.client.ts'
+import type { UserConfig } from 'tsdown'
 
-export default clientBundle('@deepseek-ai/dsh-mobile', ['src/index.ts'], {
-  libExternal: [/^qrcode$/],
-})
+const PLUGIN_ID = 'agent-mobile-gateway'
+const CLIENT_EXTERNALS: readonly string[] = [
+  'react',
+  'react/jsx-runtime',
+  'react-dom',
+  'react-dom/client',
+  '@deepseek-ai/cordis',
+  '@deepseek-ai/dsh-client-store',
+  '@deepseek-ai/dsh-client-ui-slots',
+  '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-client-ui-dockkit',
+]
+
+const nodeEnv = process.env.NODE_ENV ?? 'production'
+
+const nodeConfig: UserConfig = {
+  name: PLUGIN_ID,
+  entry: ['src/index.ts'],
+  outDir: 'lib',
+  format: ['esm'],
+  platform: 'node',
+  target: 'es2024',
+  fixedExtension: false,
+  dts: false,
+  clean: false,
+  sourcemap: true,
+  external: ['@deepseek-ai/cordis', /^qrcode$/],
+}
+
+const clientConfig: UserConfig = {
+  name: `${PLUGIN_ID}/client`,
+  entry: { client: 'src/client/index.ts' },
+  outDir: 'lib',
+  format: 'cjs',
+  platform: 'browser',
+  dts: false,
+  clean: false,
+  sourcemap: true,
+  external: [...CLIENT_EXTERNALS],
+  noExternal: (id: string) => (CLIENT_EXTERNALS.includes(id) ? undefined : true),
+  define: {
+    'process.env.NODE_ENV': JSON.stringify(nodeEnv),
+    'import.meta.env.MODE': JSON.stringify(nodeEnv),
+    'import.meta.env': JSON.stringify({ MODE: nodeEnv }),
+  },
+  outputOptions: {
+    entryFileNames: 'client.js',
+    banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(PLUGIN_ID)}, factory: (require) => {`,
+    intro: 'var module = { exports: {} }; var exports = module.exports;',
+    footer: 'return module.exports; } });',
+  },
+}
+
+export default [nodeConfig, clientConfig]

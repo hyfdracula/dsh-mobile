@@ -1,40 +1,77 @@
+import { AppIcon, ICON_LIGHT } from '../common/AppIcon';
+import { Motion } from '../common/Motion';
 import { Tokens } from '../common/Tokens';
 
 /**
- * 「正在回复」的三点气泡。
+ * 「正在回复」的平滑相位呼吸圆点气泡（M1 / M4）。
  *
- * 从 ChatPage 里抽出来：它只依赖一个当前高亮的点下标，没理由让聊天页多背 30 行；
- * 抽成组件后 ChatPage 只负责每 320ms 推进 active。
+ * 父级仅在 running === true 时推进 active（0/1/2），停止生成后立即清零定时器；
+ * 三颗圆点按相位差联动透明度、缩放与轻微起伏，使用统一 Motion 曲线过渡。
  */
 @Component
 export struct TypingBubble {
-  /** 当前不透明的那颗点（0/1/2），由父级定时推进。 */
+  /** 当前主相位的点下标（0/1/2），由父级在运行态推进。 */
   @Prop active: number = 0;
+  @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('appIconStyle') appIconStyle: string = ICON_LIGHT;
+
+  private dotOpacity(i: number): number {
+    if (this.active === i) {
+      return 1.0;
+    }
+    if ((this.active + 2) % 3 === i) {
+      return 0.56;
+    }
+    return 0.24;
+  }
+
+  private dotScale(i: number): number {
+    if (this.active === i) {
+      return 1.22;
+    }
+    if ((this.active + 2) % 3 === i) {
+      return 1.02;
+    }
+    return 0.86;
+  }
+
+  private dotOffsetY(i: number): number {
+    return this.active === i ? -2.5 : 0;
+  }
+
+  @Builder
+  private phaseDot(i: number) {
+    Circle()
+      .width(6)
+      .height(6)
+      .fill(Tokens.accent)
+      .opacity(this.dotOpacity(i))
+      .scale({ x: this.dotScale(i), y: this.dotScale(i) })
+      .translate({ y: this.dotOffsetY(i) })
+      .animation({ duration: Motion.move, curve: Motion.std })
+  }
 
   build() {
     Column() {
       Row() {
-        Image($r('app.media.app_icon'))
+        Image(AppIcon.res(this.appIconStyle))
           .width(20)
           .height(20)
-          .borderRadius(6)
+          .borderRadius(Tokens.rXs)
+          .border({ width: 0.5, color: Tokens.line })
           .objectFit(ImageFit.Cover)
       }
       .width('100%')
       .margin({ bottom: 6 })
 
-      Row({ space: 5 }) {
-        ForEach([0, 1, 2], (i: number) => {
-          Circle()
-            .width(6)
-            .height(6)
-            .fill(Tokens.accent)
-            .opacity(this.active === i ? 1 : 0.28)
-        }, (i: number) => 'dot' + i)
+      Row({ space: 6 }) {
+        this.phaseDot(0)
+        this.phaseDot(1)
+        this.phaseDot(2)
       }
       .padding({ left: 16, right: 16, top: 14, bottom: 14 })
       .backgroundColor(Tokens.surface)
-      .borderRadius(20)
+      .borderRadius(Tokens.rCard)
       .border({ width: 1, color: Tokens.lineSoft })
     }
     .width('100%')

@@ -4,7 +4,17 @@
   "buildOptionSet": [
     {
       "name": "release",
-      "debuggable": false
+      "debuggable": false,
+      "arkOptions": {
+        "obfuscation": {
+          "ruleOptions": {
+            "enable": true,
+            "files": [
+              "./obfuscation-rules.txt"
+            ]
+          }
+        }
+      }
     }
   ],
   "targets": [

@@ -1,4 +1,5 @@
 import { ImageRef, Api } from '../common/Api';
+import { AppIcon, ICON_LIGHT } from '../common/AppIcon';
 import { Tokens } from '../common/Tokens';
 import { Haptics } from '../common/Haptics';
 
@@ -8,12 +9,15 @@ import { Haptics } from '../common/Haptics';
  */
 @Component
 export struct MessageImages {
-  images: ImageRef[] = [];
+  @Prop images: ImageRef[] = [];
   api: Api = new Api('', '');
   onTap: (url: string) => void = () => {};
+  @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('attSigRev') attSigRev: number = 0;
+  @StorageLink('appIconStyle') appIconStyle: string = ICON_LIGHT;
 
   private widthOf(img: ImageRef): number {
-    return img.width > 0 && img.height > 0 && img.width < 280 ? img.width : 280;
+    return img.width > 0 && img.height > 0 && img.width < 270 ? img.width : 270;
   }
 
   private heightOf(img: ImageRef): number {
@@ -32,9 +36,9 @@ export struct MessageImages {
             .width(this.widthOf(img))
             .height(this.heightOf(img))
             .objectFit(ImageFit.Contain)
-            .borderRadius(14)
+            .borderRadius(Tokens.rMd)
             .backgroundColor(Tokens.surface2)
-            .alt($r('app.media.app_icon'))
+            .alt(AppIcon.res(this.appIconStyle))
             .onClick(() => {
               Haptics.tap();
               this.onTap(this.api.attachmentUrl(img));
@@ -42,16 +46,16 @@ export struct MessageImages {
         } else {
           Row() {
             Text('图片待加载')
-              .fontSize(11)
+              .fontSize(Tokens.fsCaption)
               .fontColor(Tokens.dim)
           }
           .width(this.widthOf(img))
           .height(72)
           .justifyContent(FlexAlign.Center)
-          .borderRadius(14)
+          .borderRadius(Tokens.rMd)
           .backgroundColor(Tokens.surface2)
         }
-      }, (img: ImageRef) => img.id)
+      }, (img: ImageRef) => img.id + '_' + (this.attSigRev >= 0 && this.api.attachmentUrl(img) !== '' ? '1' : '0'))
     }
     .alignItems(HorizontalAlign.Start)
     .width('100%')

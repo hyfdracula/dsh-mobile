@@ -1,30 +1,45 @@
-import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
-import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
-import wantAgent from '@ohos.app.ability.wantAgent';
+import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { Adaptive } from '../common/Adaptive';
+import { AppCtx } from '../common/AppCtx';
+import { Drafts } from '../common/Drafts';
+import { Marks } from '../common/Marks';
+import { Net } from '../common/Net';
+import { SafeArea } from '../common/SafeArea';
 
-const TAG: string = 'DshMobile';
+const TAG: string = 'AgentMobile';
 
 export default class EntryAbility extends UIAbility {
-  /** 后台长时任务是否已启动，避免重复申请 */
-  private keeping: boolean = false;
-
-  onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+  onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, TAG, 'Ability onCreate');
+    AppCtx.bindAbility(this.context);
+    if (this.context.config !== undefined && this.context.config.colorMode !== undefined) {
+      AppStorage.setOrCreate('sysDark',
+        this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK);
+    }
     this.takeSession(want);
   }
 
   /** 通知点击（应用已在后台时走这里） */
-  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+  onNewWant(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, TAG, 'Ability onNewWant');
     this.takeSession(want);
   }
 
+  /** 系统深浅色变更时同步到 AppStorage，供跟随系统主题实时刷新 */
+  onConfigurationUpdate(newConfig: Configuration): void {
+    if (newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK ||
+      newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT) {
+      const isDark: boolean = newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+      AppStorage.setOrCreate('sysDark', isDark);
+      AppStorage.setOrCreate('sysConfigTick', Date.now());
+    }
+  }
+
   /**
-   * 从通知的 want 里取出会话 id，交给界面跳转。
-   * AppStorage 在 onCreate 早期可能还没建好，所以延后一拍写。
+   * 同步写入通知跳转的 sessionId，由 ShellPage 在挂载及 @Watch 时消费，避免定时竞态。
    */
   private takeSession(want: Want): void {
     const params: Record<string, Object> | undefined = want.parameters;
@@ -32,99 +47,42 @@ export default class EntryAbility extends UIAbility {
       return;
     }
     const raw: Object | undefined = params.sessionId;
-    const id: string = raw === undefined ? '' : String(raw);
+    const id: string = raw === undefined ? '' : String(raw).trim();
     if (id === '') {
       return;
     }
-    setTimeout(() => {
-      // 用单独的键：openSession 表示「当前正开着哪个会话」（聊天页写、外壳读，用来压掉自己那条完成通知），
-      // 两件事共用一个键会让每次进会话都被列表当成一次跳转请求，栈里叠出好几层聊天页。
-      // 带时间戳是为了同一条通知连点两次也能重新触发。
-      AppStorage.setOrCreate('openSessionReq', id + '|' + Date.now());
-      hilog.info(0x0000, TAG, 'open session from notification: %{public}s', id);
-    }, 200);
-  }
-
-  /**
-   * 退到后台时申请长时任务。
-   *
-   * 通知依赖 12 秒一次的轮询来发现「跑完了」，而应用退到后台后 JS 定时器会被
-   * 冻结。拉起 DATA_TRANSFER 长时任务可以让轮询继续跑，任务完成时照常弹通知。
-   */
-  onBackground(): void {
-    this.startKeepAlive();
-  }
-
-  onForeground(): void {
-    this.stopKeepAlive();
-  }
-
-  private async startKeepAlive(): Promise<void> {
-    if (this.keeping) {
-      return;
-    }
-    try {
-      const info: wantAgent.WantAgentInfo = {
-        wants: [
-          {
-            bundleName: 'com.dsh.mobile',
-            abilityName: 'EntryAbility'
-          }
-        ],
-        actionType: wantAgent.OperationType.START_ABILITY,
-        requestCode: 7,
-        actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
-      };
-      const agent: object = await wantAgent.getWantAgent(info);
-      await backgroundTaskManager.startBackgroundRunning(
-        this.context,
-        backgroundTaskManager.BackgroundMode.DATA_TRANSFER,
-        agent
-      );
-      this.keeping = true;
-      hilog.info(0x0000, TAG, 'keepAlive start ok');
-    } catch (e) {
-      hilog.error(0x0000, TAG, 'keepAlive start failed: %{public}s', JSON.stringify(e));
-    }
-  }
-
-  private async stopKeepAlive(): Promise<void> {
-    if (!this.keeping) {
-      return;
-    }
-    try {
-      await backgroundTaskManager.stopBackgroundRunning(this.context);
-      hilog.info(0x0000, TAG, 'keepAlive stop ok');
-    } catch (e) {
-      hilog.error(0x0000, TAG, 'keepAlive stop failed: %{public}s', JSON.stringify(e));
-    }
-    this.keeping = false;
+    AppStorage.setOrCreate('openSessionReq', id + '|' + Date.now());
+    hilog.info(0x0000, TAG, 'open session from notification');
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
+    AppCtx.bindAbility(this.context);
+    void this.setupWindow(windowStage);
+  }
 
+  private async setupWindow(windowStage: window.WindowStage): Promise<void> {
     try {
       const win: window.Window = windowStage.getMainWindowSync();
-      win.setWindowLayoutFullScreen(true).then(() => {
-        hilog.info(0x0000, TAG, 'layoutFullScreen ok');
-      }).catch((e: BusinessError) => {
+      AppCtx.bindWindow(win);
+      try {
+        await win.setWindowLayoutFullScreen(true);
+      } catch (e) {
         hilog.error(0x0000, TAG, 'layoutFullScreen failed: %{public}s', JSON.stringify(e));
-      });
-      win.setWindowSystemBarEnable(['status']).then(() => {
-        hilog.info(0x0000, TAG, 'barEnable ok');
-      }).catch((e: BusinessError) => {
+      }
+      SafeArea.attach(win);
+      Adaptive.attach(win);
+      win.setWindowSystemBarEnable(['status']).catch((e: BusinessError) => {
         hilog.error(0x0000, TAG, 'barEnable failed: %{public}s', JSON.stringify(e));
       });
-      win.setWindowKeepScreenOn(true).catch((e: BusinessError) => {
-        hilog.error(0x0000, TAG, 'keepScreenOn failed: %{public}s', JSON.stringify(e));
-      });
-      hilog.info(0x0000, TAG, 'window setup done');
       windowStage.loadContent('pages/Index', (err) => {
         if (err.code) {
           hilog.error(0x0000, TAG, 'loadContent failed: %{public}s', JSON.stringify(err));
           return;
         }
-        hilog.info(0x0000, TAG, 'loadContent ok');
+        AppCtx.bindWindow(win);
+        SafeArea.attach(win);
+        Adaptive.attach(win);
+        SafeArea.setKeyboardResize(win);
       });
     } catch (err) {
       hilog.error(0x0000, TAG, 'window setup failed: %{public}s', JSON.stringify(err));
@@ -132,6 +90,12 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    Drafts.flush();
+    Marks.flush();
+    Adaptive.detach();
+    SafeArea.detach();
+    Net.stop();
+    AppCtx.clearWindow();
     hilog.info(0x0000, TAG, 'Ability onDestroy');
   }
 }

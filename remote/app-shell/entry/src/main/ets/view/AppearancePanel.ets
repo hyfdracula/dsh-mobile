@@ -1,5 +1,9 @@
-import { Tokens } from '../common/Tokens';
+import { AppIcon, ICON_DARK, ICON_LIGHT, IconSwitchResult } from '../common/AppIcon';
 import { Haptics } from '../common/Haptics';
+import { Mat } from '../common/Mat';
+import { Toast } from '../common/Toast';
+import { Tokens } from '../common/Tokens';
+import { HintLabel, RowSwitch } from '../common/Widgets';
 
 interface ThemeOpt {
   id: string;
@@ -12,9 +16,20 @@ const THEMES: ThemeOpt[] = [
   { id: 'auto', name: '跟随系统' }
 ];
 
+interface ScaleOpt {
+  val: number;
+  name: string;
+}
+
+const SCALES: ScaleOpt[] = [
+  { val: 0.92, name: '小' },
+  { val: 1, name: '标准' },
+  { val: 1.08, name: '大' }
+];
+
 /**
- * 「外观与交互」：主题、触感、沉浸光感、回车发送、正文字号。
- * 显示状态由父级给，变更以回调抛回；提示气泡是组件自己的临时状态。
+ * 「外观与交互」面板：
+ * 拆分为「外观显示」与「对话与交互」两张语义分组卡片，全标题统一使用 Tokens.fg + Tokens.fsBodyLg。
  */
 @Component
 export struct AppearancePanel {
@@ -23,81 +38,121 @@ export struct AppearancePanel {
   @Prop hds: boolean = true;
   @Prop enterSend: boolean = true;
   @Prop textScale: number = 1;
+  @Prop compactHistory: boolean = false;
+
   onTheme: (m: string) => void = () => {};
   onHaptics: (v: boolean) => void = () => {};
   onHds: (v: boolean) => void = () => {};
   onEnterSend: (v: boolean) => void = () => {};
   onTextScale: (v: number) => void = () => {};
+  onCompactHistory: (v: boolean) => void = () => {};
 
-  @State private popKey: string = '';
+  @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('hdsOn') hdsOn: boolean = true;
+  @StorageLink('appIconStyle') appIconStyle: string = ICON_LIGHT;
+  @State private iconBusy: boolean = false;
 
-  @Builder
-  tip(text: string) {
-    Text(text)
-      .fontSize(12)
-      .lineHeight(18)
-      .fontColor(Tokens.dim)
-      .width(240)
-      .padding(12)
-      .backgroundColor(Tokens.surface)
-      .borderRadius(14)
-      .border({ width: 1, color: Tokens.lineSoft })
-      .shadow({ radius: 18, color: Tokens.shadow, offsetY: 6 })
+  private async applyIcon(target: string): Promise<void> {
+    if (this.iconBusy || this.appIconStyle === target) {
+      return;
+    }
+    Haptics.tap();
+    this.iconBusy = true;
+    try {
+      const res: IconSwitchResult = await AppIcon.switchTo(target);
+      if (res.desktopApplied) {
+        Toast.ok(target === ICON_DARK ? '已切换为纯粹曜黑图标' : '已切换为冷银瓷白默认图标');
+      } else {
+        Toast.info('应用内图标已切换；桌面图标切换受系统限制（' + String(res.errCode) + '）');
+      }
+    } finally {
+      this.iconBusy = false;
+    }
   }
 
   @Builder
-  hint(title: string, text: string, key: string, dim: boolean) {
+  private iconOptionCard(styleId: string, label: string, tag: string, imgRes: Resource) {
+    Row({ space: 10 }) {
+      Image(imgRes)
+        .width(38)
+        .height(38)
+        .borderRadius(10)
+        .border({ width: 0.5, color: Tokens.line })
+
+      Column({ space: 2 }) {
+        Text(label)
+          .fontSize(Tokens.fsBody)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.fg)
+        Text(this.appIconStyle === styleId ? tag + ' · 使用中' : tag)
+          .fontSize(Tokens.fsCaption)
+          .fontColor(this.appIconStyle === styleId ? Tokens.accent : Tokens.dim2)
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+    }
+    .layoutWeight(1)
+    .padding({ left: 11, right: 11, top: 10, bottom: 10 })
+    .borderRadius(Tokens.rMd)
+    .backgroundColor(this.appIconStyle === styleId ? Tokens.accentSoft : Mat.subCardBg(this.hdsOn))
+    .border(this.appIconStyle === styleId
+      ? { width: 1.5, color: Tokens.accent }
+      : Mat.subCardBorder(this.hdsOn))
+    .opacity(this.iconBusy ? 0.65 : 1)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+    .onClick(() => {
+      void this.applyIcon(styleId);
+    })
+  }
+
+  @Builder
+  sectionTitle(text: string, topMargin: number) {
+    Text(text)
+      .fontSize(Tokens.fsCaption)
+      .fontColor(Tokens.dim2)
+      .letterSpacing(1.4)
+      .margin({ left: 6, top: topMargin, bottom: 8 })
+  }
+
+  @Builder
+  labelWithHint(title: string, tip: string) {
     Row() {
       Text(title)
-        .fontSize(13)
-        .fontColor(dim ? Tokens.dim : Tokens.fg)
-      Text('!')
-        .fontSize(11)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(Tokens.dim2)
-        .textAlign(TextAlign.Center)
-        .width(15)
-        .height(15)
-        .borderRadius(10)
-        .border({ width: 1, color: Tokens.isDark ? '#59FFFFFF' : '#33000000' })
-        .margin({ left: 6 })
-        .bindPopup(this.popKey === key, {
-          builder: this.tip(text),
-          placement: Placement.Bottom,
-          popupColor: Color.Transparent,
-          enableArrow: false,
-          onStateChange: (e) => {
-            if (!e.isVisible) {
-              this.popKey = '';
-            }
-          }
-        })
-        .onClick(() => {
-          this.popKey = this.popKey === key ? '' : key;
-        })
+        .fontSize(Tokens.fsBodyLg)
+        .fontColor(Tokens.fg)
+      HintLabel({
+        title: '',
+        tipText: tip
+      })
+      .margin({ left: 6 })
     }
     .alignItems(VerticalAlign.Center)
   }
 
   build() {
     Column() {
+      // 分组 1：外观显示
+      this.sectionTitle('外观显示', 6)
       Column() {
         Row() {
           Text('主题')
-            .fontSize(13)
-            .fontColor(Tokens.dim)
+            .fontSize(Tokens.fsBodyLg)
+            .fontColor(Tokens.fg)
             .layoutWeight(1)
           Row() {
             ForEach(THEMES, (o: ThemeOpt) => {
               Text(o.name)
-                .fontSize(12)
+                .fontSize(Tokens.fsFoot)
                 .fontColor(this.themeMode === o.id ? Tokens.accentInk : Tokens.dim)
-                .backgroundColor(this.themeMode === o.id ? Tokens.accent : Tokens.surface3)
-                .borderRadius(999)
-                .padding({ left: 12, right: 12, top: 7, bottom: 7 })
+                .backgroundColor(this.themeMode === o.id ? Tokens.accent : Tokens.surface2)
+                .borderRadius(Tokens.rPill)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
                 .margin({ left: 6 })
                 .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
                 .onClick(() => {
+                  if (this.themeMode === o.id) {
+                    return;
+                  }
                   Haptics.tap();
                   this.onTheme(o.id);
                 })
@@ -105,16 +160,117 @@ export struct AppearancePanel {
           }
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+        .padding({ left: 16, right: 16, top: 13, bottom: 13 })
         .alignItems(VerticalAlign.Center)
 
         Divider().color(Tokens.lineSoft).margin({ left: 16 })
+
+        Row() {
+          Column() {
+            this.labelWithHint(
+              '沉浸光感',
+              '开启（液态玻璃皮肤）：输入框、模型卡片、统计面板、弹出菜单、添加对话按钮与排队抽屉呈现液态玻璃光感；关闭（经典实色皮肤）：切换为零模糊高对比实色表面与纯色按钮。'
+            )
+            Text(this.hdsOn ? '当前：液态玻璃皮肤（悬浮通透光感）' : '当前：经典实色皮肤（零模糊高对比）')
+              .fontSize(Tokens.fsCaption)
+              .fontColor(Tokens.dim2)
+              .margin({ top: 3 })
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+
+          Toggle({ type: ToggleType.Switch, isOn: this.hdsOn })
+            .selectedColor(Tokens.accent)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+            .onChange((v: boolean) => {
+              if (v !== this.hdsOn) {
+                this.onHds(v);
+              }
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+        .alignItems(VerticalAlign.Center)
+
+        Divider().color(Tokens.lineSoft).margin({ left: 16 })
+
+        Column({ space: 10 }) {
+          Row() {
+            Column() {
+              this.labelWithHint(
+                '应用图标',
+                '在冷银瓷白（默认）与纯粹曜黑两套鸿蒙分层图标之间切换，同步更新桌面图标与应用内标识。'
+              )
+              Text(this.appIconStyle === ICON_DARK ? '当前：纯粹曜黑（暗夜饱满版）' : '当前：冷银瓷白（默认饱满版）')
+                .fontSize(Tokens.fsCaption)
+                .fontColor(Tokens.dim2)
+                .margin({ top: 3 })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+          }
+          .width('100%')
+
+          Row({ space: 10 }) {
+            this.iconOptionCard(ICON_LIGHT, '冷银瓷白', '默认', $r('app.media.app_icon'))
+            this.iconOptionCard(ICON_DARK, '纯粹曜黑', '暗夜', $r('app.media.app_icon_dark'))
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 12, bottom: 13 })
+        .alignItems(HorizontalAlign.Start)
+
+        Divider().color(Tokens.lineSoft).margin({ left: 16 })
+
         Row() {
           Row() {
-            this.hint('触感反馈', '点击、归档、发送时轻轻振一下。', 'haptics', true)
+            this.labelWithHint('正文字号', '只缩放聊天消息正文，界面按钮与标题尺寸保持稳定。')
           }
-          .alignItems(VerticalAlign.Center)
           .layoutWeight(1)
+          .alignItems(VerticalAlign.Center)
+
+          Row() {
+            ForEach(SCALES, (sc: ScaleOpt) => {
+              Text(sc.name)
+                .fontSize(Tokens.fsFoot)
+                .fontColor(this.textScale === sc.val ? Tokens.accentInk : Tokens.dim)
+                .backgroundColor(this.textScale === sc.val ? Tokens.accent : Tokens.surface2)
+                .borderRadius(Tokens.rPill)
+                .padding({ left: 11, right: 11, top: 6, bottom: 6 })
+                .margin({ left: 6 })
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+                .onClick(() => {
+                  if (this.textScale === sc.val) {
+                    return;
+                  }
+                  Haptics.tap();
+                  this.onTextScale(sc.val);
+                })
+            }, (sc: ScaleOpt) => String(sc.val))
+          }
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 13, bottom: 13 })
+        .alignItems(VerticalAlign.Center)
+      }
+      .width('100%')
+      .backgroundColor(Mat.cardBg(this.hdsOn))
+      .border(Mat.cardBorder(this.hdsOn))
+      .shadow(Mat.cardShadow(this.hdsOn))
+      .borderRadius(Tokens.rGroup)
+      .clip(true)
+
+      // 分组 2：对话与交互
+      this.sectionTitle('对话与交互', 18)
+      Column() {
+        Row() {
+          Row() {
+            this.labelWithHint('触感反馈', '点击、归档、发送时提供轻巧短振动反馈。')
+          }
+          .layoutWeight(1)
+          .alignItems(VerticalAlign.Center)
+
           Toggle({ type: ToggleType.Switch, isOn: this.haptics })
             .selectedColor(Tokens.accent)
             .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
@@ -127,30 +283,14 @@ export struct AppearancePanel {
         .alignItems(VerticalAlign.Center)
 
         Divider().color(Tokens.lineSoft).margin({ left: 16 })
-        Row() {
-          Row() {
-            this.hint('沉浸光感', '系统级玻璃材质：底栏与顶栏跟随内容折射；低端机自动降级。', 'hds', true)
-          }
-          .alignItems(VerticalAlign.Center)
-          .layoutWeight(1)
-          Toggle({ type: ToggleType.Switch, isOn: this.hds })
-            .selectedColor(Tokens.accent)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onChange((v: boolean) => {
-              this.onHds(v);
-            })
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-        .alignItems(VerticalAlign.Center)
 
-        Divider().color(Tokens.lineSoft).margin({ left: 16 })
         Row() {
           Row() {
-            this.hint('回车发送', '关掉后回车只换行，用右侧按钮发送；适合经常写多行的人。', 'enter', true)
+            this.labelWithHint('回车发送', '关掉后回车只换行，用右侧发送按钮发出；适合经常输入多行指令。')
           }
-          .alignItems(VerticalAlign.Center)
           .layoutWeight(1)
+          .alignItems(VerticalAlign.Center)
+
           Toggle({ type: ToggleType.Switch, isOn: this.enterSend })
             .selectedColor(Tokens.accent)
             .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
@@ -163,35 +303,22 @@ export struct AppearancePanel {
         .alignItems(VerticalAlign.Center)
 
         Divider().color(Tokens.lineSoft).margin({ left: 16 })
-        Row() {
-          Row() {
-            this.hint('正文字号', '只缩放聊天正文，界面控件不跟着变。', 'text', false)
+
+        RowSwitch({
+          title: '会话精简加载',
+          hint: '默认折叠长工具输出以加快大历史加载，重进会话生效',
+          value: this.compactHistory,
+          onChanged: (v: boolean) => {
+            this.onCompactHistory(v);
           }
-          .alignItems(VerticalAlign.Center)
-          .layoutWeight(1)
-          ForEach([0.92, 1, 1.08], (sc: number) => {
-            Text(sc === 0.92 ? '小' : (sc === 1 ? '标准' : '大'))
-              .fontSize(12)
-              .fontColor(this.textScale === sc ? Tokens.accentInk : Tokens.dim)
-              .backgroundColor(this.textScale === sc ? Tokens.accent : Tokens.surface2)
-              .borderRadius(Tokens.rPill)
-              .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-              .margin({ left: 6 })
-              .onClick(() => {
-                Haptics.tap();
-                this.onTextScale(sc);
-              })
-          }, (sc: number) => String(sc))
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-        .alignItems(VerticalAlign.Center)
+        })
       }
       .width('100%')
-      .backgroundColor(Tokens.surface)
+      .backgroundColor(Mat.cardBg(this.hdsOn))
+      .border(Mat.cardBorder(this.hdsOn))
+      .shadow(Mat.cardShadow(this.hdsOn))
       .borderRadius(Tokens.rGroup)
       .clip(true)
-      .margin({ top: 10 })
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)

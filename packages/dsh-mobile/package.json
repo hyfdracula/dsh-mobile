@@ -1,7 +1,7 @@
 {
-  "name": "@deepseek-ai/dsh-mobile",
-  "description": "手机网关：在自选端口上暴露 DSH 会话列表与发消息接口，并提供扫码/配对码配对与「设置 → 手机连接」面板，供自建手机 App 使用。与内置控制台完全并行、互不共享状态。",
-  "version": "2.0.0",
+  "name": "agent-mobile-gateway",
+  "description": "Agent Mobile 桌面端网关插件：在自选端口上暴露统一多 Agent（DSH / Codex / Claude Code / OpenCode / Antigravity）会话与工作区接口，支持 Noise_IK 端到端加密与扫码配对。",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
   "engines": {

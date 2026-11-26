@@ -1,5 +1,7 @@
 import { ConfigurationConstant } from '@kit.AbilityKit';
-import { common } from '@kit.AbilityKit';
+import { AppCtx } from './AppCtx';
+import { Mat } from './Mat';
+import { SafeArea } from './SafeArea';
 import { Tokens } from './Tokens';
 
 /** 外观模式：跟随系统 / 深色 / 浅色。 */
@@ -19,24 +21,29 @@ export function resolveDark(mode: string, systemDark: boolean): boolean {
 }
 
 /**
- * 应用主题：改调色板 → 写入 AppStorage 的 themeBg / themeRev。
- * 页面用 @StorageLink('themeBg') 订阅，值一变就会重绘（进而重新读取 Tokens）。
+ * 应用主题：改调色板 -> 刷新材质缓存与状态栏前景色 -> 写入 AppStorage 的 themeBg / themeDark / themeRev。
+ * 页面用 @StorageLink('themeBg') 或 @StorageLink('themeDark') 订阅，值一变就会重绘。
  */
 export function applyTheme(mode: string, systemDark: boolean): void {
   const dark: boolean = resolveDark(mode, systemDark);
   Tokens.applyDark(dark);
-  // 系统沉浸光感材质跟的是"应用色彩模式"，不是我们自己的 Tokens。
-  // 不告诉系统，深色界面下会糊出一块浅灰板。
+  Mat.invalidate();
+  SafeArea.syncSystemBar(dark, Tokens.bg);
+  // 系统沉浸光感材质跟的是应用色彩模式：跟随系统时设为 NOT_SET 以便继续接收系统深浅色切换事件。
   try {
-    const ctx = getContext() as common.UIAbilityContext;
-    ctx.getApplicationContext().setColorMode(dark
-      ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
-      : ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT);
+    const ctx = AppCtx.abilityOrNull();
+    if (ctx !== null) {
+      const targetMode: ConfigurationConstant.ColorMode = mode === THEME_AUTO
+        ? ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET
+        : (dark
+          ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+          : ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT);
+      ctx.getApplicationContext().setColorMode(targetMode);
+    }
   } catch (e) {
     console.info('DSH_THEME colorMode skipped: ' + JSON.stringify(e));
   }
   AppStorage.setOrCreate('themeBg', Tokens.bg);
-  AppStorage.setOrCreate('themeFg', Tokens.fg);
   AppStorage.setOrCreate('themeDark', dark);
   const rev: number = AppStorage.get<number>('themeRev') ?? 0;
   AppStorage.setOrCreate('themeRev', rev + 1);

@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "DSH Mobile entry module"
+      "value": "Agent Mobile entry module"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "DSH Mobile"
+      "value": "Agent Mobile"
     },
     {
       "name": "EntryAbility_label",
-      "value": "DSH Mobile"
+      "value": "Agent Mobile"
     }
   ]
 }

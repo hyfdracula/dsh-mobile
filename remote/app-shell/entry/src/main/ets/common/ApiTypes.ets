@@ -1,10 +1,13 @@
 /**
  * Api 的请求/响应与领域类型。
  *
- * 从 Api.ets 拆出来：实现与类型分开，Api 只留方法；消费者仍从 Api 重新导出拿到同一批名字。
+ * 从 Api.ets 拆出来：实现与类型分开，Api 重新显式导出全部公开类型以保持消费方兼容。
  */
 import { ImagePart } from './Images';
 import { FilePart } from './Files';
+
+/** 连接阶段进度回调（stage 从 0 递增，detail 为当前阶段可读说明）。 */
+export type StageCallback = (stage: number, detail: string) => void;
 
 /** 会话行（对应 GET /api/sessions 的 sessions[]） */
 export interface SessionRow {
@@ -13,13 +16,217 @@ export interface SessionRow {
   updatedAt: number;
   cwd: string;
   running: boolean;
-  /** 宿主有挂起的提问/审批：会话卡片标黄「等你回答」。 */
+  /** 宿主有挂起的提问/审批：会话卡片标「等你回答」。 */
   asking?: boolean;
   archived?: boolean;
   pinned?: boolean;
   agents?: AgentSummary;
   model?: ModelRef;
   context?: ContextUsage | null;
+  plan?: PlanState;
+  /** 所属后端引擎：'dsh' | 'codex' | 'claude' | 'opencode' | 'antigravity' */
+  backend?: string;
+  preview?: string;
+}
+
+/** 电脑端多 Agent 引擎能力声明（客户端按能力动态裁剪界面，零硬编码）。 */
+export interface BackendCapabilities {
+  listExistingSessions: boolean;
+  historyReplay: boolean;
+  streamDelta: boolean;
+  approval: boolean;
+  abort: boolean;
+  images: boolean;
+  files: boolean;
+  modelSwitch: boolean;
+  reasoningEffort: boolean;
+  planMode: boolean;
+  goalMode: boolean;
+  compact: boolean;
+  fork: boolean;
+  archivePin: boolean;
+  webConsole: boolean;
+}
+
+/** 电脑端单个 Agent 后端状态描述（对应 GET /api/backends）。 */
+export interface BackendInfo {
+  id: string;
+  label: string;
+  installed: boolean;
+  enabled: boolean;
+  version: string;
+  status: string;
+  sessionCount: number;
+  error?: string;
+  capabilities: BackendCapabilities;
+}
+
+export interface BackendsResp {
+  ok?: boolean;
+  backends?: BackendInfo[];
+}
+
+export interface BackendToggleBody {
+  enabled: boolean;
+}
+
+export interface BackendToggleResp {
+  ok?: boolean;
+  backend?: BackendInfo;
+}
+
+export function backendIdOfSession(id: string): string {
+  if (id.startsWith('codex:')) {
+    return 'codex';
+  }
+  if (id.startsWith('claude:')) {
+    return 'claude';
+  }
+  if (id.startsWith('opencode:')) {
+    return 'opencode';
+  }
+  if (id.startsWith('antigravity:')) {
+    return 'antigravity';
+  }
+  return 'dsh';
+}
+
+export function backendLabelOf(id: string): string {
+  if (id === 'codex') {
+    return 'Codex';
+  }
+  if (id === 'claude') {
+    return 'Claude';
+  }
+  if (id === 'opencode') {
+    return 'OpenCode';
+  }
+  if (id === 'antigravity') {
+    return 'Antigravity';
+  }
+  return 'DSH';
+}
+
+export function defaultBackendCapabilities(backend: string): BackendCapabilities {
+  if (backend === 'dsh' || backend === '') {
+    return {
+      listExistingSessions: true,
+      historyReplay: true,
+      streamDelta: true,
+      approval: true,
+      abort: true,
+      images: true,
+      files: true,
+      modelSwitch: true,
+      reasoningEffort: true,
+      planMode: true,
+      goalMode: true,
+      compact: true,
+      fork: true,
+      archivePin: true,
+      webConsole: true
+    };
+  }
+  return {
+    listExistingSessions: true,
+    historyReplay: true,
+    streamDelta: true,
+    approval: backend === 'codex' || backend === 'opencode' || backend === 'antigravity',
+    abort: true,
+    images: backend === 'codex' || backend === 'opencode' || backend === 'antigravity',
+    files: false,
+    modelSwitch: backend === 'codex' || backend === 'claude' || backend === 'antigravity',
+    reasoningEffort: backend === 'codex',
+    planMode: false,
+    goalMode: false,
+    compact: false,
+    fork: false,
+    archivePin: false,
+    webConsole: false
+  };
+}
+
+/** 计划模式状态（F09）。 */
+export interface PlanState {
+  active: boolean;
+  pending: boolean;
+}
+
+export interface PlanBody {
+  active: boolean;
+}
+
+export interface PlanResp {
+  ok?: boolean;
+  active?: boolean;
+  pending?: boolean;
+  status?: string;
+}
+
+/** 斜杠指令项（F09）。 */
+export interface SlashCommandRow {
+  name: string;
+  description: string;
+  hint?: string;
+  section: string;
+}
+
+export interface CommandsResp {
+  ok?: boolean;
+  commands?: SlashCommandRow[];
+}
+
+export interface CommandExecBody {
+  line: string;
+}
+
+export interface CommandExecResp {
+  ok?: boolean;
+  commandId: string;
+  kind: string;
+  text: string;
+}
+
+export interface GoalCreateBody {
+  action: string;
+  objective: string;
+  maxGoalRounds?: number;
+}
+
+export interface ExportSignBody {
+  format: string;
+}
+
+export interface ExportSignRawResp {
+  ok?: boolean;
+  e?: string;
+  sig?: string;
+  filename?: string;
+}
+
+/** 会话导出短签名结果（F09）。 */
+export interface ExportSignResp {
+  ok: boolean;
+  url: string;
+  filename: string;
+  e: string;
+  sig: string;
+}
+
+export interface WebConsoleGrantRawResp {
+  ok?: boolean;
+  grant?: string;
+  path?: string;
+  expiresIn?: number;
+}
+
+/** 免密网页控制台一次性授权结果（L5）。 */
+export interface WebConsoleGrantResp {
+  ok: boolean;
+  grant: string;
+  path: string;
+  enterUrl: string;
+  expiresIn: number;
 }
 
 export interface TokenUsage {
@@ -45,7 +252,15 @@ export interface ImageRef {
   name: string;
 }
 
-/** 一轮的结局，挂在那一轮最后一条回复上（宿主 turn/end 的 reason）。 */
+/** 工具调用轨迹（G4）：status 为 run / ok / err */
+export interface ToolStep {
+  id: string;
+  name: string;
+  summary: string;
+  status: string;
+}
+
+/** 会话目标视图 */
 export interface GoalView {
   id?: string;
   objective?: string;
@@ -69,6 +284,8 @@ export interface TurnInfo {
   tokensOut: number;
   atSeq: number;
   finishedAt?: number;
+  errCode?: string;
+  errText?: string;
 }
 
 export interface Message {
@@ -78,6 +295,8 @@ export interface Message {
   seq: number;
   images?: ImageRef[];
   turn?: TurnInfo;
+  thinking?: string;
+  tools?: ToolStep[];
 }
 
 /** 上下文占用：宿主 token-meter 投影（used 为下一次请求的 prompt 估算，window 为路由容量）。 */
@@ -86,12 +305,12 @@ export interface ContextUsage {
   window: number;
 }
 
-/** 电脑端待发送队列里的一条（真正躺在 DSH 宿主里的，不是手机上假排的） */
+/** 电脑端待发送队列里的一条 */
 export interface QueueTextBody {
   text: string;
 }
 
-/** 宿主队列里一条消息内的图片（只有元信息，字节走 /queue-image）。 */
+/** 宿主队列里一条消息内的图片（只有元信息）。 */
 export interface QueueImage {
   mediaType: string;
   name?: string;
@@ -159,10 +378,29 @@ export interface MessagesResult {
   running?: boolean;
   /** 最后一轮的结束原因（completed / aborted / interrupted / error …） */
   lastTurn?: string;
-  /** 最后一轮失败时的原始报错，手机端要在消息流里显示完整 body */
+  /** 最后一轮失败时的原始报错 */
   lastErr?: TurnErr | null;
   queue?: QueuedItem[];
   questions?: AskState;
+  plan?: PlanState;
+}
+
+/** SSE 增量推送帧（R4：对应 GET /api/sessions/:id/stream 的 event: update） */
+export interface StreamUpdate {
+  ok?: boolean;
+  type?: string;
+  sessionId?: string;
+  total: number;
+  firstSeq?: number;
+  messages: Message[];
+  lastTurn?: string;
+  lastErr?: TurnErr | null;
+  running?: boolean;
+  context?: ContextUsage | null;
+  stats?: SessionStats;
+  queue?: QueuedItem[];
+  questions?: AskState;
+  plan?: PlanState;
 }
 
 export interface ModelRef {
@@ -190,6 +428,12 @@ export interface ApiInfo {
   version: string;
   host: string;
   port: number;
+  hostId?: string;
+  e2ee?: boolean;
+  e2eePub?: string;
+  plan?: boolean;
+  commands?: boolean;
+  webConsole?: boolean;
 }
 
 export interface SessionsResp {
@@ -221,6 +465,7 @@ export interface MessagesResp {
   lastErr?: TurnErr;
   queue?: QueuedItem[];
   questions?: AskState;
+  plan?: PlanState;
 }
 
 export interface PresenceBody {
@@ -239,6 +484,12 @@ export interface InfoResp {
   host: string;
   port: number;
   addresses?: string[];
+  hostId?: string;
+  e2ee?: boolean;
+  e2eePub?: string;
+  plan?: boolean;
+  commands?: boolean;
+  webConsole?: boolean;
 }
 
 export interface RawResult {
@@ -246,7 +497,6 @@ export interface RawResult {
   text: string;
 }
 
-/** 服务端出错时回的那一小段 JSON，只需要 error。 */
 export interface QueueOrderBody {
   ids: string[];
 }
@@ -345,6 +595,7 @@ export interface StopResp {
 
 export interface CreateBody {
   cwd: string;
+  backend?: string;
 }
 
 export interface CreateResp {
@@ -515,10 +766,29 @@ export interface HostPluginToggleResp {
   profile?: string;
   name?: string;
   enabled?: boolean;
-  /** 清单是否真的被改写；没改说明本来就是那个状态 */
   changed?: boolean;
-  /** 改写后必须重启宿主才生效 */
   restartRequired?: boolean;
+}
+
+/** 插件配置项（R5：扁平安全标量 boolean / number / string）。 */
+export interface PluginSettingField {
+  key: string;
+  kind: string;
+  value: string;
+}
+
+export interface PluginSettingsResp {
+  ok?: boolean;
+  writable: boolean;
+  restartRequired?: boolean;
+  fields: PluginSettingField[];
+}
+
+export interface PluginSettingsSaveBody {
+  profile: string;
+  name: string;
+  fields?: PluginSettingField[];
+  values?: Record<string, string | number | boolean>;
 }
 
 export interface FsEntry {
@@ -535,6 +805,9 @@ export interface FsListing {
   more: boolean;
   /** 会话没有工作目录时，宿主退回了它自己的当前目录 */
   fallback?: boolean;
+  total?: number;
+  offset?: number;
+  nextOffset?: number;
 }
 
 export interface FsResp {
@@ -544,6 +817,109 @@ export interface FsResp {
   entries?: FsEntry[];
   more?: boolean;
   fallback?: boolean;
+  total?: number;
+  offset?: number;
+  nextOffset?: number;
+}
+
+/** 宿主文件夹浏览（G6：新建会话选择任意目录）。 */
+export interface HostDirEntry {
+  name: string;
+  path: string;
+}
+
+export interface HostDirsResp {
+  ok?: boolean;
+  path: string;
+  parent: string;
+  roots?: HostDirEntry[];
+  dirs: HostDirEntry[];
+  recent: string[];
+}
+
+export interface FsMkdirBody {
+  path: string;
+}
+
+export interface FsUploadItem {
+  name: string;
+  data: string;
+}
+
+export interface FsUploadBody {
+  dir: string;
+  files: FsUploadItem[];
+}
+
+export interface FsUploadResp {
+  ok?: boolean;
+  saved: string[];
+  bytes: number;
+}
+
+/** Git 变更文件行与 Diff 响应（G5）。 */
+export interface GitFileRow {
+  path: string;
+  status: string;
+  staged: boolean;
+}
+
+export interface GitStatusResp {
+  ok?: boolean;
+  isRepo: boolean;
+  branch: string;
+  ahead: number;
+  behind: number;
+  files: GitFileRow[];
+}
+
+export interface GitDiffResp {
+  ok?: boolean;
+  path: string;
+  diff: string;
+  truncated: boolean;
+}
+
+/** 受控工作区终端（R6）。 */
+export interface TerminalOpenResp {
+  ok?: boolean;
+  cwd: string;
+  running: boolean;
+  exitCode: number | null;
+  output: string;
+  seq: number;
+}
+
+export interface TerminalPollResp {
+  ok?: boolean;
+  cwd?: string;
+  running: boolean;
+  exitCode: number | null;
+  output?: string;
+  seq: number;
+}
+
+export interface TerminalInputBody {
+  data?: string;
+  raw?: boolean;
+  action?: string;
+}
+
+/** 已授权本机开发服预览代理（R9）。 */
+export interface LoopbackPortsResp {
+  ok?: boolean;
+  ports?: number[];
+}
+
+export interface LoopbackSignBody {
+  port: number;
+}
+
+export interface LoopbackSignResp {
+  ok?: boolean;
+  port?: number;
+  e?: string;
+  sig?: string;
 }
 
 export interface TeamMemberRow {

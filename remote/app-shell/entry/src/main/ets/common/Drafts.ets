@@ -1,5 +1,5 @@
 import preferences from '@ohos.data.preferences';
-import { common } from '@kit.AbilityKit';
+import { AppCtx } from './AppCtx';
 
 const STORE: string = 'dsh_mobile_drafts';
 const KEY: string = 'rows';
@@ -26,9 +26,7 @@ export class Drafts {
     }
     Drafts.mem = new Map<string, string>();
     try {
-      const host = getContext() as common.UIAbilityContext;
-      const opts: preferences.Options = { name: STORE };
-      const p: preferences.Preferences = preferences.getPreferencesSync(host, opts);
+      const p: preferences.Preferences = preferences.getPreferencesSync(AppCtx.ability(), { name: STORE });
       Drafts.store = p;
       const raw: string = p.getSync(KEY, '') as string;
       if (raw !== '') {

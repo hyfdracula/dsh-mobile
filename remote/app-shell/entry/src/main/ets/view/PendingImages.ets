@@ -11,12 +11,13 @@ export struct PendingImages {
   @Prop images: ImagePart[] = [];
   onPreview: (dataUrl: string) => void = () => {};
   onRemove: (index: number) => void = () => {};
+  @StorageLink('themeDark') themeDark: boolean = true;
 
   build() {
     Scroll() {
       Row({ space: 10 }) {
         ForEach(this.images, (it: ImagePart, i: number) => {
-          Stack({ alignContent: Alignment.TopStart }) {
+          Stack({ alignContent: Alignment.TopEnd }) {
             Image('data:' + it.mediaType + ';base64,' + it.data)
               .width(72)
               .height(72)
@@ -38,7 +39,7 @@ export struct PendingImages {
             .borderRadius(10)
             .backgroundColor('#99000000')
             .justifyContent(FlexAlign.Center)
-            .offset({ x: -6, y: -6 })
+            .offset({ x: 5, y: -5 })
             .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
             .onClick(() => {
               Haptics.tap();

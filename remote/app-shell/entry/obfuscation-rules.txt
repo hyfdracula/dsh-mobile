@@ -1,0 +1,6 @@
+# Agent Mobile Release Obfuscation Rules
+-enable-toplevel-obfuscation
+-enable-filename-obfuscation
+-enable-export-obfuscation
+-compact
+# Keep property names unobfuscated so REST/SSE/E2EE JSON serialization and local preferences stay intact.

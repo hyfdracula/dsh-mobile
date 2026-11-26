@@ -1,10 +1,10 @@
 {
   "modelVersion": "5.0.0",
-  "name": "dsh_mobile",
-  "version": "1.0.0",
-  "description": "DSH Mobile - HarmonyOS client for DeepSeek Harness",
+  "name": "agent_mobile",
+  "version": "3.0.0",
+  "description": "Agent Mobile - HarmonyOS native client for multi-agent desktop gateways",
   "main": "",
-  "author": "",
-  "license": "MIT",
+  "author": "Agent Mobile Contributors",
+  "license": "Apache-2.0",
   "dependencies": {}
 }

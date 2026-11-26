@@ -8,6 +8,10 @@
       {
         "name": "ohos.arkui.UIMaterial.state",
         "value": "enable"
+      },
+      {
+        "name": "ohos.net.network_config",
+        "resource": "$profile:network_config"
       }
     ],
     "deviceTypes": [
@@ -22,9 +26,6 @@
         "name": "ohos.permission.VIBRATE"
       },
       {
-        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
-      },
-      {
         "name": "ohos.permission.GET_NETWORK_INFO"
       }
     ],
@@ -36,11 +37,11 @@
         "name": "EntryAbility",
         "srcEntry": "./ets/entryability/EntryAbility.ets",
         "description": "$string:EntryAbility_desc",
-        "icon": "$media:app_icon",
+        "icon": "$media:layered_image",
         "label": "$string:EntryAbility_label",
         "startWindowBackground": "$color:start_window_background",
-        "startWindowIcon": "$media:app_icon",
-        "orientation": "portrait",
+        "startWindowIcon": "$media:start_window_icon",
+        "orientation": "auto_rotation_restricted",
         "exported": true,
         "skills": [
           {
