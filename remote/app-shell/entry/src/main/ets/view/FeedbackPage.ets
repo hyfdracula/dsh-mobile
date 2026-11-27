@@ -1,6 +1,7 @@
 import { BusinessError } from '@kit.BasicServicesKit';
 import { picker } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
+import { HdsNavDestination } from '@kit.UIDesignKit';
 import { AppCtx } from '../common/AppCtx';
 import { PageHeader, TopFade } from '../common/Chrome';
 import {
@@ -19,7 +20,7 @@ import {
   UploadSpec
 } from '../common/Feedback';
 import { Haptics } from '../common/Haptics';
-import { Motion } from '../common/Motion';
+import { Motion, MOTION_VIVID } from '../common/Motion';
 import { Notifier } from '../common/Notifier';
 import { Toast } from '../common/Toast';
 import { Tokens } from '../common/Tokens';
@@ -43,6 +44,7 @@ export struct FeedbackPage {
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
   @StorageLink('themeDark') themeDark: boolean = true;
   @StorageLink('wideScreen') wideScreen: boolean = false;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
   @StorageLink('fbBack') @Watch('onFbBack') private fbBack: number = 0;
 
   @State @Watch('onStage') private stage: string = 'entry';
@@ -64,10 +66,19 @@ export struct FeedbackPage {
   // 工单详情状态
   @State private cur: Ticket | null = null;
 
-  private scroller: Scroller = new Scroller();
+  private fbStack: NavPathStack = new NavPathStack();
+  private submitScroller: Scroller = new Scroller();
 
   private onStage(): void {
     AppStorage.setOrCreate('fbStage', this.stage);
+  }
+
+  private syncStageFromStack(): void {
+    const names: string[] = this.fbStack.getAllPathName();
+    const top: string = names.length > 0 ? names[names.length - 1] : 'entry';
+    if (this.stage !== top) {
+      this.stage = top;
+    }
   }
 
   private onFbBack(): void {
@@ -82,21 +93,19 @@ export struct FeedbackPage {
     this.contact = contactPref();
   }
 
-  private switchStage(next: string): void {
-    this.getUIContext().animateTo({ duration: Motion.move, curve: Motion.std }, () => {
-      this.stage = next;
-    });
+  private pushStage(next: string): void {
     try {
-      this.scroller.scrollEdge(Edge.Top);
-    } catch (e) {
-      // 滚动容器未就绪时忽略
+      this.getUIContext().getFocusController().clearFocus();
+    } catch (_e) {
     }
+    this.fbStack.pushPathByName(next, null);
+    this.syncStageFromStack();
   }
 
   private scrollToBottomSoon(): void {
     setTimeout(() => {
       try {
-        this.scroller.scrollEdge(Edge.Bottom);
+        this.submitScroller.scrollEdge(Edge.Bottom);
       } catch (e) {
         // 忽略
       }
@@ -104,16 +113,11 @@ export struct FeedbackPage {
   }
 
   private back(): void {
-    Haptics.tap();
-    if (this.stage === 'submit' || this.stage === 'mine') {
+    Haptics.soft();
+    if (this.fbStack.size() > 0) {
       this.err = '';
-      this.note = '';
-      this.switchStage('entry');
-      return;
-    }
-    if (this.stage === 'detail') {
-      this.err = '';
-      this.switchStage('mine');
+      this.fbStack.pop();
+      this.syncStageFromStack();
       return;
     }
     this.onExit();
@@ -291,7 +295,20 @@ export struct FeedbackPage {
     this.err = '';
     try {
       this.cur = await detail(id);
-      this.switchStage('detail');
+      try {
+        this.getUIContext().getFocusController().clearFocus();
+      } catch (_e) {
+      }
+      const names: string[] = this.fbStack.getAllPathName();
+      if (names.length > 0 && names[names.length - 1] === 'submit') {
+        this.fbStack.pop(false);
+        const remain: string[] = this.fbStack.getAllPathName();
+        if (remain.length === 0 || remain[remain.length - 1] !== 'mine') {
+          this.fbStack.pushPathByName('mine', null, false);
+        }
+      }
+      this.fbStack.pushPathByName('detail', null, true);
+      this.syncStageFromStack();
     } catch (e) {
       this.err = (e as BusinessError).message;
     } finally {
@@ -299,164 +316,248 @@ export struct FeedbackPage {
     }
   }
 
-  private titleOf(): string {
-    if (this.stage === 'submit') {
+  private titleOf(name: string): string {
+    if (name === 'submit') {
       return '提交反馈';
     }
-    if (this.stage === 'mine') {
+    if (name === 'mine') {
       return '我的反馈';
     }
-    if (this.stage === 'detail') {
+    if (name === 'detail') {
       return '工单详情';
     }
     return '反馈与支持';
   }
 
-  build() {
-    Stack({ alignContent: Alignment.Top }) {
-      Scroll(this.scroller) {
-        Column() {
-          Column() {
-            Stack({ alignContent: Alignment.Top }) {
-              if (this.stage === 'submit') {
-                Column() {
-                  FeedbackSubmitView({
-                    kind: $kind,
-                    text: $text,
-                    contact: $contact,
-                    notifyOn: $notifyOn,
-                    pend: this.pend,
-                    busy: this.busy,
-                    err: this.err,
-                    onAddShot: (): void => {
-                      void this.addShot();
-                    },
-                    onAddLog: (): void => {
-                      void this.addLog();
-                    },
-                    onAddVideo: (): void => {
-                      void this.addVideo();
-                    },
-                    onDropPending: (idx: number): void => {
-                      this.dropPending(idx);
-                    },
-                    onBottomFieldFocus: (): void => {
-                      this.scrollToBottomSoon();
-                    },
-                    onSubmit: (): void => {
-                      void this.doSubmit();
-                    }
-                  })
-                }
-                .width('100%')
-                .transition(
-                  TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std })
-                    .combine(TransitionEffect.translate({ y: 8 }).animation({ duration: Motion.move, curve: Motion.std }))
-                )
-              } else if (this.stage === 'mine') {
-                Column() {
-                  FeedbackMineView({
-                    rows: this.rows,
-                    loaded: this.loaded,
-                    busy: this.busy,
-                    err: this.err,
-                    onGoSubmit: (): void => {
-                      this.err = '';
-                      this.note = '';
-                      this.switchStage('submit');
-                    },
-                    onOpenTicket: (id: string): void => {
-                      this.note = '';
-                      void this.openDetail(id);
-                    },
-                    onRetry: (): void => {
-                      void this.loadMine();
-                    }
-                  })
-                }
-                .width('100%')
-                .transition(
-                  TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std })
-                    .combine(TransitionEffect.translate({ y: 8 }).animation({ duration: Motion.move, curve: Motion.std }))
-                )
-              } else if (this.stage === 'detail') {
-                Column() {
-                  FeedbackDetailView({
-                    cur: this.cur,
-                    note: this.note,
-                    err: this.err,
-                    busy: this.busy,
-                    onRefresh: (id: string): void => {
-                      void this.openDetail(id);
-                    }
-                  })
-                }
-                .width('100%')
-                .transition(
-                  TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std })
-                    .combine(TransitionEffect.translate({ y: 8 }).animation({ duration: Motion.move, curve: Motion.std }))
-                )
-              } else {
-                Column() {
-                  FeedbackEntryView({
-                    onGoSubmit: (): void => {
-                      this.note = '';
-                      this.err = '';
-                      this.switchStage('submit');
-                    },
-                    onGoMine: (): void => {
-                      this.note = '';
-                      this.err = '';
-                      this.switchStage('mine');
-                      void this.loadMine();
-                    }
-                  })
-                }
-                .width('100%')
-                .transition(
-                  TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std })
-                    .combine(TransitionEffect.translate({ y: 8 }).animation({ duration: Motion.move, curve: Motion.std }))
-                )
+  @Builder
+  fbDest(name: string) {
+    HdsNavDestination() {
+      Stack({ alignContent: Alignment.Top }) {
+        if (name === 'submit') {
+          Scroll(this.submitScroller) {
+            Column() {
+              Column() {
+                FeedbackSubmitView({
+                  kind: $kind,
+                  text: $text,
+                  contact: $contact,
+                  notifyOn: $notifyOn,
+                  pend: this.pend,
+                  busy: this.busy,
+                  err: this.err,
+                  onAddShot: (): void => {
+                    void this.addShot();
+                  },
+                  onAddLog: (): void => {
+                    void this.addLog();
+                  },
+                  onAddVideo: (): void => {
+                    void this.addVideo();
+                  },
+                  onDropPending: (idx: number): void => {
+                    this.dropPending(idx);
+                  },
+                  onBottomFieldFocus: (): void => {
+                    this.scrollToBottomSoon();
+                  },
+                  onSubmit: (): void => {
+                    void this.doSubmit();
+                  }
+                })
               }
+              .width('100%')
+              .constraintSize({ maxWidth: this.wideScreen ? 680 : 520 })
+              .alignItems(HorizontalAlign.Start)
             }
             .width('100%')
+            .padding({
+              left: 16,
+              right: 16,
+              top: this.topInset + 64,
+              bottom: this.bottomInset + 72
+            })
+            .alignItems(HorizontalAlign.Center)
           }
           .width('100%')
-          .constraintSize({ maxWidth: this.wideScreen ? 680 : 520 })
-          .alignItems(HorizontalAlign.Start)
+          .height('100%')
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .align(Alignment.Top)
+        } else if (name === 'mine') {
+          Scroll() {
+            Column() {
+              Column() {
+                FeedbackMineView({
+                  rows: this.rows,
+                  loaded: this.loaded,
+                  busy: this.busy,
+                  err: this.err,
+                  onGoSubmit: (): void => {
+                    this.err = '';
+                    this.note = '';
+                    this.pushStage('submit');
+                  },
+                  onOpenTicket: (id: string): void => {
+                    this.note = '';
+                    void this.openDetail(id);
+                  },
+                  onRetry: (): void => {
+                    void this.loadMine();
+                  }
+                })
+              }
+              .width('100%')
+              .constraintSize({ maxWidth: this.wideScreen ? 680 : 520 })
+              .alignItems(HorizontalAlign.Start)
+            }
+            .width('100%')
+            .padding({
+              left: 16,
+              right: 16,
+              top: this.topInset + 64,
+              bottom: this.bottomInset + 40
+            })
+            .alignItems(HorizontalAlign.Center)
+          }
+          .width('100%')
+          .height('100%')
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .align(Alignment.Top)
+        } else {
+          Scroll() {
+            Column() {
+              Column() {
+                FeedbackDetailView({
+                  cur: this.cur,
+                  note: this.note,
+                  err: this.err,
+                  busy: this.busy,
+                  onRefresh: (id: string): void => {
+                    void this.openDetail(id);
+                  }
+                })
+              }
+              .width('100%')
+              .constraintSize({ maxWidth: this.wideScreen ? 680 : 520 })
+              .alignItems(HorizontalAlign.Start)
+            }
+            .width('100%')
+            .padding({
+              left: 16,
+              right: 16,
+              top: this.topInset + 64,
+              bottom: this.bottomInset + 40
+            })
+            .alignItems(HorizontalAlign.Center)
+          }
+          .width('100%')
+          .height('100%')
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .align(Alignment.Top)
+        }
+
+        TopFade({ fadeHeight: this.topInset + 68 })
+        Column() {
+          PageHeader({
+            title: this.titleOf(name),
+            padTop: true,
+            popIn: true,
+            subPageDepth: 2,
+            rightKind: name === 'mine' ? 'glyph' : 'none',
+            onBack: () => {
+              this.back();
+            },
+            onRight: () => {
+              void this.loadMine();
+            }
+          })
         }
         .width('100%')
-        .padding({
-          left: 16,
-          right: 16,
-          top: this.topInset + 64,
-          bottom: this.bottomInset + (this.stage === 'submit' ? 72 : 40)
-        })
-        .alignItems(HorizontalAlign.Center)
+        .padding({ left: 16, right: 16 })
       }
       .width('100%')
       .height('100%')
-      .scrollBar(BarState.Off)
-      .edgeEffect(EdgeEffect.Spring)
-      .align(Alignment.Top)
+      .backgroundColor(this.themeBg)
+    }
+    .hideTitleBar(true)
+    .hideBackButton(true)
+    .backgroundColor(this.themeBg)
+    .onShown(() => {
+      this.syncStageFromStack();
+    })
+    .onHidden(() => {
+      this.syncStageFromStack();
+    })
+    .onBackPressed(() => {
+      this.back();
+      return true;
+    })
+  }
 
-      TopFade({ fadeHeight: this.topInset + 68 })
-      Column() {
-        PageHeader({
-          title: this.titleOf(),
-          padTop: true,
-          rightKind: this.stage === 'mine' ? 'glyph' : 'none',
-          onBack: () => {
-            this.back();
-          },
-          onRight: () => {
-            void this.loadMine();
+  build() {
+    Navigation(this.fbStack) {
+      Stack({ alignContent: Alignment.Top }) {
+        Scroll() {
+          Column() {
+            Column() {
+              FeedbackEntryView({
+                onGoSubmit: (): void => {
+                  this.note = '';
+                  this.err = '';
+                  this.pushStage('submit');
+                },
+                onGoMine: (): void => {
+                  this.note = '';
+                  this.err = '';
+                  this.pushStage('mine');
+                  void this.loadMine();
+                }
+              })
+            }
+            .width('100%')
+            .constraintSize({ maxWidth: this.wideScreen ? 680 : 520 })
+            .alignItems(HorizontalAlign.Start)
           }
-        })
+          .width('100%')
+          .padding({
+            left: 16,
+            right: 16,
+            top: this.topInset + 64,
+            bottom: this.bottomInset + 40
+          })
+          .alignItems(HorizontalAlign.Center)
+        }
+        .width('100%')
+        .height('100%')
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
+        .align(Alignment.Top)
+
+        TopFade({ fadeHeight: this.topInset + 68 })
+        Column() {
+          PageHeader({
+            title: '反馈与支持',
+            padTop: true,
+            popIn: true,
+            subPageDepth: 2,
+            onBack: () => {
+              this.back();
+            }
+          })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16 })
       }
       .width('100%')
-      .padding({ left: 16, right: 16 })
+      .height('100%')
+      .backgroundColor(this.themeBg)
     }
+    .hideTitleBar(true)
+    .hideToolBar(true)
+    .mode(NavigationMode.Stack)
+    .navDestination(this.fbDest)
     .width('100%')
     .height('100%')
     .backgroundColor(this.themeBg)

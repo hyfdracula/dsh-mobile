@@ -2,7 +2,7 @@ import { AgentRef } from '../../common/Api';
 import { TopFade } from '../../common/Chrome';
 import { Haptics } from '../../common/Haptics';
 import { Mat } from '../../common/Mat';
-import { Motion } from '../../common/Motion';
+import { Motion, MOTION_VIVID } from '../../common/Motion';
 import { Tokens } from '../../common/Tokens';
 
 /**
@@ -205,6 +205,7 @@ export struct PlanModeBanner {
   onClose: () => void = () => {};
   @StorageLink('hdsOn') hdsOn: boolean = true;
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
 
   build() {
     Row({ space: 8 }) {
@@ -245,7 +246,7 @@ export struct PlanModeBanner {
     .backgroundColor(this.hdsOn ? Tokens.accentSoft : Tokens.surface)
     .border({ width: this.hdsOn ? 0.5 : 1, color: this.hdsOn ? Tokens.accentGlass : Tokens.accent })
     .alignItems(VerticalAlign.Center)
-    .transition(TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std }))
+    .transition(Motion.panelTransition(this.motionMode))
   }
 }
 
@@ -255,10 +256,20 @@ export struct ScrollBottomFab {
   onTap: () => void = () => {};
   @StorageLink('hdsOn') hdsOn: boolean = true;
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
+  @State private bounceTrigger: number = 0;
 
   build() {
     Stack() {
-      Image($r('app.media.ic_down')).width(17).height(17).fillColor(Tokens.fg).draggable(false)
+      if (Motion.isVivid(this.motionMode)) {
+        SymbolGlyph($r('sys.symbol.chevron_down'))
+          .fontSize(17)
+          .fontWeight(FontWeight.Medium)
+          .fontColor([Tokens.fg])
+          .symbolEffect(Motion.bounceEffect(EffectDirection.DOWN), this.bounceTrigger)
+      } else {
+        Image($r('app.media.ic_down')).width(17).height(17).fillColor(Tokens.fg).draggable(false)
+      }
     }
     .width(42)
     .height(42)
@@ -269,9 +280,10 @@ export struct ScrollBottomFab {
     .shadow(Mat.glassFloatShadow(this.hdsOn))
     .position({ right: 18, bottom: this.bottomOffset })
     .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-    .transition(TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std }))
+    .transition(Motion.fabTransition(this.motionMode))
     .onClick(() => {
       Haptics.tap();
+      this.bounceTrigger += 1;
       this.onTap();
     })
   }
@@ -316,6 +328,7 @@ export struct ContextPill {
   onTap: () => void = () => {};
   @StorageLink('hdsOn') hdsOn: boolean = true;
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
 
   private clampedPct(): number {
     if (!this.hasCtx) {
@@ -367,10 +380,25 @@ export struct ContextPill {
         .width(15)
         .height(15)
 
-      Text(this.hasCtx ? String(this.clampedPct()) + '%' : '--')
-        .fontSize(11)
-        .fontFamily('monospace')
-        .fontColor(this.labelColor())
+      if (this.hasCtx) {
+        Row() {
+          Text(String(this.clampedPct()))
+            .fontSize(11)
+            .fontFamily('monospace')
+            .fontColor(this.labelColor())
+            .contentTransition(Motion.numTransition(this.motionMode))
+          Text('%')
+            .fontSize(11)
+            .fontFamily('monospace')
+            .fontColor(this.labelColor())
+        }
+        .alignItems(VerticalAlign.Center)
+      } else {
+        Text('--')
+          .fontSize(11)
+          .fontFamily('monospace')
+          .fontColor(this.labelColor())
+      }
     }
     .height(28)
     .padding({ left: 8, right: 10 })
@@ -389,19 +417,34 @@ export struct ContextPill {
 
 @Component
 export struct ComposerSendCluster {
-  @Prop running: boolean = false;
-  @Prop sending: boolean = false;
+  @Prop @Watch('onActionStateChange') running: boolean = false;
+  @Prop @Watch('onActionStateChange') sending: boolean = false;
   @Prop hasContent: boolean = false;
-  @Prop attachOn: boolean = false;
+  @Prop @Watch('onAttachStateChange') attachOn: boolean = false;
   onToggleAttach: () => void = () => {};
   onSendNormal: () => void = () => {};
   onSendQueue: () => void = () => {};
   onSendSteer: () => void = () => {};
   onStop: () => void = () => {};
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
+  @State private attachTrigger: number = -1;
+  @State private actionTrigger: number = -1;
+
+  private onAttachStateChange(): void {
+    if (Motion.isVivid(this.motionMode)) {
+      this.attachTrigger += 1;
+    }
+  }
+
+  private onActionStateChange(): void {
+    if (Motion.isVivid(this.motionMode)) {
+      this.actionTrigger += 1;
+    }
+  }
 
   private sendShadow(): ShadowOptions {
-    if (this.hasContent) {
+    if (this.hasContent && !(this.running && !this.hasContent)) {
       const active: ShadowOptions = { radius: 14, color: Tokens.accentGlow, offsetY: 3 };
       return active;
     }
@@ -409,23 +452,57 @@ export struct ComposerSendCluster {
     return none;
   }
 
+  private primarySymbol(): Resource {
+    if (this.running && !this.hasContent) {
+      return $r('sys.symbol.square_fill');
+    }
+    if (this.sending) {
+      return $r('sys.symbol.ellipsis_circle');
+    }
+    return $r('sys.symbol.arrow_up');
+  }
+
+  private primarySymbolColor(): string {
+    if (this.running && !this.hasContent) {
+      return Tokens.fg;
+    }
+    return this.hasContent ? '#FFFFFF' : Tokens.dim2;
+  }
+
+  private primaryBtnBg(): ResourceColor {
+    if (this.running && !this.hasContent) {
+      return Tokens.surface3;
+    }
+    return this.hasContent ? Tokens.accent : Color.Transparent;
+  }
+
   build() {
     Row() {
-      Text(this.attachOn ? '×' : '+')
-        .fontSize(this.attachOn ? 20 : 22)
-        .fontColor(this.attachOn ? Tokens.accent : Tokens.dim)
-        .width(36)
-        .height(36)
-        .textAlign(TextAlign.Center)
-        .borderRadius(Tokens.rPill)
-        .backgroundColor(this.attachOn ? Tokens.accentSoft : Color.Transparent)
-        .margin({ left: 4 })
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
-        .accessibilityText('添加与指令')
-        .onClick(() => {
-          Haptics.tap();
-          this.onToggleAttach();
-        })
+      Stack({ alignContent: Alignment.Center }) {
+        if (Motion.isVivid(this.motionMode)) {
+          SymbolGlyph(this.attachOn ? $r('sys.symbol.xmark') : $r('sys.symbol.plus'))
+            .fontSize(18)
+            .fontWeight(FontWeight.Medium)
+            .fontColor([this.attachOn ? Tokens.accent : Tokens.dim])
+            .symbolEffect(Motion.replaceEffect(), this.attachTrigger)
+        } else {
+          Text(this.attachOn ? '×' : '+')
+            .fontSize(this.attachOn ? 20 : 22)
+            .fontColor(this.attachOn ? Tokens.accent : Tokens.dim)
+            .textAlign(TextAlign.Center)
+        }
+      }
+      .width(36)
+      .height(36)
+      .borderRadius(Tokens.rPill)
+      .backgroundColor(this.attachOn ? Tokens.accentSoft : Color.Transparent)
+      .margin({ left: 4 })
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+      .accessibilityText('添加与指令')
+      .onClick(() => {
+        Haptics.tap();
+        this.onToggleAttach();
+      })
 
       if (this.running && this.hasContent) {
         Text('排队')
@@ -438,7 +515,7 @@ export struct ComposerSendCluster {
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
           .margin({ left: 6 })
           .onClick(() => {
-            Haptics.tap();
+            Haptics.confirm();
             this.onSendQueue();
           })
         Text('插队')
@@ -452,9 +529,36 @@ export struct ComposerSendCluster {
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
           .margin({ left: 6 })
           .onClick(() => {
-            Haptics.tap();
+            Haptics.confirm();
             this.onSendSteer();
           })
+      } else if (Motion.isVivid(this.motionMode)) {
+        // 灵动档合并发送/停止为同一胶囊按钮，通过 ReplaceSymbolEffect 实现原生图标形变
+        Stack({ alignContent: Alignment.Center }) {
+          SymbolGlyph(this.primarySymbol())
+            .fontSize(this.running && !this.hasContent ? 15 : (this.hasContent ? 19 : 17))
+            .fontWeight(FontWeight.Bold)
+            .fontColor([this.primarySymbolColor()])
+            .symbolEffect(Motion.replaceEffect(), this.actionTrigger)
+        }
+        .width(38)
+        .height(38)
+        .backgroundColor(this.primaryBtnBg())
+        .borderRadius(Tokens.rPill)
+        .shadow(this.sendShadow())
+        .animation(Motion.fadeOpts(this.motionMode))
+        .margin({ left: 6 })
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+        .accessibilityText(this.running && !this.hasContent ? '停止生成' : '发送')
+        .onClick(() => {
+          if (this.running && !this.hasContent) {
+            Haptics.warn();
+            this.onStop();
+          } else {
+            Haptics.confirm();
+            this.onSendNormal();
+          }
+        })
       } else if (this.running && !this.hasContent) {
         Text('■')
           .fontSize(Tokens.fsBody)
@@ -468,7 +572,7 @@ export struct ComposerSendCluster {
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
           .accessibilityText('停止生成')
           .onClick(() => {
-            Haptics.tap();
+            Haptics.warn();
             this.onStop();
           })
       } else {
@@ -482,11 +586,12 @@ export struct ComposerSendCluster {
           .backgroundColor(this.hasContent ? Tokens.accent : Color.Transparent)
           .borderRadius(Tokens.rPill)
           .shadow(this.sendShadow())
-          .animation({ duration: Motion.fade, curve: Motion.std })
+          .animation(Motion.fadeOpts(this.motionMode))
           .margin({ left: 6 })
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
           .accessibilityText('发送')
           .onClick(() => {
+            Haptics.confirm();
             this.onSendNormal();
           })
       }

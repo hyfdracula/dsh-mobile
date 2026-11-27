@@ -3,12 +3,12 @@ import http from '@ohos.net.http';
 import { Api } from '../common/Api';
 import { isLanUrl } from '../common/ApiUtil';
 import { AppCtx } from '../common/AppCtx';
-import { AppIcon, ICON_LIGHT } from '../common/AppIcon';
+import { AppIcon, ICON_DARK } from '../common/AppIcon';
 import { PageHeader, TopFade } from '../common/Chrome';
 import { copyText } from '../common/Clipboard';
 import { Haptics } from '../common/Haptics';
 import { Mat } from '../common/Mat';
-import { Motion } from '../common/Motion';
+import { Motion, MOTION_VIVID } from '../common/Motion';
 import { PairClaim, PairError, PairInfo, Pairing, PairLink } from '../common/Pairing';
 import { Tokens } from '../common/Tokens';
 import { ConnectionStageCard, SheetHeader } from '../common/Widgets';
@@ -41,8 +41,12 @@ export struct PairPage {
   api: Api = new Api('', '');
   @Prop defaultBase: string = '';
   @Prop entry: string = '';
+  @Prop mode: string = '';
   @Prop hasBack: boolean = false;
+  @Prop popHeader: boolean = true;
+  @Prop subPageDepth: number = 2;
   onExit: () => void = () => {};
+  onGoOtherStep: () => void = () => {};
   onPaired: (b: string, t: string, host: string, lan: string[], hostId?: string, e2eePub?: string) => void = () => {};
 
   @StorageLink('topInset') topInset: number = 40;
@@ -51,10 +55,11 @@ export struct PairPage {
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
   @StorageLink('hdsOn') hdsOn: boolean = true;
   @StorageLink('themeDark') themeDark: boolean = true;
-  @StorageLink('appIconStyle') appIconStyle: string = ICON_LIGHT;
+  @StorageLink('appIconStyle') appIconStyle: string = ICON_DARK;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
 
-  @State private screen: string = 'connect';
   @State private tab: string = 'code';
+  @State private entered: boolean = true;
   @State private code: string = '';
   @State private addr: string = '';
   @State private manualBase: string = '';
@@ -82,13 +87,29 @@ export struct PairPage {
   private claimSeq: number = 0;
   private probeTimer: number = -1;
   private elapsedTimer: number = -1;
+  private enterTimer: number = -1;
   private scroller: Scroller = new Scroller();
 
+  private isPrepareMode(): boolean {
+    if (this.mode !== '') {
+      return this.mode === 'prepare';
+    }
+    return this.entry === 'guide';
+  }
+
   aboutToAppear(): void {
-    this.screen = this.entry === 'guide' ? 'prepare' : 'connect';
     if (this.defaultBase !== '') {
       this.addr = this.defaultBase;
       this.manualBase = this.defaultBase;
+    }
+    if (Motion.isFlagship(this.motionMode)) {
+      this.entered = false;
+      this.enterTimer = setTimeout(() => {
+        this.enterTimer = -1;
+        this.entered = true;
+      }, 16);
+    } else {
+      this.entered = true;
     }
   }
 
@@ -97,6 +118,10 @@ export struct PairPage {
     if (this.probeTimer >= 0) {
       clearTimeout(this.probeTimer);
       this.probeTimer = -1;
+    }
+    if (this.enterTimer >= 0) {
+      clearTimeout(this.enterTimer);
+      this.enterTimer = -1;
     }
   }
 
@@ -122,17 +147,6 @@ export struct PairPage {
     this.stageActive = false;
     this.stageErr = '';
     this.hint = '已取消本次连接，可修改参数后重试';
-  }
-
-  private switchScreen(next: string): void {
-    this.err = '';
-    this.okMsg = '';
-    this.stageErr = '';
-    this.stageActive = false;
-    this.getUIContext().animateTo({ duration: Motion.move, curve: Motion.std }, () => {
-      this.screen = next;
-    });
-    this.scroller.scrollTo({ xOffset: 0, yOffset: 0, animation: true });
   }
 
   private scheduleProbe(rawAddr: string): void {
@@ -272,7 +286,7 @@ export struct PairPage {
       this.stageIdx = 3;
       this.stageDetail = '正在写入本机加密凭据 · ' + hostLabel;
       this.okMsg = '已连接 · ' + hostLabel;
-      Haptics.soft();
+      Haptics.success();
       await new Promise<void>((r: () => void) => setTimeout(r, 240));
       if (seq !== this.claimSeq) {
         return;
@@ -378,7 +392,7 @@ export struct PairPage {
       this.stageIdx = 3;
       this.stageDetail = '正在写入本机加密凭据 · ' + hostName;
       this.okMsg = '已验证 · ' + hostName;
-      Haptics.soft();
+      Haptics.success();
       await new Promise<void>((r: () => void) => setTimeout(r, 200));
       if (seq !== this.claimSeq) {
         return;
@@ -967,9 +981,76 @@ export struct PairPage {
   @Builder
   connectScreen() {
     Column() {
-      this.heroScanCard()
-      this.segmentedTabs()
-      this.modeContentCard()
+      Row({ space: 8 }) {
+        Text('第 2 步 / 共 2 步')
+          .fontSize(Tokens.fsCaption)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Tokens.accent)
+          .backgroundColor(Tokens.accentSoft)
+          .borderRadius(Tokens.rPill)
+          .padding({ left: 9, right: 9, top: 3, bottom: 3 })
+        Text('扫码或填入配对码连接')
+          .fontSize(Tokens.fsCaption)
+          .fontColor(Tokens.dim2)
+      }
+      .width('100%')
+      .margin({ bottom: 10 })
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomHeaderOpacityAnim(0, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+        centerX: '0%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomHeaderScaleAnim(0, this.motionMode))
+
+      Column() {
+        this.heroScanCard()
+      }
+      .width('100%')
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(1, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(1, this.motionMode))
+
+      Column() {
+        this.segmentedTabs()
+      }
+      .width('100%')
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(2, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(2, this.motionMode))
+
+      Column() {
+        this.modeContentCard()
+      }
+      .width('100%')
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(3, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(3, this.motionMode))
+
       this.feedbackBlock()
 
       Row({ space: 10 }) {
@@ -982,7 +1063,7 @@ export struct PairPage {
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
           .onClick(() => {
             Haptics.tap();
-            this.switchScreen('prepare');
+            this.onGoOtherStep();
           })
 
         Blank()
@@ -1001,6 +1082,16 @@ export struct PairPage {
       }
       .width('100%')
       .margin({ top: 16 })
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(4, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(4, this.motionMode))
       .bindSheet($$this.helpSheet, this.helpSheetContent(),
         Mat.sheetOpts(this.hdsOn, SheetSize.FIT_CONTENT, () => {
           this.helpSheet = false;
@@ -1014,6 +1105,20 @@ export struct PairPage {
   prepareScreen() {
     Column({ space: 10 }) {
       Column({ space: 4 }) {
+        Row({ space: 8 }) {
+          Text('第 1 步 / 共 2 步')
+            .fontSize(Tokens.fsCaption)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.accent)
+            .backgroundColor(Tokens.accentSoft)
+            .borderRadius(Tokens.rPill)
+            .padding({ left: 9, right: 9, top: 3, bottom: 3 })
+          Text('先完成电脑端准备，再进入下一步连接')
+            .fontSize(Tokens.fsCaption)
+            .fontColor(Tokens.dim2)
+        }
+        .margin({ bottom: 4 })
+
         Text('在电脑上准备 Agent Mobile 网关')
           .fontSize(Tokens.fsDisplay)
           .fontWeight(FontWeight.Bold)
@@ -1026,9 +1131,32 @@ export struct PairPage {
       .width('100%')
       .alignItems(HorizontalAlign.Start)
       .margin({ bottom: 6 })
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomHeaderOpacityAnim(0, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+        centerX: '0%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomHeaderScaleAnim(0, this.motionMode))
 
-      this.prepareStepCard('1', '安装并启用 agent-mobile-gateway',
-        '在电脑终端添加网关插件后重启服务，保持网关监听在本地端口（默认 8901）。')
+      Column() {
+        this.prepareStepCard('1', '安装并启用 agent-mobile-gateway',
+          '在电脑终端添加网关插件后重启服务，保持网关监听在本地端口（默认 8901）。')
+      }
+      .width('100%')
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(1, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(1, this.motionMode))
 
       Row({ space: 8 }) {
         Text(PAIR_CMD)
@@ -1052,12 +1180,48 @@ export struct PairPage {
       .backgroundColor(Tokens.bgEl)
       .borderRadius(Tokens.rMd)
       .border({ width: 1, color: Tokens.lineSoft })
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(2, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(2, this.motionMode))
 
-      this.prepareStepCard('2', '打开电脑端「Agent Mobile」面板',
-        '在桌面侧栏打开 Agent Mobile 面板，页面上方会展示配对二维码、6 位配对码与入口地址。')
+      Column() {
+        this.prepareStepCard('2', '打开电脑端「Agent Mobile」面板',
+          '在桌面侧栏打开 Agent Mobile 面板，页面上方会展示配对二维码、6 位配对码与入口地址。')
+      }
+      .width('100%')
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(3, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(3, this.motionMode))
 
-      this.prepareStepCard('3', '外网访问准备（可选）',
-        '同 Wi-Fi 下可直接扫描连接；异地使用建议通过 HTTPS 或 Cloudflare 隧道暴露入口。')
+      Column() {
+        this.prepareStepCard('3', '外网访问准备（可选）',
+          '同 Wi-Fi 下可直接扫描连接；异地使用建议通过 HTTPS 或 Cloudflare 隧道暴露入口。')
+      }
+      .width('100%')
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(4, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(4, this.motionMode))
 
       Text('我已准备好，前往连接')
         .fontSize(Tokens.fsBodyLg)
@@ -1070,9 +1234,19 @@ export struct PairPage {
         .borderRadius(Tokens.rPill)
         .margin({ top: 10 })
         .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomOpacityAnim(5, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          centerX: '50%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomScaleAnim(5, this.motionMode))
         .onClick(() => {
-          Haptics.tap();
-          this.switchScreen('connect');
+          Haptics.confirm();
+          this.onGoOtherStep();
         })
     }
     .width('100%')
@@ -1084,7 +1258,7 @@ export struct PairPage {
       Scroll(this.scroller) {
         Column() {
           Column() {
-            if (this.screen === 'prepare') {
+            if (this.isPrepareMode()) {
               this.prepareScreen()
             } else {
               this.connectScreen()
@@ -1112,17 +1286,13 @@ export struct PairPage {
       TopFade({ fadeHeight: this.topInset + 68 })
       Column() {
         PageHeader({
-          title: this.screen === 'prepare' ? '电脑端准备' : '连接电脑',
-          hasBack: this.hasBack || this.screen === 'prepare',
+          title: this.isPrepareMode() ? '电脑端准备' : '连接电脑',
+          hasBack: this.hasBack,
           padTop: true,
+          popIn: this.popHeader,
+          subPageDepth: this.subPageDepth,
           onBack: () => {
-            if (this.screen === 'prepare' && this.entry !== 'guide') {
-              this.switchScreen('connect');
-            } else if (this.hasBack) {
-              this.onExit();
-            } else {
-              this.switchScreen('connect');
-            }
+            this.onExit();
           }
         })
       }

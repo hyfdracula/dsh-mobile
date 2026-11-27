@@ -1,4 +1,5 @@
 import { Mat } from '../../common/Mat';
+import { Motion, MOTION_VIVID } from '../../common/Motion';
 import { Tokens } from '../../common/Tokens';
 import { EmptyState } from '../../common/Widgets';
 import { Haptics } from '../../common/Haptics';
@@ -99,14 +100,27 @@ export struct SessionBatchBar {
   @StorageLink('bottomInset') bottomInset: number = 20;
   @StorageLink('hdsOn') hdsOn: boolean = true;
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
 
   build() {
     Column() {
       Row() {
-        Text('已选 ' + String(this.selectedCount) + ' 项')
-          .fontSize(Tokens.fsBody)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Tokens.fg)
+        Row() {
+          Text('已选 ')
+            .fontSize(Tokens.fsBody)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.fg)
+          Text(String(this.selectedCount))
+            .fontSize(Tokens.fsBody)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.fg)
+            .contentTransition(Motion.numTransition(this.motionMode))
+          Text(' 项')
+            .fontSize(Tokens.fsBody)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.fg)
+        }
+        .alignItems(VerticalAlign.Center)
         Blank()
         Text('全选')
           .fontSize(Tokens.fsBody)
@@ -151,6 +165,7 @@ export struct SessionBatchBar {
     .width('100%')
     .padding({ left: 16, right: 16, bottom: this.bottomInset + 14 })
     .alignItems(HorizontalAlign.Center)
+    .transition(Motion.panelTransition(this.motionMode))
   }
 }
 
@@ -235,16 +250,24 @@ export struct SessionListEmptyView {
  */
 @Component
 export struct SessionNewFab {
-  @Prop creating: boolean = false;
+  @Prop @Watch('onCreatingChange') creating: boolean = false;
   onTap: () => void = () => {};
 
   @StorageLink('bottomInset') bottomInset: number = 20;
   @StorageLink('hdsOn') hdsOn: boolean = true;
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
+  @State private fabTrigger: number = -1;
+
+  private onCreatingChange(): void {
+    if (Motion.isVivid(this.motionMode)) {
+      this.fabTrigger += 1;
+    }
+  }
 
   build() {
     Column() {
-      Stack() {
+      Stack({ alignContent: Alignment.Center }) {
         if (this.hdsOn) {
           Row()
             .width('100%').height('100%').borderRadius(Tokens.rXl)
@@ -258,11 +281,22 @@ export struct SessionNewFab {
             })
             .hitTestBehavior(HitTestMode.None)
         }
-        Text(this.creating ? '...' : '+')
-          .fontSize(28)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(this.hdsOn ? (this.themeDark ? '#F8FAFC' : Tokens.fg) : Tokens.accentInk)
-          .textAlign(TextAlign.Center).width(56).height(56)
+        if (Motion.isVivid(this.motionMode)) {
+          SymbolGlyph(this.creating ? $r('sys.symbol.ellipsis_circle') : $r('sys.symbol.plus'))
+            .fontSize(24)
+            .fontWeight(FontWeight.Medium)
+            .fontColor([this.hdsOn ? (this.themeDark ? '#F8FAFC' : Tokens.fg) : Tokens.accentInk])
+            .symbolEffect(
+              this.creating ? Motion.replaceEffect() : Motion.bounceEffect(EffectDirection.UP),
+              this.fabTrigger
+            )
+        } else {
+          Text(this.creating ? '...' : '+')
+            .fontSize(28)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.hdsOn ? (this.themeDark ? '#F8FAFC' : Tokens.fg) : Tokens.accentInk)
+            .textAlign(TextAlign.Center).width(56).height(56)
+        }
       }
       .width(56).height(56).borderRadius(Tokens.rXl)
       .backgroundColor(this.hdsOn
@@ -282,6 +316,9 @@ export struct SessionNewFab {
       .accessibilityText('新建会话')
       .onClick(() => {
         Haptics.tap();
+        if (Motion.isVivid(this.motionMode)) {
+          this.fabTrigger += 1;
+        }
         this.onTap();
       })
     }

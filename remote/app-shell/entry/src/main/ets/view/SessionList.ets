@@ -11,7 +11,7 @@ import {
 } from '../common/Api';
 import { Mat } from '../common/Mat';
 import { Tokens } from '../common/Tokens';
-import { Motion } from '../common/Motion';
+import { Motion, MOTION_VIVID } from '../common/Motion';
 import { TopFade, buildTransparentHdsTitle } from '../common/Chrome';
 import { EmptyState } from '../common/Widgets';
 import { copyText } from '../common/Clipboard';
@@ -22,8 +22,8 @@ import { ChatParam } from '../common/Types';
 import {
   ListViewPrefs, RowModel, SessionDataSource, WsBuildResult, WsOpt,
   buildSessionRowModels, buildWsOptions, collectGroupLabels,
-  collectRecentWsChoices, normCwdKey, plainPreview, readListViewPrefs, resolveBaseCwd,
-  sigOfSessionRows, tidyCwd, writeListViewPrefs, wsLeafName
+  collectRecentWsChoices, normCwdKey, plainPreview, readCachedPreviews, readListViewPrefs, resolveBaseCwd,
+  sigOfSessionRows, tidyCwd, writeCachedPreviews, writeListViewPrefs, wsLeafName
 } from './session/SessionModels';
 import { SessionTile } from './session/SessionTile';
 import { SessionHeaderBar } from './session/SessionHeaderBar';
@@ -52,6 +52,7 @@ export struct SessionList {
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
   @StorageLink('hdsOn') hdsOn: boolean = true;
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
   @StorageLink('online') online: boolean = true;
   @StorageLink('wideScreen') wideScreen: boolean = false;
   @StorageLink('unreadCount') unreadCount: number = 0;
@@ -100,23 +101,32 @@ export struct SessionList {
   @State private wsSheetTab: string = 'pick';
   @State @Watch('syncSheet') private headerSheetOn: boolean = false;
 
+  @State private listEntered: boolean = false;
   private scroller: Scroller = new Scroller();
   private loadStart: number = 0;
   private slowTimer: number = -1;
   private loadGen: number = 0;
   private rowSig: string = '';
   private poll: number = 0;
+  private revealDone: boolean = false;
+  private revealFinishAt: number = 0;
+  private revealTimer: number = -1;
+  private previewFlushTimer: number = -1;
+  private backendsFlushTimer: number = -1;
+  private coldRevealInFlight: boolean = false;
 
   aboutToAppear(): void {
     const prefs: ListViewPrefs = readListViewPrefs();
     this.groupBy = prefs.groupBy;
     this.listState = prefs.listState;
     this.sortBy = prefs.sortBy;
+    readCachedPreviews(this.previewTextMap, this.previewCountMap);
 
     const age: number = Date.now() - this.api.cachedSessionsUpdatedAt();
     if (this.api.cachedSessionsUpdatedAt() > 0 && age < 8000) {
       this.applyFetchedRows(this.api.cachedSessions());
       this.loading = false;
+      this.triggerInitialReveal();
     } else {
       void this.load(true);
     }
@@ -145,6 +155,18 @@ export struct SessionList {
     if (this.slowTimer !== -1) {
       clearTimeout(this.slowTimer);
       this.slowTimer = -1;
+    }
+    if (this.revealTimer !== -1) {
+      clearTimeout(this.revealTimer);
+      this.revealTimer = -1;
+    }
+    if (this.previewFlushTimer !== -1) {
+      clearTimeout(this.previewFlushTimer);
+      this.previewFlushTimer = -1;
+    }
+    if (this.backendsFlushTimer !== -1) {
+      clearTimeout(this.backendsFlushTimer);
+      this.backendsFlushTimer = -1;
     }
     AppStorage.setOrCreate('sheetOpen', false);
   }
@@ -184,10 +206,11 @@ export struct SessionList {
     this.timedOut = false;
     this.err = '';
     if (this.loading) {
-      this.loading = false;
-      this.loadSlow = false;
+      void this.finishColdApply(this.api.cachedSessions(), false);
+      return;
     }
     this.applyFetchedRows(this.api.cachedSessions());
+    this.triggerInitialReveal();
   }
 
   private onMarksVer(): void {
@@ -223,6 +246,144 @@ export struct SessionList {
     Haptics.tap();
     Unread.clearAll();
     Toast.ok('已全部标为已读');
+  }
+
+  private triggerInitialReveal(): void {
+    if (this.revealDone || this.loading) {
+      return;
+    }
+    this.revealDone = true;
+    if (this.rowCount === 0 || !Motion.isFlagship(this.motionMode)) {
+      this.listEntered = true;
+      this.revealFinishAt = 0;
+      return;
+    }
+    const visN: number = this.rowCount > 14 ? 14 : this.rowCount;
+    this.revealFinishAt = Date.now() + Motion.bloomTotalMs(visN, 20);
+    if (this.revealTimer !== -1) {
+      clearTimeout(this.revealTimer);
+    }
+    this.revealTimer = setTimeout(() => {
+      this.revealTimer = -1;
+      this.listEntered = true;
+    }, 24);
+  }
+
+  private scheduleRebuildAfterReveal(): void {
+    const remain: number = this.revealFinishAt - Date.now();
+    if (remain <= 0) {
+      this.rebuildModels();
+      return;
+    }
+    if (this.previewFlushTimer !== -1) {
+      clearTimeout(this.previewFlushTimer);
+    }
+    this.previewFlushTimer = setTimeout(() => {
+      this.previewFlushTimer = -1;
+      this.rebuildModels();
+    }, remain + 24);
+  }
+
+  private orderedActiveIds(fetched: SessionRow[], limit: number): string[] {
+    const active: SessionRow[] = fetched.filter((r: SessionRow) => r.archived !== true);
+    active.sort((a: SessionRow, b: SessionRow) => {
+      const pa: number = a.pinned === true ? 0 : 1;
+      const pb: number = b.pinned === true ? 0 : 1;
+      if (pa !== pb) {
+        return pa - pb;
+      }
+      return b.updatedAt - a.updatedAt;
+    });
+    const ids: string[] = [];
+    for (let i = 0; i < active.length && ids.length < limit; i++) {
+      const id: string = active[i].id;
+      if (id !== '' && ids.indexOf(id) < 0) {
+        ids.push(id);
+      }
+    }
+    return ids;
+  }
+
+  private async prefetchInitialPreviews(fetched: SessionRow[], timeoutMs: number): Promise<void> {
+    const ordered: string[] = this.orderedActiveIds(fetched, 24);
+    if (ordered.length === 0) {
+      return;
+    }
+    const topCheck: number = ordered.length < 12 ? ordered.length : 12;
+    let missingTop: number = 0;
+    for (let i = 0; i < topCheck; i++) {
+      if (!this.previewTextMap.has(ordered[i])) {
+        missingTop++;
+      }
+    }
+    if (missingTop === 0) {
+      return;
+    }
+    const ids: string[] = [];
+    for (let i = 0; i < ordered.length; i++) {
+      if (!this.previewTextMap.has(ordered[i])) {
+        ids.push(ordered[i]);
+      }
+    }
+    if (ids.length === 0) {
+      return;
+    }
+    let timer: number = -1;
+    const timeoutPromise: Promise<PreviewRow[]> = new Promise<PreviewRow[]>((resolve) => {
+      timer = setTimeout(() => {
+        timer = -1;
+        resolve([]);
+      }, timeoutMs);
+    });
+    const fetchPromise: Promise<PreviewRow[]> = this.api.previews(ids).catch((): PreviewRow[] => []);
+    try {
+      const got: PreviewRow[] = await Promise.race([fetchPromise, timeoutPromise]);
+      for (let i = 0; i < got.length; i++) {
+        const clean: string = plainPreview(got[i].preview);
+        const cnt: number = got[i].count === undefined ? 0 : got[i].count;
+        this.previewTextMap.set(got[i].id, clean);
+        this.previewCountMap.set(got[i].id, cnt);
+      }
+      if (got.length > 0) {
+        writeCachedPreviews(this.previewTextMap, this.previewCountMap, this.orderedActiveIds(fetched, 80));
+      }
+    } catch (e) {
+    } finally {
+      if (timer !== -1) {
+        clearTimeout(timer);
+        timer = -1;
+      }
+    }
+  }
+
+  private async finishColdApply(fetched: SessionRow[], clearSig: boolean): Promise<void> {
+    if (!this.loading || this.coldRevealInFlight) {
+      return;
+    }
+    this.coldRevealInFlight = true;
+    try {
+      for (let i = 0; i < fetched.length; i++) {
+        const r: SessionRow = fetched[i];
+        if (r.preview !== undefined && r.preview !== '' && !this.previewTextMap.has(r.id)) {
+          this.previewTextMap.set(r.id, plainPreview(r.preview));
+        }
+      }
+      const timeoutMs: number = this.api.onWan() ? 1400 : 800;
+      await this.prefetchInitialPreviews(fetched, timeoutMs);
+      if (clearSig) {
+        this.rowSig = '';
+      }
+      this.applyFetchedRows(fetched);
+      this.loading = false;
+      this.loadSlow = false;
+      if (this.slowTimer !== -1) {
+        clearTimeout(this.slowTimer);
+        this.slowTimer = -1;
+      }
+      this.triggerInitialReveal();
+    } finally {
+      this.coldRevealInFlight = false;
+    }
   }
 
   private applyFetchedRows(fetched: SessionRow[]): void {
@@ -266,7 +427,7 @@ export struct SessionList {
     }
   }
 
-  private async load(forceNetwork: boolean = true): Promise<void> {
+  private async load(forceNetwork: boolean = true, clearSig: boolean = false): Promise<void> {
     if (!forceNetwork) {
       const age: number = Date.now() - this.api.cachedSessionsUpdatedAt();
       if (this.api.cachedSessionsUpdatedAt() > 0 && age < 6000) {
@@ -275,6 +436,7 @@ export struct SessionList {
         this.applyFetchedRows(this.api.cachedSessions());
         this.loading = false;
         this.loadSlow = false;
+        this.triggerInitialReveal();
         return;
       }
     }
@@ -299,21 +461,28 @@ export struct SessionList {
       }
       this.api.cacheSessions(fetched);
       this.timedOut = false;
-      this.rowSig = '';
-      this.applyFetchedRows(fetched);
+      if (this.loading) {
+        await this.finishColdApply(fetched, clearSig);
+      } else {
+        if (clearSig) {
+          this.rowSig = '';
+        }
+        this.applyFetchedRows(fetched);
+      }
     } catch (e) {
       if (gen !== this.loadGen) {
         return;
       }
       this.err = (e as Error).message;
     } finally {
-      if (gen === this.loadGen) {
+      if (gen === this.loadGen && this.loading && !this.coldRevealInFlight) {
         this.loading = false;
         this.loadSlow = false;
         if (this.slowTimer !== -1) {
           clearTimeout(this.slowTimer);
           this.slowTimer = -1;
         }
+        this.triggerInitialReveal();
       }
     }
   }
@@ -343,7 +512,8 @@ export struct SessionList {
         }
       }
       if (changed) {
-        this.rebuildModels();
+        writeCachedPreviews(this.previewTextMap, this.previewCountMap, this.orderedActiveIds(this.allRows, 80));
+        this.scheduleRebuildAfterReveal();
       }
     } catch (e) {
     }
@@ -354,17 +524,32 @@ export struct SessionList {
     void this.load(true);
   }
 
+  private applyBackendsList(list: BackendInfo[]): void {
+    this.backends = list;
+    if (this.backendFilter !== 'all') {
+      const stillOn: boolean = list.some((b: BackendInfo): boolean => b.id === this.backendFilter && b.enabled);
+      if (!stillOn) {
+        this.backendFilter = 'all';
+        this.rebuildModels();
+      }
+    }
+  }
+
   private async loadBackends(): Promise<void> {
     try {
       const list: BackendInfo[] = await this.api.backends(false);
-      this.backends = list;
-      if (this.backendFilter !== 'all') {
-        const stillOn: boolean = list.some((b: BackendInfo): boolean => b.id === this.backendFilter && b.enabled);
-        if (!stillOn) {
-          this.backendFilter = 'all';
-          this.rebuildModels();
+      const remain: number = this.revealFinishAt - Date.now();
+      if (this.backends.length === 0 && remain > 0) {
+        if (this.backendsFlushTimer !== -1) {
+          clearTimeout(this.backendsFlushTimer);
         }
+        this.backendsFlushTimer = setTimeout(() => {
+          this.backendsFlushTimer = -1;
+          this.applyBackendsList(list);
+        }, remain + 24);
+        return;
       }
+      this.applyBackendsList(list);
     } catch (e) {
       // 旧网关无 /api/backends 时静默保持仅 DSH 模式
     }
@@ -634,7 +819,7 @@ export struct SessionList {
     } else if (this.timedOut) {
       this.timedOut = false;
       this.loading = true;
-      void this.load(true);
+      void this.load(true, true);
     } else if (this.archivedView) {
       this.setArchivedMode(false);
     } else if (this.rows.length > 0 && this.backendFilter !== 'all') {
@@ -762,7 +947,7 @@ export struct SessionList {
               onRetry: () => {
                 this.loading = true;
                 this.loadSlow = false;
-                void this.load(true);
+                void this.load(true, true);
               }
             })
           }
@@ -779,7 +964,7 @@ export struct SessionList {
               action: '重试',
               onAction: () => {
                 this.loading = true;
-                void this.load(true);
+                void this.load(true, true);
               }
             })
           }
@@ -882,13 +1067,21 @@ export struct SessionList {
                       .height(8)
                       .borderRadius(Tokens.rPill)
                       .backgroundColor(Tokens.accent)
-                    Text(String(this.unreadCount) + ' 条新回复未读')
-                      .fontSize(Tokens.fsFoot)
-                      .fontWeight(FontWeight.Medium)
-                      .fontColor(Tokens.fg)
-                      .layoutWeight(1)
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Row() {
+                      Text(String(this.unreadCount))
+                        .fontSize(Tokens.fsFoot)
+                        .fontWeight(FontWeight.Medium)
+                        .fontColor(Tokens.fg)
+                        .contentTransition(Motion.numTransition(this.motionMode))
+                      Text(' 条新回复未读')
+                        .fontSize(Tokens.fsFoot)
+                        .fontWeight(FontWeight.Medium)
+                        .fontColor(Tokens.fg)
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    }
+                    .layoutWeight(1)
+                    .alignItems(VerticalAlign.Center)
                     Text('定位查看')
                       .fontSize(Tokens.fsCaption)
                       .fontWeight(FontWeight.Medium)
@@ -920,6 +1113,7 @@ export struct SessionList {
                   .shadow(Mat.cardShadow(this.hdsOn))
                   .alignItems(VerticalAlign.Center)
                 }
+                .transition(Motion.panelTransition(this.motionMode))
               }
 
               if (this.rowCount === 0) {
@@ -935,7 +1129,7 @@ export struct SessionList {
                 }
                 .width('100%')
               } else {
-                LazyForEach(this.dataSource, (m: RowModel) => {
+                LazyForEach(this.dataSource, (m: RowModel, idx: number) => {
                   if (m.kind === 'head') {
                     ListItem() {
                       Row() {
@@ -947,7 +1141,7 @@ export struct SessionList {
                             .stroke(Tokens.dim2).strokeWidth(1.6).strokeLineCap(LineCapStyle.Round)
                             .fill(Color.Transparent).width(11).height(6)
                             .rotate({ angle: this.isFolded(m.label) ? -90 : 0 })
-                            .animation({ duration: Motion.fade, curve: Motion.std })
+                            .animation(Motion.fadeOpts(this.motionMode))
                         }
                       }
                       .width('100%').padding({ left: 6, right: 6, top: 10, bottom: 2 })
@@ -957,6 +1151,16 @@ export struct SessionList {
                         }
                       })
                     }
+                    .animation(null)
+                    .opacity(this.listEntered || idx >= 18 ? 1 : 0)
+                    .animation(Motion.bloomHeaderOpacityAnim(idx, this.motionMode, 20))
+                    .scale({
+                      x: this.listEntered || idx >= 18 ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+                      y: this.listEntered || idx >= 18 ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+                      centerX: '0%',
+                      centerY: '50%'
+                    })
+                    .animation(Motion.bloomHeaderScaleAnim(idx, this.motionMode, 20))
                   } else {
                     ListItem() {
                       SessionTile({
@@ -986,6 +1190,16 @@ export struct SessionList {
                         onFork: () => { void this.doFork(m.row); }
                       })
                     }
+                    .animation(null)
+                    .opacity(this.listEntered || idx >= 18 ? 1 : 0)
+                    .animation(Motion.bloomOpacityAnim(idx, this.motionMode, 20))
+                    .scale({
+                      x: this.listEntered || idx >= 18 ? 1 : Motion.BLOOM_SCALE_START,
+                      y: this.listEntered || idx >= 18 ? 1 : Motion.BLOOM_SCALE_START,
+                      centerX: '50%',
+                      centerY: '50%'
+                    })
+                    .animation(Motion.bloomScaleAnim(idx, this.motionMode, 20))
                     .swipeAction(this.capsForRow(m.row).archivePin
                       ? {
                           end: {
@@ -1019,7 +1233,7 @@ export struct SessionList {
           .onStateChange((st: RefreshStatus) => { this.pullState = st; })
           .onRefreshing(() => {
             this.refreshing = true;
-            this.load(true).finally(() => {
+            this.load(true, true).finally(() => {
               this.refreshing = false;
               this.pullState = RefreshStatus.Inactive;
             });

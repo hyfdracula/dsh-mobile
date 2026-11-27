@@ -7,7 +7,7 @@
 | 部分 | 是什么 | 位置 |
 |---|---|---|
 | `packages/dsh-mobile` | DSH 插件（Node 侧）。在本机起一个 HTTP 网关，把 DSH 的会话能力暴露成移动端 API，并在 DSH 的「设置」里加一个「手机连接」面板（二维码 + 6 位配对码）。 | `packages/dsh-mobile` |
-| `remote/app-shell` | 鸿蒙客户端（ArkTS / ArkUI）。会话列表、聊天页、设置与配对向导，包名 `com.dsh.mobile`。 | `remote/app-shell` |
+| `remote/app-shell` | 鸿蒙客户端（ArkTS / ArkUI）。会话列表、聊天页、设置与配对向导；`dev` 调试产物包名 `com.dsh.mobile`，`default` 上架产物包名 `com.agent.mobile`。 | `remote/app-shell` |
 
 两端通过同一台电脑上的网关通信。手机和电脑在同一个局域网时走局域网直连；不在同一局域网时可以给网关套一层公网隧道（例如 cloudflared），在 App 的「设置 → 连接」里填隧道地址即可。
 
@@ -28,13 +28,14 @@
 
 | 文件 | 说明 |
 |---|---|
-| `dsh-mobile-3.0.0-signed.hap` | 当前版本 3.0.0；多 Agent 引擎 + 端到端加密 + 统一沉浸光感液态玻璃；已签名，签名 profile 仅授权作者登记过的设备 |
+| `dsh-mobile-3.1.0-signed.hap` | 当前版本 3.1.0 调试包（`com.dsh.mobile`）；双模式动效、通知与推送、反馈与界面定稿、网关 3.1.0；已签名，签名 profile 仅授权作者登记过的设备 |
+| `dsh-mobile-3.0.0-signed.hap` | 旧版 3.0.0；已签名，签名 profile 仍只授权作者登记过的设备 |
 | `dsh-mobile-2.0.0-signed.hap` | 旧版 2.0.0；已签名，签名 profile 仍只授权作者登记过的设备 |
 | `dsh-mobile-1.0.0-20261120-signed.hap` | 旧版 1.0.0，已签名，同样只授权作者登记过的设备 |
-| `dsh-mobile-1.0.0-20261120-unsigned.hap` | 旧版 1.0.0，未签名，用自己的证书签完就能装 |
+| `dsh-mobile-1.0.0-20261120-unsigned.hap` | 旧版 1.0.0，未签名，用自己的证书签完就装 |
 
 ```bash
-hdc install -r release/dsh-mobile-3.0.0-signed.hap
+hdc install -r release/dsh-mobile-3.1.0-signed.hap
 ```
 
 装不上就照 [`release/README.md`](release/README.md) 里的两种签名方式重签一次。安装包内不含任何服务器地址或令牌，首次启动直接进配对向导。

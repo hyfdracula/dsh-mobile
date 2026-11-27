@@ -1,13 +1,14 @@
-﻿# 安装包
+# 安装包
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| `dsh-mobile-3.0.0-signed.hap` | 6.00 MB | 当前版本 3.0.0（versionCode 3000000）；已签名，**只能装在签名证书 profile 里列出的设备上** |
+| `dsh-mobile-3.1.0-signed.hap` | 6.67 MB | 当前版本 3.1.0（versionCode 3001000）；已签名，**只能装在签名证书 profile 里列出的设备上** |
+| `dsh-mobile-3.0.0-signed.hap` | 6.00 MB | 旧版 3.0.0（versionCode 3000000）；已签名，**只能装在签名证书 profile 里列出的设备上** |
 | `dsh-mobile-2.0.0-signed.hap` | 2.75 MB | 旧版 2.0.0（versionCode 2000000）；已签名，**只能装在签名证书 profile 里列出的设备上** |
 | `dsh-mobile-1.0.0-20261120-signed.hap` | 1.19 MB | 旧版 1.0.0，已签名，**只能装在签名证书 profile 里列出的设备上** |
 | `dsh-mobile-1.0.0-20261120-unsigned.hap` | 1.12 MB | 旧版 1.0.0，未签名，需用自己的证书签名后再装 |
 
-构建于 2026-11-26（3.0.0），`compatibleSdkVersion` / `targetSdkVersion` = 26.0.0，bundle 名 `com.dsh.mobile`。
+构建于 2026-11-27（3.1.0），`compatibleSdkVersion` / `targetSdkVersion` = 26.0.0，bundle 名 `com.dsh.mobile`（`dev` 调试产物；源码中的 `default` 上架产物使用 `com.agent.mobile`）。
 
 ## 为什么已签名包不一定能装
 
@@ -34,7 +35,7 @@ java -jar hap-sign-tool.jar sign-app \
 
 ```bash
 hdc list targets                        # 确认设备
-hdc install -r dsh-mobile-signed.hap
+hdc install -r dsh-mobile-3.1.0-signed.hap
 hdc shell aa start -a EntryAbility -b com.dsh.mobile
 ```
 

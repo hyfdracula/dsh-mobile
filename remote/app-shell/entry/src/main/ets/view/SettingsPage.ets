@@ -3,24 +3,28 @@ import { bundleManager } from '@kit.AbilityKit';
 import { HdsNavDestination, HdsNavigationTitleBarOptions } from '@kit.UIDesignKit';
 import { Api, ApiInfo, SessionRow } from '../common/Api';
 import { AppCtx } from '../common/AppCtx';
-import { AppIcon, ICON_LIGHT } from '../common/AppIcon';
+import { AppIcon, ICON_DARK } from '../common/AppIcon';
 import { PageHeader, TopFade, buildTransparentHdsTitle } from '../common/Chrome';
 import { Haptics } from '../common/Haptics';
-import { LegalDocKind } from '../common/LegalDocs';
+import { legalBodyOf, LegalDocKind, legalTitleOf } from '../common/LegalDocs';
+import { LinkLog } from '../common/LinkLog';
 import { Mat } from '../common/Mat';
+import { Motion, MOTION_VIVID } from '../common/Motion';
 import { Pairing } from '../common/Pairing';
+import { PushBridge } from '../common/PushBridge';
 import { Toast } from '../common/Toast';
 import { Tokens } from '../common/Tokens';
 import { ChatParam } from '../common/Types';
 import { Unread } from '../common/Unread';
 import { AboutPanel, AboutRow } from './AboutPanel';
+import { AgentEnginesPanel } from './AgentEnginesPanel';
 import { AgentPanel } from './AgentPanel';
+import { AiSetupGuideBody, TunnelSetupGuideBody } from './AgentSetupCard';
 import { AppearancePanel } from './AppearancePanel';
 import { ConnectPanel } from './ConnectPanel';
 import { DataStoragePanel } from './DataStoragePanel';
 import { ExtrasPanel } from './ExtrasPanel';
 import { FeedbackPage } from './FeedbackPage';
-import { LegalSheet } from './LegalSheet';
 import { NotifyPanel } from './NotifyPanel';
 import { PairPage } from './PairPage';
 import { StoragePage } from './StoragePage';
@@ -33,6 +37,7 @@ interface NavRow {
 }
 
 const AGENT_GROUP_ROWS: NavRow[] = [
+  { id: 'connect', name: '连接与设备', hint: '多电脑切换、网络策略与外网配置' },
   { id: 'agents', name: 'Agent 引擎与控制台', hint: '多智能体引擎、预设、插件与控制台' }
 ];
 
@@ -43,14 +48,15 @@ const PREF_GROUP_ROWS: NavRow[] = [
 
 const DATA_GROUP_ROWS: NavRow[] = [
   { id: 'data', name: '数据与存储', hint: '缓存空间、草稿与待发清理' },
-  { id: 'about', name: '关于与协议', hint: '版本、诊断日志、隐私政策与开源许可' }
+  { id: 'about', name: '关于与协议', hint: '版本、运行诊断日志、隐私政策与开源许可' }
 ];
 
 /**
  * 设置页信息架构协调器：
- * - 顶部单一 Hero 连接卡片（唯一「连接」入口）；
+ * - 顶部状态概览 Hero 卡片（仅展示连接状态，不可点击，连接入口收口在下方「连接与设备」）；
  * - 三大语义分组卡片：「电脑与智能体」、「偏好设置」、「数据与支持」；
- * - 底部静态版本号落款；二级/三级页由内部 subStack 承载。
+ * - 所有二级/三级功能页统一采用全屏水平推拉 + 页内逐卡绽放，仅保留隐私政策/用户协议/开源许可
+ *   与外网访问向导为景深高斯模糊悬浮阅读卡，并完整适配全局沉浸光感开关。
  */
 @Component
 export struct SettingsPage {
@@ -92,16 +98,26 @@ export struct SettingsPage {
   @StorageLink('linkEncrypted') linkEncrypted: boolean = false;
   @StorageLink('wideScreen') wideScreen: boolean = false;
   @StorageLink('unreadCount') unreadCount: number = 0;
-  @StorageLink('appIconStyle') appIconStyle: string = ICON_LIGHT;
+  @StorageLink('appIconStyle') appIconStyle: string = ICON_DARK;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
+  @StorageLink('sheetOpen') sheetOpen: boolean = false;
 
   @State private pairEntry: string = '';
   @State private dataRefreshTick: number = 0;
-  @State private legalKind: string = '';
   @State private hapticsUi: boolean = true;
   @State private hdsUi: boolean = true;
   @State private enterSendUi: boolean = true;
   @State private compactHistoryUi: boolean = false;
   @State private textScaleUi: number = 1;
+  @State private rootEntered: boolean = true;
+  private rootEnterTimer: number = -1;
+
+  // 仅用于「隐私政策 / 用户协议 / 开源许可 / 外网向导（AI 与隧道）」的景深悬浮阅读浮卡
+  @State private readingRoute: string = '';
+  @State private readingMounted: boolean = false;
+  @State private readingOpenFactor: number = 0;
+  @State private readingDragY: number = 0;
+  private readingCloseTimer: number = -1;
 
   @State private info: ApiInfo | null = null;
   @State private base: string = '';
@@ -120,7 +136,8 @@ export struct SettingsPage {
 
   @State private notifyDone: boolean = true;
   @State private notifyBgOnly: boolean = true;
-  @State private verText: string = 'Agent Mobile';
+  @State private notifyShowTitle: boolean = true;
+  @State private verText: string = 'Agent远程控制台';
   @State private answerMode: string = 'phone';
   @State private answerBusy: boolean = false;
   @State private devCount: number = -1;
@@ -143,8 +160,12 @@ export struct SettingsPage {
     this.editToken = this.token0;
     this.saved = '';
     this.saveErr = '';
+    Api.clearBackendsCache();
     void this.load();
     void this.loadDeviceCount();
+    if (this.token0 !== '' && this.wanBase !== '') {
+      void this.api.backends(false).catch(() => {});
+    }
   }
 
   private onHapticsProp(): void {
@@ -161,12 +182,105 @@ export struct SettingsPage {
 
   private syncSubFromStack(): void {
     const names: string[] = this.subStack.getAllPathName();
-    this.sub = names.length > 0 ? names[names.length - 1] : '';
+    if (names.length > 0) {
+      this.sub = names[names.length - 1];
+    } else if (this.readingMounted && this.readingRoute !== '') {
+      this.sub = this.readingRoute;
+    } else {
+      this.sub = '';
+    }
+  }
+
+  private clearReadingTimer(): void {
+    if (this.readingCloseTimer >= 0) {
+      clearTimeout(this.readingCloseTimer);
+      this.readingCloseTimer = -1;
+    }
+  }
+
+  private openReadingSheet(route: string): void {
+    this.clearReadingTimer();
+    LinkLog.record('NAV', 'reading ' + route);
+    this.readingRoute = route;
+    this.readingDragY = 0;
+    this.readingOpenFactor = 0;
+    this.readingMounted = true;
+    this.sheetOpen = true;
+    this.syncSubFromStack();
+    setTimeout(() => {
+      if (this.readingMounted && this.readingRoute === route) {
+        this.getUIContext().animateTo(Motion.flagshipSheet(), () => {
+          this.readingOpenFactor = 1;
+        });
+      }
+    }, 16);
+  }
+
+  private closeReadingSheet(): void {
+    this.clearReadingTimer();
+    if (!this.readingMounted) {
+      this.sheetOpen = false;
+      this.syncSubFromStack();
+      return;
+    }
+    this.getUIContext().animateTo(Motion.flagshipSheet(), () => {
+      this.readingOpenFactor = 0;
+      this.readingDragY = 0;
+    });
+    this.readingCloseTimer = setTimeout(() => {
+      this.readingCloseTimer = -1;
+      this.readingMounted = false;
+      this.readingRoute = '';
+      this.readingDragY = 0;
+      this.sheetOpen = false;
+      this.syncSubFromStack();
+    }, 240);
+  }
+
+  private effectiveBackdrop(): number {
+    if (!this.readingMounted || this.readingOpenFactor <= 0) {
+      return 0;
+    }
+    const dragRatio: number = Math.min(1, Math.max(0, this.readingDragY / 320));
+    return Math.max(0, this.readingOpenFactor * (1 - dragRatio));
+  }
+
+  private readingHeightFor(route: string): string {
+    if (route === 'guide:ai') {
+      return '78%';
+    }
+    if (route === 'guide:tunnel') {
+      return '84%';
+    }
+    return '80%';
+  }
+
+  private readingTitleOf(route: string): string {
+    if (route === 'guide:ai') {
+      return '让 AI 帮你配';
+    }
+    if (route === 'guide:tunnel') {
+      return '外网访问配置向导';
+    }
+    if (route === 'legal:terms') {
+      return legalTitleOf('terms');
+    }
+    if (route === 'legal:licenses') {
+      return legalTitleOf('licenses');
+    }
+    return legalTitleOf('privacy');
+  }
+
+  private openSettingEntry(id: string): void {
+    Haptics.tap();
+    LinkLog.record('NAV', 'open ' + id);
+    this.subStack.pushPathByName(id, null);
+    this.syncSubFromStack();
   }
 
   private onSettingsBack(): void {
-    if (this.legalKind !== '') {
-      this.legalKind = '';
+    if (this.readingMounted) {
+      this.closeReadingSheet();
       return;
     }
     if (this.sub === 'feedback') {
@@ -194,11 +308,25 @@ export struct SettingsPage {
     this.syncSubFromStack();
     const nd: boolean | undefined = AppStorage.get<boolean>('notifyDone');
     const nb: boolean | undefined = AppStorage.get<boolean>('notifyBgOnly');
+    const nst: boolean | undefined = AppStorage.get<boolean>('notifyShowTitle');
     this.notifyDone = nd !== undefined ? nd : true;
     this.notifyBgOnly = nb !== undefined ? nb : true;
+    this.notifyShowTitle = nst !== undefined ? nst : true;
     this.editBase = this.wanBase;
     this.editToken = this.token0;
+    if (Motion.isFlagship(this.motionMode)) {
+      this.rootEntered = false;
+      this.rootEnterTimer = setTimeout(() => {
+        this.rootEnterTimer = -1;
+        this.rootEntered = true;
+      }, 16);
+    } else {
+      this.rootEntered = true;
+    }
     void this.load();
+    if (this.token0 !== '' && this.wanBase !== '' && Api.cachedBackends().length === 0) {
+      void this.api.backends(false).catch(() => {});
+    }
     this.linkTimer = setInterval(() => {
       const lanNow: boolean = this.api.isLan();
       if (lanNow !== this.lan) {
@@ -213,6 +341,11 @@ export struct SettingsPage {
       this.linkTimer = -1;
     }
     this.stopSaveTimer();
+    this.clearReadingTimer();
+    if (this.rootEnterTimer >= 0) {
+      clearTimeout(this.rootEnterTimer);
+      this.rootEnterTimer = -1;
+    }
   }
 
   private startSaveTimer(): void {
@@ -250,6 +383,7 @@ export struct SettingsPage {
     await this.load();
     void this.loadDeviceCount();
     if (this.err === '') {
+      Haptics.success();
       Toast.ok('已刷新连接 · ' + (this.info !== null ? this.info.host : '在线'));
     } else {
       Toast.err(this.err);
@@ -263,17 +397,20 @@ export struct SettingsPage {
     const rawBase: string = this.editBase.trim();
     const rawToken: string = this.editToken.trim();
     if (rawBase === '' || rawToken === '') {
+      Haptics.error();
       this.saved = '';
       this.saveErr = '连接地址与访问令牌均不能为空。';
       return;
     }
     if (rawBase.indexOf('://') >= 0 && !/^https?:\/\//i.test(rawBase)) {
+      Haptics.error();
       this.saved = '';
       this.saveErr = '地址协议仅支持 http:// 或 https://。';
       return;
     }
     const normBase: string = Pairing.normalizeBase(rawBase);
     if (!/^https?:\/\/[^\s/]+/i.test(normBase)) {
+      Haptics.error();
       this.saved = '';
       this.saveErr = '连接地址格式不合法，请检查后重试。';
       return;
@@ -307,11 +444,13 @@ export struct SettingsPage {
       this.saveErr = '';
       this.saved = '已连接 · ' + inf.host;
       void this.loadDeviceCount();
+      Haptics.success();
       Toast.ok('已连接 ' + inf.host);
     } catch (e) {
       const msg: string = (e as Error).message !== undefined && (e as Error).message !== ''
         ? (e as Error).message
         : '无法连接到该地址，请检查电脑端网关是否开启或令牌是否正确';
+      Haptics.error();
       this.err = msg;
       this.saveErr = msg;
       this.saved = '';
@@ -359,9 +498,9 @@ export struct SettingsPage {
   private readVersion(): void {
     try {
       const info = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
-      this.verText = 'Agent Mobile v' + info.versionName;
+      this.verText = 'Agent远程控制台 v' + info.versionName;
     } catch (e) {
-      this.verText = 'Agent Mobile';
+      this.verText = 'Agent远程控制台';
     }
   }
 
@@ -393,8 +532,33 @@ export struct SettingsPage {
     this.syncSubFromStack();
   }
 
+  private popAllPairSub(): void {
+    let guard: number = 0;
+    while (this.subStack.size() > 0 && guard < 8) {
+      const names: string[] = this.subStack.getAllPathName();
+      const top: string = names.length > 0 ? names[names.length - 1] : '';
+      if (top !== 'pair' && top !== 'pair_prepare' && top !== 'pair_connect') {
+        break;
+      }
+      this.subStack.pop(false);
+      guard++;
+    }
+    this.syncSubFromStack();
+  }
+
+  private switchPairSub(target: string): void {
+    const names: string[] = this.subStack.getAllPathName();
+    if (names.length >= 2 && names[names.length - 2] === target) {
+      this.subStack.pop();
+    } else {
+      this.subStack.pushPathByName(target, null);
+    }
+    this.syncSubFromStack();
+  }
+
   private clearUnread(): void {
     Unread.clearAll();
+    Haptics.success();
     Toast.ok('已清除全部未读与桌面红点');
   }
 
@@ -407,20 +571,22 @@ export struct SettingsPage {
       return '正在检测连接…';
     }
     if (this.err !== '') {
-      return '未连接 · 点击管理电脑连接';
+      return '未连接 · 请在下方「连接与设备」管理';
     }
     const route: string = this.lan ? '已连接 · 局域网直连' : '已连接 · 公网入口';
     return this.linkEncrypted ? route + ' · 端到端加密' : route;
   }
 
   private isFullScreenSub(name: string): boolean {
-    return name === 'pair' || name === 'feedback' || name === 'storage' ||
+    return name === 'pair' || name === 'pair_prepare' || name === 'pair_connect' ||
+      name === 'feedback' || name === 'storage' ||
       name === 'extras_plugins' || name === 'extras_schedules' || name === 'web_console';
   }
 
   private subTitleOf(name: string): string {
     if (name === 'connect') return '连接与设备';
     if (name === 'agents') return 'Agent 引擎与控制台';
+    if (name === 'agent_engines') return '电脑端智能体引擎';
     if (name === 'appearance') return '外观与交互';
     if (name === 'notify') return '通知';
     if (name === 'data') return '数据与存储';
@@ -428,6 +594,7 @@ export struct SettingsPage {
   }
 
   private navIconRes(id: string): Resource {
+    if (id === 'connect') return $r('app.media.ic_pc');
     if (id === 'agents') return $r('app.media.ic_set_agent');
     if (id === 'appearance') return $r('app.media.ic_set_look');
     if (id === 'notify') return $r('app.media.ic_set_bell');
@@ -440,7 +607,7 @@ export struct SettingsPage {
       { k: '客户端', v: this.verText, mono: false },
       { k: '电脑网关', v: this.info !== null ? (this.info.version + ' · ' + this.info.host) : '未连接', mono: false },
       { k: '监听端口', v: this.info !== null ? String(this.info.port) : '-', mono: true },
-      { k: '数据流向', v: '仅在你授权的手机与电脑间加密传输', mono: false }
+      { k: '数据流向', v: '仅在授权设备间加密传输', mono: false }
     ];
   }
 
@@ -456,16 +623,26 @@ export struct SettingsPage {
   }
 
   @Builder
-  groupTitle(text: string, topGap: number) {
+  groupTitle(text: string, topGap: number, bloomIdx: number) {
     Text(text)
       .fontSize(Tokens.fsCaption)
       .fontColor(Tokens.dim2)
       .letterSpacing(1.4)
       .margin({ left: 6, top: topGap, bottom: 8 })
+      .animation(null)
+      .opacity(this.rootEntered ? 1 : 0)
+      .animation(Motion.bloomHeaderOpacityAnim(bloomIdx, this.motionMode, 12))
+      .scale({
+        x: this.rootEntered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+        y: this.rootEntered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+        centerX: '0%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomHeaderScaleAnim(bloomIdx, this.motionMode, 12))
   }
 
   @Builder
-  navRow(r: NavRow) {
+  navRowCard(r: NavRow, idx: number) {
     Row() {
       Stack({ alignContent: Alignment.Center }) {
         Image(this.navIconRes(r.id)).width(18).height(18).fillColor(Tokens.navIconInk).objectFit(ImageFit.Contain)
@@ -491,32 +668,41 @@ export struct SettingsPage {
           .borderRadius(Tokens.rPill)
           .padding({ left: 7, right: 7, top: 2, bottom: 2 })
           .margin({ right: 8 })
+          .contentTransition(Motion.numTransition(this.motionMode))
       }
-      Text('›').fontSize(17).fontColor(Tokens.dim2)
-    }
-    .width('100%').padding({ left: 14, right: 14, top: 13, bottom: 13 })
-    .alignItems(VerticalAlign.Center).clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
-    .onClick(() => { Haptics.tap(); this.subStack.pushPathByName(r.id, null); })
-  }
-
-  @Builder
-  navGroup(rows: NavRow[]) {
-    Column() {
-      ForEach(rows, (r: NavRow, i: number) => {
-        this.navRow(r)
-        if (i < rows.length - 1) {
-          Divider().color(Tokens.lineSoft).margin({ left: 60 })
-        }
-      }, (r: NavRow) => r.id)
+      if (Motion.isFlagship(this.motionMode)) {
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(14)
+          .fontColor([Tokens.dim2])
+      } else {
+        Text('›').fontSize(17).fontColor(Tokens.dim2)
+      }
     }
     .width('100%')
+    .padding({ left: 14, right: 14, top: 13, bottom: 13 })
+    .alignItems(VerticalAlign.Center)
     .backgroundColor(Mat.cardBg(this.hdsOn))
     .border(Mat.cardBorder(this.hdsOn))
-    .shadow(Mat.cardShadow(this.hdsOn))
-    .borderRadius(Tokens.rGroup)
+    .shadow(Mat.rowShadow(this.hdsOn))
+    .borderRadius(Tokens.rRow)
     .clip(true)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+    .animation(null)
+    .opacity(this.rootEntered ? 1 : 0)
+    .animation(Motion.bloomOpacityAnim(idx, this.motionMode, 12))
+    .scale({
+      x: this.rootEntered ? 1 : Motion.BLOOM_SCALE_START,
+      y: this.rootEntered ? 1 : Motion.BLOOM_SCALE_START,
+      centerX: '50%',
+      centerY: '50%'
+    })
+    .animation(Motion.bloomScaleAnim(idx, this.motionMode, 12))
+    .onClick(() => { this.openSettingEntry(r.id); })
   }
 
+  /**
+   * 顶部 Hero 概览卡：纯状态指示展示（不可点击，连接入口独立为下方「连接与设备」）。
+   */
   @Builder
   deviceBanner() {
     Row() {
@@ -548,14 +734,41 @@ export struct SettingsPage {
       .alignItems(HorizontalAlign.Start).layoutWeight(1).margin({ left: 12 })
 
       if (!this.loading && this.err === '') {
-        Row().width(8).height(8).borderRadius(Tokens.rPill).backgroundColor(Tokens.ok).margin({ right: 6 })
+        Row() {
+          Row().width(7).height(7).borderRadius(Tokens.rPill).backgroundColor(Tokens.ok)
+          Text(this.lan ? '局域网' : '公网')
+            .fontSize(Tokens.fsCaption)
+            .fontColor(Tokens.ok)
+            .margin({ left: 5 })
+        }
+        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+        .borderRadius(Tokens.rPill)
+        .backgroundColor(Tokens.doneBg)
+      } else if (!this.loading && this.err !== '') {
+        Row() {
+          Row().width(7).height(7).borderRadius(Tokens.rPill).backgroundColor(Tokens.err)
+          Text('未连接')
+            .fontSize(Tokens.fsCaption)
+            .fontColor(Tokens.err)
+            .margin({ left: 5 })
+        }
+        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+        .borderRadius(Tokens.rPill)
+        .backgroundColor(Tokens.intrBg)
       }
-      Text('›').fontSize(17).fontColor(Tokens.dim2)
     }
     .width('100%').padding(16).backgroundColor(Mat.cardBg(this.hdsOn))
-    .border(Mat.cardBorder(this.hdsOn)).shadow(Mat.cardShadow(this.hdsOn)).borderRadius(Tokens.rGroup)
-    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
-    .onClick(() => { Haptics.tap(); this.subStack.pushPathByName('connect', null); })
+    .border(Mat.cardBorder(this.hdsOn)).shadow(Mat.cardShadow(this.hdsOn)).borderRadius(Tokens.rCard)
+    .animation(null)
+    .opacity(this.rootEntered ? 1 : 0)
+    .animation(Motion.bloomOpacityAnim(0, this.motionMode, 12))
+    .scale({
+      x: this.rootEntered ? 1 : Motion.BLOOM_SCALE_START,
+      y: this.rootEntered ? 1 : Motion.BLOOM_SCALE_START,
+      centerX: '50%',
+      centerY: '50%'
+    })
+    .animation(Motion.bloomScaleAnim(0, this.motionMode, 12))
   }
 
   @Builder
@@ -563,14 +776,26 @@ export struct SettingsPage {
     Column() {
       this.deviceBanner()
 
-      this.groupTitle('电脑与智能体', 18)
-      this.navGroup(AGENT_GROUP_ROWS)
+      this.groupTitle('电脑与智能体', 16, 1)
+      Column({ space: 9 }) {
+        this.navRowCard(AGENT_GROUP_ROWS[0], 1)
+        this.navRowCard(AGENT_GROUP_ROWS[1], 2)
+      }
+      .width('100%')
 
-      this.groupTitle('偏好设置', 18)
-      this.navGroup(PREF_GROUP_ROWS)
+      this.groupTitle('偏好设置', 16, 3)
+      Column({ space: 9 }) {
+        this.navRowCard(PREF_GROUP_ROWS[0], 3)
+        this.navRowCard(PREF_GROUP_ROWS[1], 4)
+      }
+      .width('100%')
 
-      this.groupTitle('数据与支持', 18)
-      this.navGroup(DATA_GROUP_ROWS)
+      this.groupTitle('数据与支持', 16, 5)
+      Column({ space: 9 }) {
+        this.navRowCard(DATA_GROUP_ROWS[0], 5)
+        this.navRowCard(DATA_GROUP_ROWS[1], 6)
+      }
+      .width('100%')
 
       Text(this.verText)
         .fontSize(Tokens.fsFoot)
@@ -578,21 +803,40 @@ export struct SettingsPage {
         .width('100%')
         .textAlign(TextAlign.Center)
         .padding({ top: 22, bottom: 8 })
+        .animation(null)
+        .opacity(this.rootEntered ? 1 : 0)
+        .animation(Motion.bloomHeaderOpacityAnim(7, this.motionMode, 12))
+        .scale({
+          x: this.rootEntered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          y: this.rootEntered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          centerX: '0%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomHeaderScaleAnim(7, this.motionMode, 12))
     }
     .width('100%').alignItems(HorizontalAlign.Start)
   }
 
   @Builder
   fullScreenSubBody(name: string) {
-    if (name === 'pair') {
+    if (name === 'pair_prepare' || name === 'pair_connect' || name === 'pair') {
       PairPage({
-        api: this.api, defaultBase: this.defaultLan, entry: this.pairEntry, hasBack: true,
+        api: this.api,
+        defaultBase: this.defaultLan,
+        entry: name === 'pair_prepare' ? 'guide' : this.pairEntry,
+        mode: name === 'pair_prepare' ? 'prepare' : 'connect',
+        hasBack: true,
+        popHeader: true,
         onExit: () => { this.closeSub(); },
+        onGoOtherStep: () => {
+          this.switchPairSub(name === 'pair_prepare' ? 'pair_connect' : 'pair_prepare');
+        },
         onPaired: (b: string, t: string, host: string, lan: string[], hostId?: string, e2eePub?: string) => {
-          this.closeSub();
+          this.popAllPairSub();
           this.onSaveLan(b, t, lan, hostId, e2eePub, host);
           this.editBase = b;
           this.editToken = t;
+          Api.clearBackendsCache();
           void this.load();
           void this.loadDeviceCount();
         }
@@ -631,9 +875,19 @@ export struct SettingsPage {
         onAddMachine: (wan: string, token: string, mName: string): void => {
           this.onAddMachine(wan, token, mName);
         },
-        onOpenPair: (entry: string): void => { this.pairEntry = entry; this.subStack.pushPathByName('pair', null); },
+        onOpenPair: (entry: string): void => {
+          this.pairEntry = entry;
+          const target: string = entry === 'guide' ? 'pair_prepare' : 'pair_connect';
+          LinkLog.record('NAV', 'open ' + target + ' (' + entry + ')');
+          this.subStack.pushPathByName(target, null);
+          this.syncSubFromStack();
+        },
+        onOpenGuide: (kind: string): void => {
+          this.openReadingSheet(kind === 'ai' ? 'guide:ai' : 'guide:tunnel');
+        },
         onReconnect: (): void => { void this.reconnectHost(); },
         onRemoveCurrent: (): void => {
+          Haptics.warn();
           AppCtx.confirm(
             '移除此电脑',
             '会清掉这台手机与它的配对凭据；若无其余电脑将回到连接页。电脑端不受影响。',
@@ -652,17 +906,29 @@ export struct SettingsPage {
         answerMode: this.answerMode,
         answerBusy: this.answerBusy,
         onAnswerMode: (m: string): void => { void this.setAnswerMode(m); },
+        onOpenEngines: (): void => {
+          LinkLog.record('NAV', 'open agent_engines');
+          this.subStack.pushPathByName('agent_engines', null);
+          this.syncSubFromStack();
+        },
         onOpenPresets: (): void => {
           const p: ChatParam = { id: '', title: '智能体预设与权限' };
           this.rootStack.pushPathByName('presets', p);
         },
         onOpenExtras: (mode: string): void => {
-          this.subStack.pushPathByName(mode === 'schedules' ? 'extras_schedules' : 'extras_plugins', null);
+          const route: string = mode === 'schedules' ? 'extras_schedules' : 'extras_plugins';
+          LinkLog.record('NAV', 'open ' + route);
+          this.subStack.pushPathByName(route, null);
+          this.syncSubFromStack();
         },
         onOpenWebConsole: (): void => {
+          LinkLog.record('NAV', 'open web_console');
           this.subStack.pushPathByName('web_console', null);
+          this.syncSubFromStack();
         }
       })
+    } else if (name === 'agent_engines') {
+      AgentEnginesPanel({ api: this.api })
     } else if (name === 'appearance') {
       AppearancePanel({
         themeMode: this.themeMode, haptics: this.hapticsUi, hds: this.hdsUi, enterSend: this.enterSendUi,
@@ -683,21 +949,47 @@ export struct SettingsPage {
       })
     } else if (name === 'notify') {
       NotifyPanel({
-        done: this.notifyDone, bgOnly: this.notifyBgOnly,
-        onDone: (v: boolean): void => { this.notifyDone = v; void this.savePrefFlag('notifyDone', v); },
-        onBgOnly: (v: boolean): void => { this.notifyBgOnly = v; void this.savePrefFlag('notifyBgOnly', v); },
+        api: this.api,
+        done: this.notifyDone,
+        bgOnly: this.notifyBgOnly,
+        showTitle: this.notifyShowTitle,
+        onDone: (v: boolean): void => {
+          this.notifyDone = v;
+          void this.savePrefFlag('notifyDone', v);
+          void PushBridge.syncToGateway(this.api, true);
+        },
+        onBgOnly: (v: boolean): void => {
+          this.notifyBgOnly = v;
+          void this.savePrefFlag('notifyBgOnly', v);
+          void PushBridge.syncToGateway(this.api, true);
+        },
+        onShowTitle: (v: boolean): void => {
+          this.notifyShowTitle = v;
+          void this.savePrefFlag('notifyShowTitle', v);
+          void PushBridge.syncToGateway(this.api, true);
+        },
         onClearUnread: (): void => { this.clearUnread(); }
       })
     } else if (name === 'data') {
       DataStoragePanel({
         refreshTick: this.dataRefreshTick,
-        onStorage: (): void => { this.subStack.pushPathByName('storage', null); }
+        onStorage: (): void => {
+          LinkLog.record('NAV', 'open storage');
+          this.subStack.pushPathByName('storage', null);
+          this.syncSubFromStack();
+        }
       })
     } else {
       AboutPanel({
         rows: this.aboutRows(), verText: this.verText,
-        onFeedback: (): void => { this.subStack.pushPathByName('feedback', null); },
-        onLegal: (kind: LegalDocKind): void => { this.legalKind = kind; }
+        onFeedback: (): void => {
+          LinkLog.record('NAV', 'open feedback');
+          this.subStack.pushPathByName('feedback', null);
+          this.syncSubFromStack();
+        },
+        onLegal: (kind: LegalDocKind): void => {
+          this.openReadingSheet('legal:' + kind);
+        }
       })
     }
   }
@@ -709,10 +1001,15 @@ export struct SettingsPage {
         title: this.subTitleOf(name),
         padTop: true,
         immersive: true,
+        subPageDepth: name === 'engines' ? 2 : 1,
         rightKind: name === 'connect' ? 'icon' : 'none',
         rightIcon: $r('app.media.ic_scan'),
         onBack: () => { this.closeSub(); },
-        onRight: () => { this.pairEntry = 'scan'; this.subStack.pushPathByName('pair', null); }
+        onRight: () => {
+          this.pairEntry = 'scan';
+          this.subStack.pushPathByName('pair_connect', null);
+          this.syncSubFromStack();
+        }
       })
     }
     .width('100%')
@@ -753,8 +1050,9 @@ export struct SettingsPage {
     .hideBackButton(true)
     .backgroundColor(this.themeBg)
     .onBackPressed(() => {
-      if (this.legalKind !== '') {
-        this.legalKind = '';
+      if (this.readingMounted) {
+        Haptics.soft();
+        this.closeReadingSheet();
         return true;
       }
       if (name === 'feedback') {
@@ -765,6 +1063,7 @@ export struct SettingsPage {
           return true;
         }
       }
+      Haptics.soft();
       this.closeSub();
       return true;
     })
@@ -784,43 +1083,202 @@ export struct SettingsPage {
     })
   }
 
-  build() {
+  /**
+   * 仅用于「隐私政策 / 用户协议 / 开源许可 / 外网访问向导」的景深悬浮阅读浮卡：
+   * - 保留标志性的景深高斯虚化缩退背板与跟手下拉关闭动效；
+   * - 严格尊重全局 hdsOn 开关：开启为雾面通透液态玻璃，关闭为零模糊高对比实色表面。
+   */
+  @Builder
+  readingSheetOverlay() {
     Stack({ alignContent: Alignment.Bottom }) {
-      Navigation(this.subStack) {
+      Row()
+        .width('100%')
+        .height('100%')
+        .backgroundColor(this.themeDark ? '#66000000' : '#2E0F172A')
+        .opacity(this.effectiveBackdrop())
+        .onClick(() => {
+          Haptics.soft();
+          this.closeReadingSheet();
+        })
+
+      Column() {
         Stack({ alignContent: Alignment.Top }) {
-          Scroll() {
+          if (this.hdsOn) {
+            Row()
+              .width('100%')
+              .height('100%')
+              .linearGradient({
+                angle: 165,
+                colors: this.themeDark
+                  ? [['#22FFFFFF', 0.0], ['#08FFFFFF', 0.28], ['#00FFFFFF', 0.65]]
+                  : [['#66FFFFFF', 0.0], ['#1AFFFFFF', 0.30], ['#00FFFFFF', 0.68]]
+              })
+              .hitTestBehavior(HitTestMode.None)
+          }
+
+          Column() {
+            // 顶部拖拽指示条 + 阅读标题栏
             Column() {
-              Column() { this.rootList() }
-                .width('100%').constraintSize({ maxWidth: this.panelMaxWidth() }).alignItems(HorizontalAlign.Start)
+              Row()
+                .width(38)
+                .height(4)
+                .borderRadius(2)
+                .backgroundColor(this.themeDark ? '#40FFFFFF' : '#260F172A')
+                .margin({ top: 9, bottom: 8 })
+
+              Row({ space: 10 }) {
+                Text(this.readingTitleOf(this.readingRoute))
+                  .fontSize(Tokens.fsTitle)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(Tokens.fg)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .layoutWeight(1)
+
+                Stack({ alignContent: Alignment.Center }) {
+                  SymbolGlyph($r('sys.symbol.xmark'))
+                    .fontSize(15)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor([Tokens.dim])
+                }
+                .width(34)
+                .height(34)
+                .borderRadius(Tokens.rPill)
+                .backgroundColor(Mat.subCardBg(this.hdsOn))
+                .border(Mat.subCardBorder(this.hdsOn))
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+                .accessibilityText('关闭')
+                .onClick(() => {
+                  Haptics.soft();
+                  this.closeReadingSheet();
+                })
+              }
+              .width('100%')
+              .padding({ left: 18, right: 16, bottom: 10 })
+              .alignItems(VerticalAlign.Center)
             }
             .width('100%')
-            .padding({ left: 16, right: 16, top: this.topInset + 62, bottom: this.bottomInset + 96 })
             .alignItems(HorizontalAlign.Center)
-          }
-          .width('100%').height('100%').scrollBar(BarState.Off)
-          .edgeEffect(EdgeEffect.Spring).align(Alignment.Top)
+            .gesture(
+              PanGesture({ direction: PanDirection.Vertical, distance: 4 })
+                .onActionUpdate((e: GestureEvent) => {
+                  const dy: number = e.offsetY;
+                  this.readingDragY = dy > 0 ? dy : dy * 0.16;
+                })
+                .onActionEnd((e: GestureEvent) => {
+                  if (this.readingDragY > 96 || e.velocityY > 560) {
+                    Haptics.soft();
+                    this.closeReadingSheet();
+                  } else {
+                    this.getUIContext().animateTo(Motion.flagshipSheet(), () => {
+                      this.readingDragY = 0;
+                    });
+                  }
+                })
+            )
 
-          TopFade({ fadeHeight: this.topInset + 68 })
-          this.rootHeader()
+            Scroll() {
+              Column() {
+                if (this.readingRoute === 'guide:ai') {
+                  AiSetupGuideBody()
+                } else if (this.readingRoute === 'guide:tunnel') {
+                  TunnelSetupGuideBody()
+                } else {
+                  Text(legalBodyOf(this.readingRoute === 'legal:terms'
+                    ? 'terms'
+                    : (this.readingRoute === 'legal:licenses' ? 'licenses' : 'privacy')))
+                    .fontSize(Tokens.fsBody)
+                    .fontColor(Tokens.fg)
+                    .lineHeight(22)
+                    .width('100%')
+                    .copyOption(CopyOptions.LocalDevice)
+                }
+              }
+              .width('100%')
+              .padding({ left: 18, right: 18, top: 4, bottom: 26 })
+              .alignItems(HorizontalAlign.Start)
+            }
+            .width('100%')
+            .layoutWeight(1)
+            .scrollBar(BarState.Off)
+            .edgeEffect(EdgeEffect.Spring)
+            .align(Alignment.Top)
+          }
+          .width('100%')
+          .height('100%')
         }
-        .width('100%').height('100%').backgroundColor(this.themeBg)
+        .width('100%')
+        .constraintSize({ maxWidth: this.panelMaxWidth() + 32 })
+        .height(this.readingHeightFor(this.readingRoute))
+        .backgroundColor(this.hdsOn ? Color.Transparent : Tokens.surface)
+        .backgroundEffect(Mat.readingGlassEffect(this.hdsOn))
+        .borderRadius(28)
+        .border(Mat.glassRimBorder(this.hdsOn))
+        .shadow(Mat.glassFloatShadow(this.hdsOn))
+        .clip(true)
+        .translate({ y: (1 - this.readingOpenFactor) * 520 + this.readingDragY })
+        .scale({
+          x: 0.94 + 0.06 * this.readingOpenFactor,
+          y: 0.94 + 0.06 * this.readingOpenFactor
+        })
+        .opacity(Math.min(1, this.readingOpenFactor * 1.45))
       }
-      .hideTitleBar(true)
-      .mode(NavigationMode.Stack)
-      .navDestination(this.subDest)
       .width('100%')
       .height('100%')
+      .justifyContent(FlexAlign.End)
+      .alignItems(HorizontalAlign.Center)
+      .padding({ left: 10, right: 10, bottom: this.bottomInset + 10 })
+      .hitTestBehavior(HitTestMode.Transparent)
+    }
+    .width('100%')
+    .height('100%')
+  }
 
-      if (this.legalKind !== '') {
-        LegalSheet({
-          kind: this.legalKind as LegalDocKind,
-          onClose: () => {
-            this.legalKind = '';
+  build() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column() {
+        Navigation(this.subStack) {
+          Stack({ alignContent: Alignment.Top }) {
+            Scroll() {
+              Column() {
+                Column() { this.rootList() }
+                  .width('100%').constraintSize({ maxWidth: this.panelMaxWidth() }).alignItems(HorizontalAlign.Start)
+              }
+              .width('100%')
+              .padding({ left: 16, right: 16, top: this.topInset + 62, bottom: this.bottomInset + 96 })
+              .alignItems(HorizontalAlign.Center)
+            }
+            .width('100%').height('100%').scrollBar(BarState.Off)
+            .edgeEffect(EdgeEffect.Spring).align(Alignment.Top)
+
+            TopFade({ fadeHeight: this.topInset + 68 })
+            this.rootHeader()
           }
-        })
+          .width('100%').height('100%').backgroundColor(this.themeBg)
+        }
+        .hideTitleBar(true)
+        .mode(NavigationMode.Stack)
+        .navDestination(this.subDest)
+        .width('100%')
+        .height('100%')
+      }
+      .width('100%')
+      .height('100%')
+      .backgroundColor(this.themeBg)
+      .blur(this.hdsOn ? this.effectiveBackdrop() * 18 : 0)
+      .scale({
+        x: 1 - 0.055 * this.effectiveBackdrop(),
+        y: 1 - 0.055 * this.effectiveBackdrop()
+      })
+      .borderRadius(this.effectiveBackdrop() > 0.01 ? 22 * this.effectiveBackdrop() : 0)
+      .clip(this.effectiveBackdrop() > 0.01)
+
+      if (this.readingMounted && this.readingRoute !== '') {
+        this.readingSheetOverlay()
       }
     }
     .width('100%')
     .height('100%')
+    .backgroundColor(this.themeBg)
   }
 }

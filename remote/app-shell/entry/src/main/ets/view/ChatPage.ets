@@ -1,7 +1,6 @@
 import { inputMethod } from '@kit.IMEKit';
-import { HdsNavDestination, HdsNavigationTitleBarOptions } from '@kit.UIDesignKit';
+import { HdsNavDestination, HdsNavigationTitleBarOptions, hdsEffect } from '@kit.UIDesignKit';
 import window from '@ohos.window';
-import { KeyboardAvoidMode as KbMode } from '@ohos.arkui.UIContext';
 import {
   AgentRef,
   Api,
@@ -38,12 +37,14 @@ import { FilePart } from '../common/Files';
 import { dayLabel, sameDay } from '../common/Format';
 import { Haptics } from '../common/Haptics';
 import { ImagePart, pickImages } from '../common/Images';
+import { Machines } from '../common/Machines';
 import { Marks } from '../common/Marks';
 import { Mat } from '../common/Mat';
 import { MdBlock, parseMd } from '../common/Md';
-import { Motion } from '../common/Motion';
+import { Motion, MOTION_VIVID } from '../common/Motion';
 import { Net } from '../common/Net';
 import { Outbox, StashItem } from '../common/Outbox';
+import { SafeArea } from '../common/SafeArea';
 import { Toast } from '../common/Toast';
 import { Tokens } from '../common/Tokens';
 import { ChatParam } from '../common/Types';
@@ -53,6 +54,8 @@ import { ExtrasPanel } from './ExtrasPanel';
 import { PendingBoard, PendRow } from './PendingBoard';
 import { PendingImages } from './PendingImages';
 import { TypingBubble } from './TypingBubble';
+import { WebConsolePage } from './WebConsolePage';
+import { AiFlowGlow, pickNextAiFlowVariant } from './chat/AiFlowGlow';
 import { AskQuestionCard } from './chat/AskQuestionCard';
 import { BigEditorOverlay } from './chat/BigEditorOverlay';
 import { ChatBubbleItem } from './chat/ChatBubbleItem';
@@ -89,6 +92,7 @@ import {
   reorderPendList,
   replayOutboxItems,
   ResolvedModelState,
+  clampKeyboardByContainer,
   resolveKeyboardHeightVp,
   resolveLinkState,
   saveSessionMarkdown,
@@ -115,17 +119,20 @@ export struct ChatPage {
   @StorageLink('topInset') topInset: number = 40;
   @StorageLink('bottomInset') bottomInset: number = 20;
   @StorageLink('hdsOn') hdsOn: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
   @StorageLink('enterSend') enterSend: boolean = true;
   @StorageLink('compactHistory') @Watch('onCompactHistoryChange') compactHistory: boolean = false;
   @StorageLink('textScale') textScale: number = 1;
   @StorageLink('online') @Watch('onOnline') online: boolean = true;
   @StorageLink('bigImg') bigImg: string = '';
+  @StorageLink('bigImgGeoId') bigImgGeoId: string = '';
   @StorageLink('appFg') @Watch('onAppFgChange') appFg: boolean = true;
   @StorageLink('linkMode') linkMode: string = 'lan';
   @StorageLink('linkEncrypted') linkEncrypted: boolean = false;
   @StorageLink('wideScreen') wideScreen: boolean = false;
 
   @State private kbH: number = 0;
+  @State private listKbPad: number = 0;
   private kwWin: window.Window | null = null;
   private kwCb: ((h: number) => void) | null = null;
   private kwRep: number = 0;
@@ -133,6 +140,15 @@ export struct ChatPage {
   private kwAvoidSeen: boolean = false;
   private kwAvoidCb: ((data: window.AvoidAreaOptions) => void) | null = null;
   private winH: number = 0;
+  private pageH: number = 0;
+  private pageGlobalY: number = 0;
+  private kbToken: number = 0;
+  private kbHeld: boolean = false;
+  private kbScrollTimer: number = -1;
+  private kbDismissTimer: number = -1;
+  private kbSettleTimer: number = -1;
+  private kbScrollPendingDelta: number = 0;
+  private kbScrolling: boolean = false;
 
   @State private msgs: Message[] = [];
   @State private total: number = 0;
@@ -147,8 +163,11 @@ export struct ChatPage {
   @State private atBottom: boolean = true;
 
   @State private draft: string = '';
-  @State private sending: boolean = false;
+  @State @Watch('onSendingChange') private sending: boolean = false;
   @State @Watch('onRunningChange') private running: boolean = false;
+  private static lastFlowVariant: number = -1;
+  @State private flowVariant: number = 0;
+  private flowWasActive: boolean = false;
   @State private pendImgs: ImagePart[] = [];
   @State private pendFiles: FilePart[] = [];
   @State private queueItems: QueuedItem[] = [];
@@ -212,6 +231,12 @@ export struct ChatPage {
   @State private menuMsg: Message | null = null;
   @State private asks: PendingAsk[] = [];
   @State private extrasMode: string = '';
+  @State private webConsoleOn: boolean = false;
+  @State private composerPressed: boolean = false;
+  @State private composerTouchXPct: number = 50;
+  @State private composerTouchYPct: number = 50;
+  private composerW: number = 340;
+  private composerH: number = 104;
 
   @State private err: string = '';
   @State private errCard: string = '';
@@ -221,6 +246,8 @@ export struct ChatPage {
   private sseActive: boolean = false;
   private poller: number = 0;
   @State private dotOn: number = 0;
+  @State private hdrEntered: boolean = true;
+  private hdrTimer: number = -1;
   private dotTimer: number = 0;
   private alive: boolean = false;
   private gen: number = 0;
@@ -232,6 +259,15 @@ export struct ChatPage {
   aboutToAppear(): void {
     this.alive = true;
     this.gen++;
+    if (Motion.isFlagship(this.motionMode)) {
+      this.hdrEntered = false;
+      this.hdrTimer = setTimeout(() => {
+        this.hdrTimer = -1;
+        this.hdrEntered = true;
+      }, 24);
+    } else {
+      this.hdrEntered = true;
+    }
     this.initialMaxSeq = Number.MAX_SAFE_INTEGER;
     this.seenSeqs.clear();
     this.pinKeyboard();
@@ -240,6 +276,7 @@ export struct ChatPage {
     Unread.markRead(this.param.id);
     this.draft = Drafts.get(this.param.id);
     AppStorage.setOrCreate('openSession', this.param.id);
+    AppStorage.setOrCreate('pendingOpenSession', '');
     this.curModelId = this.param.model ?? '';
     this.curModel = '';
     this.curEffort = this.param.effort ?? '';
@@ -264,6 +301,10 @@ export struct ChatPage {
     AppStorage.setOrCreate('openSession', '');
     this.alive = false;
     this.gen++;
+    if (this.hdrTimer >= 0) {
+      clearTimeout(this.hdrTimer);
+      this.hdrTimer = -1;
+    }
     if (this.retryTimer !== 0) {
       clearTimeout(this.retryTimer);
       this.retryTimer = 0;
@@ -276,6 +317,8 @@ export struct ChatPage {
   private onAppFgChange(): void {
     if (!this.alive) return;
     if (this.appFg === true) {
+      this.acquireKbPin();
+      this.refreshWinHeight();
       Unread.markRead(this.param.id);
       void this.refreshSoft();
       this.startRealtimeStream();
@@ -291,7 +334,26 @@ export struct ChatPage {
     }
   }
 
+  private isComposerFlowActive(): boolean {
+    return (this.running || this.sending) && Motion.isVivid(this.motionMode);
+  }
+
+  private syncFlowVariant(): void {
+    const now: boolean = this.isComposerFlowActive();
+    if (now && !this.flowWasActive) {
+      const next: number = pickNextAiFlowVariant(ChatPage.lastFlowVariant);
+      ChatPage.lastFlowVariant = next;
+      this.flowVariant = next;
+    }
+    this.flowWasActive = now;
+  }
+
+  private onSendingChange(): void {
+    this.syncFlowVariant();
+  }
+
   private onRunningChange(): void {
+    this.syncFlowVariant();
     if (this.running && this.alive) {
       if (this.dotTimer === 0) {
         this.dotTimer = setInterval(() => {
@@ -319,26 +381,82 @@ export struct ChatPage {
 
   // ---------- 键盘避让（U5 / M2） ----------
 
+  private acquireKbPin(): void {
+    if (this.kbToken === 0) {
+      this.kbToken = SafeArea.nextKbToken();
+    }
+    this.kbHeld = true;
+    try {
+      SafeArea.holdKeyboardNone(this.kbToken, this.getUIContext());
+    } catch (_e) {
+      SafeArea.holdKeyboardNone(this.kbToken);
+    }
+  }
+
+  private releaseKbPin(): void {
+    if (this.kbHeld && this.kbToken !== 0) {
+      this.kbHeld = false;
+      try {
+        SafeArea.releaseKeyboardNone(this.kbToken, this.getUIContext());
+      } catch (_e) {
+        SafeArea.releaseKeyboardNone(this.kbToken);
+      }
+    }
+  }
+
+  private clearKbTimers(): void {
+    if (this.kbScrollTimer >= 0) {
+      clearTimeout(this.kbScrollTimer);
+      this.kbScrollTimer = -1;
+    }
+    if (this.kbDismissTimer >= 0) {
+      clearTimeout(this.kbDismissTimer);
+      this.kbDismissTimer = -1;
+    }
+    if (this.kbSettleTimer >= 0) {
+      clearTimeout(this.kbSettleTimer);
+      this.kbSettleTimer = -1;
+    }
+    this.kbScrollPendingDelta = 0;
+    this.kbScrolling = false;
+  }
+
+  private refreshWinHeight(): void {
+    if (this.kwWin === null) {
+      return;
+    }
+    try {
+      const hVp: number = AppCtx.px2vp(this.kwWin.getWindowProperties().windowRect.height);
+      if (hVp > 0) {
+        this.winH = hVp;
+      }
+    } catch (_e) {}
+  }
+
+  private padForKb(kb: number): number {
+    return kb > 0 ? (kb + 10) : Math.max(20, this.bottomInset + 6);
+  }
+
   private pinKeyboard(): void {
-    try { this.getUIContext().setKeyboardAvoidMode(KbMode.NONE); } catch (e) {}
+    this.acquireKbPin();
     window.getLastWindow(AppCtx.ability()).then((w: window.Window) => {
       if (!this.alive) return;
       this.kwWin = w;
-      try {
-        this.winH = AppCtx.px2vp(w.getWindowProperties().windowRect.height);
-      } catch (e) {
-        this.winH = 0;
-      }
+      this.refreshWinHeight();
+      this.acquireKbPin();
       this.kwCb = (h: number) => {
         this.kwRep = h > 0 ? AppCtx.px2vp(h) : 0;
+        this.refreshWinHeight();
         this.applyKb();
       };
       w.on('keyboardHeightChange', this.kwCb);
       this.kwAvoidCb = (data: window.AvoidAreaOptions) => {
+        if (data.type !== window.AvoidAreaType.TYPE_KEYBOARD) return;
         const area: window.AvoidArea = data.area;
         const px: number = area === undefined || area.bottomRect === undefined ? 0 : area.bottomRect.height;
         this.kwAvoid = px > 0 ? AppCtx.px2vp(px) : 0;
         this.kwAvoidSeen = true;
+        this.refreshWinHeight();
         this.applyKb();
       };
       w.on('avoidAreaChange', this.kwAvoidCb);
@@ -346,22 +464,122 @@ export struct ChatPage {
   }
 
   private applyKb(): void {
-    const next: number = resolveKeyboardHeightVp(this.kwRep, this.kwAvoid, this.kwAvoidSeen, this.winH);
-    if (Math.abs(next - this.kbH) > 0.5) {
-      const wasBottom: boolean = this.atBottom;
-      const rising: boolean = next > this.kbH;
+    this.refreshWinHeight();
+    const rawNext: number = resolveKeyboardHeightVp(this.kwRep, this.kwAvoid, this.kwAvoidSeen, this.winH);
+    const next: number = clampKeyboardByContainer(rawNext, this.winH, this.pageH, this.pageGlobalY);
+    if (Math.abs(next - this.kbH) <= 0.5) {
+      if (this.kbDismissTimer < 0 && Math.abs(this.listKbPad - next) > 0.5) {
+        this.listKbPad = next;
+      }
+      return;
+    }
+
+    const prevKb: number = this.kbH;
+    const prevPad: number = this.padForKb(prevKb);
+    const nextPad: number = this.padForKb(next);
+    const deltaPad: number = nextPad - prevPad;
+    const rising: boolean = next > prevKb;
+    const wasBottom: boolean = this.atBottom || this.kbScrolling;
+
+    if (this.kbDismissTimer >= 0) {
+      clearTimeout(this.kbDismissTimer);
+      this.kbDismissTimer = -1;
+    }
+
+    if (rising) {
+      this.listKbPad = next;
       try {
-        this.getUIContext().animateTo({ duration: Motion.move, curve: Motion.std }, () => {
+        this.getUIContext().animateTo(Motion.kbComposerAnim(this.motionMode), () => {
           this.kbH = next;
         });
-      } catch (e) {
+      } catch (_e) {
         this.kbH = next;
       }
-      if (wasBottom && rising) {
-        setTimeout(() => {
-          if (this.alive) this.scroller.scrollEdge(Edge.Bottom);
-        }, 60);
+
+      if (wasBottom) {
+        this.kbScrolling = true;
+        this.kbScrollPendingDelta += deltaPad;
+        if (this.kbScrollTimer >= 0) {
+          clearTimeout(this.kbScrollTimer);
+        }
+        this.kbScrollTimer = setTimeout(() => {
+          this.kbScrollTimer = -1;
+          if (!this.alive) return;
+          const d: number = this.kbScrollPendingDelta;
+          this.kbScrollPendingDelta = 0;
+          if (d === 0) return;
+          const curY: number = this.scroller.currentOffset()?.yOffset ?? 0;
+          try {
+            this.scroller.scrollTo({
+              xOffset: 0,
+              yOffset: Math.max(0, curY + d + 2),
+              animation: {
+                duration: 480,
+                curve: Motion.kbListFollowCurve(this.motionMode),
+                canOverScroll: false
+              }
+            });
+          } catch (_e) {
+            this.scroller.scrollEdge(Edge.Bottom);
+          }
+        }, Motion.KB_LIST_LAG_RISE_MS);
+
+        if (this.kbSettleTimer >= 0) {
+          clearTimeout(this.kbSettleTimer);
+        }
+        this.kbSettleTimer = setTimeout(() => {
+          this.kbSettleTimer = -1;
+          this.kbScrolling = false;
+        }, 560);
       }
+    } else {
+      try {
+        this.getUIContext().animateTo(Motion.kbComposerAnim(this.motionMode), () => {
+          this.kbH = next;
+        });
+      } catch (_e) {
+        this.kbH = next;
+      }
+
+      this.kbScrolling = true;
+      this.kbScrollPendingDelta += deltaPad;
+      if (this.kbScrollTimer >= 0) {
+        clearTimeout(this.kbScrollTimer);
+      }
+      this.kbScrollTimer = setTimeout(() => {
+        this.kbScrollTimer = -1;
+        if (!this.alive) return;
+        const d: number = this.kbScrollPendingDelta;
+        this.kbScrollPendingDelta = 0;
+        const curY: number = this.scroller.currentOffset()?.yOffset ?? 0;
+        if (curY > 0 && d < 0) {
+          try {
+            this.scroller.scrollTo({
+              xOffset: 0,
+              yOffset: Math.max(0, curY + d),
+              animation: {
+                duration: 440,
+                curve: Motion.kbListFollowCurve(this.motionMode),
+                canOverScroll: false
+              }
+            });
+          } catch (_e) {}
+        }
+      }, Motion.KB_LIST_LAG_DISMISS_MS);
+
+      if (this.kbSettleTimer >= 0) {
+        clearTimeout(this.kbSettleTimer);
+        this.kbSettleTimer = -1;
+      }
+      this.kbDismissTimer = setTimeout(() => {
+        this.kbDismissTimer = -1;
+        if (!this.alive) return;
+        this.listKbPad = next;
+        this.kbScrolling = false;
+        try {
+          this.atBottom = this.scroller.isAtEnd();
+        } catch (_e) {}
+      }, 460);
     }
   }
 
@@ -372,6 +590,7 @@ export struct ChatPage {
     if (this.kwWin !== null && this.kwAvoidCb !== null) {
       try { this.kwWin.off('avoidAreaChange', this.kwAvoidCb); } catch (e) {}
     }
+    this.clearKbTimers();
     this.kwWin = null;
     this.kwCb = null;
     this.kwAvoidCb = null;
@@ -379,7 +598,8 @@ export struct ChatPage {
     this.kwAvoid = 0;
     this.kwAvoidSeen = false;
     this.kbH = 0;
-    try { this.getUIContext().setKeyboardAvoidMode(KbMode.RESIZE); } catch (e) {}
+    this.listKbPad = 0;
+    this.releaseKbPin();
   }
 
   private hideKb(): void {
@@ -1363,6 +1583,11 @@ export struct ChatPage {
       this.pendFiles = [];
       if (this.queueItems.length === 0) this.pendH = 0;
       this.pendingKey = '';
+      if (this.kbSettleTimer >= 0) {
+        clearTimeout(this.kbSettleTimer);
+        this.kbSettleTimer = -1;
+      }
+      this.kbScrolling = false;
       this.atBottom = true;
       await this.refreshSoft();
       setTimeout(() => { if (this.alive) this.scroller.scrollEdge(Edge.Bottom); }, 60);
@@ -1563,15 +1788,15 @@ export struct ChatPage {
   }
 
   private inputBottomPad(): number {
-    return this.kbH > 0 ? (this.kbH + 10) : Math.max(20, this.bottomInset + 6);
+    return this.padForKb(this.kbH);
   }
 
-  /** 列表底部真实占位高度：贴合底部输入总成实际高度，避免拉到底后与输入框间留出大块空白 */
+  /** 列表底部真实占位高度：由 listKbPad 独立控制，配合软键盘弹收做惯性错拍跟推 */
   private listBottomSpacerHeight(): number {
     const dockH: number = this.bottomStackH > 0
       ? this.bottomStackH
       : ((this.inputH > 0 ? this.inputH : 108) + this.pendH);
-    return dockH + this.inputBottomPad() + 6;
+    return dockH + this.padForKb(this.listKbPad) + 6;
   }
 
   private ctxUsed(): number {
@@ -1744,13 +1969,114 @@ export struct ChatPage {
       onStartRename: (): void => { this.hideKb(); this.renaming = true; },
       onTogglePin: (): void => { void this.togglePinSession(); },
       onForkSession: (): void => { void this.forkWholeSession(); },
-      onOpenSearch: (): void => { this.searchOn = true; },
+      onOpenSearch: (): void => {
+        this.getUIContext().animateTo(Motion.moveOpts(this.motionMode), () => {
+          this.searchOn = true;
+        });
+      },
       onExportMd: (): void => { void this.exportMd(); },
       onOpenPresets: (): void => { this.openPresetsPage(); },
+      onOpenWebConsole: (): void => { this.hideKb(); this.webConsoleOn = true; },
       onRefresh: (): void => { void this.refreshSoft(); },
       onArchive: (): void => { void this.archiveCurrentSession(); },
       onDismiss: (): void => { this.menuOn = false; }
     })
+  }
+
+  private openBigImg(url: string, geoId: string): void {
+    if (Motion.isVivid(this.motionMode) && geoId !== '') {
+      this.bigImgGeoId = geoId;
+      this.getUIContext().animateTo(Motion.moveOpts(this.motionMode), () => {
+        this.bigImg = url;
+      });
+    } else {
+      this.bigImgGeoId = '';
+      this.bigImg = url;
+    }
+  }
+
+  private buildComposerEffect(): VisualEffect {
+    if (!this.hdsOn) {
+      const offLight: hdsEffect.PointLightEffect = {
+        sourceType: hdsEffect.PointLightSourceType.NONE,
+        illuminatedType: hdsEffect.PointLightIlluminatedType.NONE
+      };
+      return new hdsEffect.HdsEffectBuilder()
+        .pointLight(offLight)
+        .pressShadow(hdsEffect.PressShadowType.NONE)
+        .buildEffect();
+    }
+    const lightOpts: hdsEffect.PointLightOptions = {
+      color: this.themeDark ? '#CCFFFFFF' : '#FFFFFFFF',
+      intensity: this.composerPressed ? 1.45 : 0.92,
+      height: 46,
+      bloom: this.composerPressed ? 0.85 : 0.42
+    };
+    const lightEff: hdsEffect.PointLightEffect = {
+      sourceType: hdsEffect.PointLightSourceType.BRIGHT,
+      illuminatedType: hdsEffect.PointLightIlluminatedType.DEFAULT_FEATHERING_BORDER,
+      options: lightOpts
+    };
+    return new hdsEffect.HdsEffectBuilder()
+      .pointLight(lightEff)
+      .pressShadow(hdsEffect.PressShadowType.BLEND_GRADIENT)
+      .buildEffect();
+  }
+
+  @Builder
+  private composerGlowOverlay() {
+    Stack() {
+      // 1. 沉浸光感非均一折射高光与顶边晶体棱线
+      if (this.hdsOn) {
+        Row()
+          .width('100%')
+          .height('100%')
+          .linearGradient({
+            angle: 155,
+            colors: this.themeDark
+              ? [['#1AFFFFFF', 0.0], ['#06FFFFFF', 0.32], ['#00FFFFFF', 0.66], ['#0D94B8FF', 1.0]]
+              : [['#38FFFFFF', 0.0], ['#10FFFFFF', 0.34], ['#00FFFFFF', 0.68], ['#0F3B6EF6', 1.0]]
+          })
+          .hitTestBehavior(HitTestMode.None)
+
+        Row()
+          .width('86%')
+          .height(1)
+          .linearGradient({
+            angle: 90,
+            colors: [
+              ['#00FFFFFF', 0.0],
+              [this.themeDark ? '#4DFFFFFF' : '#CCFFFFFF', 0.5],
+              ['#00FFFFFF', 1.0]
+            ]
+          })
+          .position({ x: '7%', y: 0 })
+          .hitTestBehavior(HitTestMode.None)
+
+        // 2. 点击跟手径向高光晕染
+        Row()
+          .width('100%')
+          .height('100%')
+          .radialGradient({
+            center: [String(this.composerTouchXPct) + '%', String(this.composerTouchYPct) + '%'],
+            radius: 150,
+            colors: this.themeDark
+              ? [['#42FFFFFF', 0.0], ['#1CA6C8FF', 0.42], ['#00FFFFFF', 1.0]]
+              : [['#85FFFFFF', 0.0], ['#303B6EF6', 0.42], ['#00FFFFFF', 1.0]]
+          })
+          .opacity(this.composerPressed ? 1 : 0)
+          .animation(Motion.flagshipSnappy())
+          .hitTestBehavior(HitTestMode.None)
+      }
+
+      // 3. AI 待回复多风格液态水波纹（仅挂载在输入框上）
+      if (this.isComposerFlowActive()) {
+        AiFlowGlow({ radius: Tokens.rCard, glowOpacity: 0.62, variant: this.flowVariant })
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .hitTestBehavior(HitTestMode.None)
   }
 
   /** HDS 标题栏内容：放回 HdsNavDestination.titleBar 以激活 HarmonyOS 6 真实沉浸光感材质，并保持四控件单行水平居中对齐 */
@@ -1765,6 +2091,11 @@ export struct ChatPage {
             onTap: (): void => { this.stack.pop(); }
           })
             .accessibilityText('返回')
+            .animation(null)
+            .opacity(this.hdrEntered ? 1 : 0)
+            .animation(Motion.headerPopOpacityAnim(Motion.HEADER_DELAY_BACK, this.motionMode, 180))
+            .translate({ x: this.hdrEntered ? 0 : Motion.HEADER_SLIDE_BACK_X })
+            .animation(Motion.headerPopScaleAnim(Motion.HEADER_DELAY_BACK, this.motionMode))
 
           HeaderTitleCapsule({
             title: this.titleNow !== '' ? this.titleNow : '会话',
@@ -1778,6 +2109,11 @@ export struct ChatPage {
             }
           })
             .layoutWeight(1)
+            .animation(null)
+            .opacity(this.hdrEntered ? 1 : 0)
+            .animation(Motion.headerPopOpacityAnim(Motion.HEADER_DELAY_TITLE, this.motionMode, 200))
+            .translate({ x: this.hdrEntered ? 0 : Motion.HEADER_SLIDE_TITLE_X })
+            .animation(Motion.headerTitleSlideAnim(Motion.HEADER_DELAY_TITLE, this.motionMode))
 
           HeaderCirclePill({
             glyph: 'stats',
@@ -1785,6 +2121,11 @@ export struct ChatPage {
             onTap: (): void => { this.hideKb(); this.statsOn = true; }
           })
             .accessibilityText('上下文与统计')
+            .animation(null)
+            .opacity(this.hdrEntered ? 1 : 0)
+            .animation(Motion.headerPopOpacityAnim(Motion.HEADER_DELAY_RIGHT_INNER, this.motionMode, 220))
+            .translate({ x: this.hdrEntered ? 0 : Motion.HEADER_SLIDE_RIGHT_INNER_X })
+            .animation(Motion.headerPopScaleAnim(Motion.HEADER_DELAY_RIGHT_INNER, this.motionMode))
 
           HeaderCirclePill({
             glyph: '···',
@@ -1792,6 +2133,11 @@ export struct ChatPage {
             onTap: (): void => { this.hideKb(); this.menuOn = true; }
           })
             .accessibilityText('更多菜单')
+            .animation(null)
+            .opacity(this.hdrEntered ? 1 : 0)
+            .animation(Motion.headerPopOpacityAnim(Motion.HEADER_DELAY_RIGHT_OUTER, this.motionMode, 220))
+            .translate({ x: this.hdrEntered ? 0 : Motion.HEADER_SLIDE_RIGHT_OUTER_X })
+            .animation(Motion.headerPopScaleAnim(Motion.HEADER_DELAY_RIGHT_OUTER, this.motionMode))
             .bindPopup(this.menuOn, Mat.popupOpts(
               this.hdsOn,
               (): void => { this.chatMenuBuilder(); },
@@ -1799,9 +2145,7 @@ export struct ChatPage {
               { x: 0, y: 6 },
               (vis: boolean): void => { if (!vis) this.menuOn = false; },
               20,
-              TransitionEffect.OPACITY
-                .combine(TransitionEffect.scale({ x: 0.94, y: 0.94, centerX: '100%', centerY: '0%' }))
-                .animation({ duration: Motion.fade, curve: Motion.std })
+              Motion.popupMenuTransition(this.motionMode, true)
             ))
         }
         .width('100%')
@@ -1899,7 +2243,7 @@ export struct ChatPage {
                     isStreaming: this.running && i === this.msgs.length - 1,
                     canFork: this.sessionCaps().fork,
                     api: this.api,
-                    onPreviewImage: (url: string): void => { this.bigImg = url; },
+                    onPreviewImage: (url: string, geoId: string): void => { this.openBigImg(url, geoId); },
                     onFork: (target: Message): void => { void this.forkAt(target); },
                     onLongPress: (target: Message): void => {
                       this.menuMsg = target;
@@ -1915,11 +2259,7 @@ export struct ChatPage {
               .alignItems(HorizontalAlign.Center)
             }
             .transition(this.shouldAnimateBubble(m)
-              ? TransitionEffect.asymmetric(
-                  TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std })
-                    .combine(TransitionEffect.translate({ y: 8 }).animation({ duration: Motion.move, curve: Motion.std })),
-                  TransitionEffect.IDENTITY
-                )
+              ? Motion.bubbleTransition(this.motionMode)
               : TransitionEffect.IDENTITY)
           }, (m: Message) => buildMsgForEachKey(m))
 
@@ -1936,7 +2276,7 @@ export struct ChatPage {
               .width('100%')
               .alignItems(HorizontalAlign.Center)
             }
-            .transition(TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std }))
+            .transition(Motion.panelTransition(this.motionMode))
           }
 
           if (this.errCard !== '') {
@@ -1972,11 +2312,20 @@ export struct ChatPage {
         .padding({ left: 14, right: 14 })
         .scrollBar(BarState.Off)
         .edgeEffect(EdgeEffect.Spring)
-        .onDidScroll(() => { try { this.atBottom = this.scroller.isAtEnd(); } catch (e) {} })
+        .onDidScroll(() => {
+          if (!this.kbScrolling) {
+            try { this.atBottom = this.scroller.isAtEnd(); } catch (e) {}
+          }
+        })
+        .onTouch((e: TouchEvent) => {
+          if (e.type === TouchType.Down && this.kbScrolling) {
+            this.kbScrolling = false;
+          }
+        })
         .hitTestBehavior(HitTestMode.Transparent)
 
         // 顶部柔和渐隐/非沉浸回退衬板（四枚顶栏控件已归位至 HdsNavDestination.titleBar 以启用真实沉浸光感）
-        if (!this.bigEditOn && this.extrasMode === '' && !this.searchOn) {
+        if (!this.bigEditOn && this.extrasMode === '' && !this.searchOn && !this.webConsoleOn) {
           ChatTopBackdrop({
             immersive: this.immersiveOn(),
             topInset: this.topInset
@@ -2092,7 +2441,7 @@ export struct ChatPage {
                 if (this.pendImgs.length > 0) {
                   PendingImages({
                     images: this.pendImgs,
-                    onPreview: (d: string): void => { this.bigImg = d; },
+                    onPreview: (d: string, geoId: string): void => { this.openBigImg(d, geoId); },
                     onRemove: (i: number): void => { this.dropImg(i); }
                   })
                 }
@@ -2148,13 +2497,17 @@ export struct ChatPage {
                       if (prev === '' && v === '/') {
                         this.slashOpened = true;
                         void this.loadHostCommands();
-                        this.getUIContext().animateTo({ duration: Motion.move, curve: Motion.std }, () => {
+                        this.getUIContext().animateTo(Motion.moveOpts(this.motionMode), () => {
                           this.attachOn = true;
                         });
                       } else if (this.slashOpened && (!v.startsWith('/') || v.indexOf(' ') >= 0 || v.indexOf('\n') >= 0)) {
                         this.slashOpened = false;
                         this.attachOn = false;
                       }
+                    })
+                    .onFocus(() => {
+                      this.acquireKbPin();
+                      this.refreshWinHeight();
                     })
                     .onSubmit(() => {
                       if (this.enterSend) void this.send();
@@ -2234,7 +2587,7 @@ export struct ChatPage {
                         void this.loadHostCommands();
                       }
                       this.slashOpened = false;
-                      this.getUIContext().animateTo({ duration: Motion.move, curve: Motion.std }, () => {
+                      this.getUIContext().animateTo(Motion.moveOpts(this.motionMode), () => {
                         this.attachOn = !this.attachOn;
                       });
                     },
@@ -2251,13 +2604,37 @@ export struct ChatPage {
               .width('100%')
               .padding({ top: 6, bottom: 6 })
               .backgroundColor(this.hdsOn ? Color.Transparent : Tokens.surface)
-              .backgroundEffect(Mat.glassEffect(this.hdsOn, this.attachOn || this.pendImgs.length > 0))
+              .backgroundEffect(Mat.composerGlassEffect(this.hdsOn, this.attachOn || this.pendImgs.length > 0))
+              .visualEffect(this.buildComposerEffect())
               .borderRadius(Tokens.rCard)
               .border(Mat.glassRimBorder(this.hdsOn))
               .shadow(Mat.glassFloatShadow(this.hdsOn))
+              .overlay(this.composerGlowOverlay())
+              .clip(true)
+              .onTouch((e: TouchEvent) => {
+                if (!this.hdsOn) {
+                  return;
+                }
+                if (e.touches !== undefined && e.touches.length > 0) {
+                  const w: number = this.composerW > 40 ? this.composerW : 340;
+                  const h: number = this.composerH > 30 ? this.composerH : 104;
+                  const xp: number = Math.round(Math.max(5, Math.min(95, (e.touches[0].x / w) * 100)));
+                  const yp: number = Math.round(Math.max(5, Math.min(95, (e.touches[0].y / h) * 100)));
+                  this.composerTouchXPct = xp;
+                  this.composerTouchYPct = yp;
+                }
+                if (e.type === TouchType.Down) {
+                  this.composerPressed = true;
+                } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
+                  this.composerPressed = false;
+                }
+              })
               .onAreaChange((oldValue: Area, newValue: Area) => {
+                const w: number = Number(newValue.width);
                 const h: number = Number(newValue.height);
+                if (w > 40) this.composerW = w;
                 if (h > 0 && Math.abs(h - this.inputH) > 1) this.inputH = h;
+                if (h > 0) this.composerH = h;
               })
             }
             .width('100%')
@@ -2294,6 +2671,14 @@ export struct ChatPage {
           })
         }
 
+        if (this.webConsoleOn) {
+          WebConsolePage({
+            api: this.api,
+            hostName: Machines.displayName(),
+            onExit: (): void => { this.webConsoleOn = false; }
+          })
+        }
+
         if (this.bigEditOn) {
           BigEditorOverlay({
             isQueueEdit: this.queueEditId !== '',
@@ -2324,7 +2709,11 @@ export struct ChatPage {
             msgs: this.msgs,
             kbH: this.kbH,
             onJump: (m: Message): void => { this.jumpToMessage(m); },
-            onClose: (): void => { this.searchOn = false; }
+            onClose: (): void => {
+              this.getUIContext().animateTo(Motion.moveOpts(this.motionMode), () => {
+                this.searchOn = false;
+              });
+            }
           })
         }
 
@@ -2380,11 +2769,28 @@ export struct ChatPage {
       }
       .width('100%')
       .height('100%')
+      .onAreaChange((_oldVal: Area, newVal: Area) => {
+        const h: number = Number(newVal.height);
+        const gy: number = Number(newVal.globalPosition.y);
+        const changed: boolean = (h > 100 && Math.abs(h - this.pageH) > 2) ||
+          (Number.isFinite(gy) && Math.abs(gy - this.pageGlobalY) > 2);
+        if (h > 100) {
+          this.pageH = h;
+        }
+        if (Number.isFinite(gy)) {
+          this.pageGlobalY = gy;
+        }
+        if (changed && (this.kwRep > 0 || this.kwAvoid > 0 || this.kbH > 0)) {
+          this.refreshWinHeight();
+          this.applyKb();
+        }
+      })
     }
-    .hideTitleBar(this.bigEditOn || this.extrasMode !== '' || this.searchOn)
+    .hideTitleBar(this.bigEditOn || this.extrasMode !== '' || this.searchOn || this.webConsoleOn)
     .titleBar(this.hdsTitle())
     .padding({ top: 0 })
     .onBackPressed(() => {
+      if (this.webConsoleOn) { this.webConsoleOn = false; return true; }
       if (this.extrasMode !== '') { this.extrasMode = ''; return true; }
       if (this.searchOn) { this.searchOn = false; return true; }
       if (this.bigEditOn) {
@@ -2412,5 +2818,17 @@ export struct ChatPage {
     .bindToScrollable([this.scroller])
     .backgroundColor(this.themeBg)
     .mode(NavDestinationMode.STANDARD)
+    .onShown(() => {
+      if (this.alive) {
+        this.acquireKbPin();
+        this.refreshWinHeight();
+      }
+    })
+    .onHidden(() => {
+      this.clearKbTimers();
+      this.kbH = 0;
+      this.listKbPad = 0;
+      this.releaseKbPin();
+    })
   }
 }

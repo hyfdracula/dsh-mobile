@@ -1,9 +1,10 @@
 import preferences from '@ohos.data.preferences';
 import ConfigurationConstant from '@ohos.app.ability.ConfigurationConstant';
 import { Configuration } from '@ohos.app.ability.Configuration';
+import { HdsNavDestination } from '@kit.UIDesignKit';
 import { Api } from '../common/Api';
 import { AppCtx } from '../common/AppCtx';
-import { AppIcon, ICON_LIGHT } from '../common/AppIcon';
+import { AppIcon, ICON_DARK } from '../common/AppIcon';
 import { isLanUrl } from '../common/ApiUtil';
 import { Tokens } from '../common/Tokens';
 import { ChatParam } from '../common/Types';
@@ -14,9 +15,14 @@ import { ChatPage } from '../view/ChatPage';
 import { PresetsPage } from '../view/PresetsPage';
 import { PairPage } from '../view/PairPage';
 import { ShellPage } from '../view/ShellPage';
+import { GlassToastHost } from '../common/GlassToastHost';
 import { Haptics } from '../common/Haptics';
+import { LinkLog } from '../common/LinkLog';
 import { Machines } from '../common/Machines';
+import { Mat } from '../common/Mat';
+import { Motion, MOTION_VIVID } from '../common/Motion';
 import { Net } from '../common/Net';
+import { PushBridge } from '../common/PushBridge';
 import { Secret } from '../common/Secret';
 import { Toast } from '../common/Toast';
 import { Unread } from '../common/Unread';
@@ -33,12 +39,15 @@ const PREF_STORE: string = 'dsh_mobile_cfg';
 @Component
 struct Index {
   @Provide('stack') stack: NavPathStack = new NavPathStack();
-  /** 全屏看图的地址：聊天页写，这里负责铺满整屏盖住标题栏 */
+  /** 全屏看图的地址与一镜到底 ID：聊天页写，这里负责铺满整屏盖住标题栏 */
   @StorageLink('bigImg') bigImg: string = '';
+  @StorageLink('bigImgGeoId') bigImgGeoId: string = '';
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
   @StorageLink('themeBg') themeBg: string = Tokens.bg;
   @StorageLink('themeRev') themeRev: number = 0;
   @StorageLink('sysConfigTick') @Watch('onSysConfigTick') sysConfigTick: number = 0;
   @StorageLink('netBearerTick') @Watch('onNetBearerTick') netBearerTick: number = 0;
+  @StorageLink('openSession') @Watch('onOpenSessionChange') openSession: string = '';
   @StorageLink('topInset') topInset: number = 40;
   @StorageLink('bottomInset') bottomInset: number = 20;
   @State private wanBase: string = DEFAULT_BASE;
@@ -51,10 +60,11 @@ struct Index {
   @State private machineName: string = '';
   @State private haptics: boolean = true;
   @State private hdsOn: boolean = true;
-  @StorageLink('appIconStyle') appIconStyle: string = ICON_LIGHT;
+  @StorageLink('appIconStyle') appIconStyle: string = ICON_DARK;
   @State private cfgLoaded: boolean = false;
   @State private privacyAccepted: boolean = false;
-  @State private legalKind: string = '';
+  @State private legalKind: LegalDocKind = 'privacy';
+  @State private legalOpen: boolean = false;
   /** 每次重建导航栈自增，40ms 延迟里若已变化就放弃回填 */
   private navRev: number = 0;
   /** 在线心跳定时器，-1 表示没在跑 */
@@ -78,6 +88,16 @@ struct Index {
     void this.refreshLan();
   }
 
+  private onOpenSessionChange(): void {
+    if (!this.privacyAccepted || this.token === '' || this.wanBase === '') {
+      return;
+    }
+    if (AppStorage.get<boolean>('appFg') === false) {
+      return;
+    }
+    this.sendPresenceOnce();
+  }
+
   private onSysConfigTick(): void {
     if (this.themeMode !== THEME_AUTO) {
       return;
@@ -96,6 +116,7 @@ struct Index {
    * 否则用户在系统里打开了通知，回到应用还显示「现在没开」。
    */
   onPageShow(): void {
+    LinkLog.record('APP', 'fg fromBg=' + (this.wasBackground ? '1' : '0'));
     AppStorage.setOrCreate('notifyProbe', Date.now());
     const fromBg: boolean = this.wasBackground;
     this.wasBackground = false;
@@ -119,6 +140,7 @@ struct Index {
   onPageHide(): void {
     this.wasBackground = true;
     AppStorage.setOrCreate('appFg', false);
+    LinkLog.record('APP', 'bg');
     this.stopPresence(true);
   }
 
@@ -137,6 +159,7 @@ struct Index {
         const pub: string = info.e2eePub !== undefined ? info.e2eePub : '';
         Machines.updateMeta(active.id, hid, pub, this.api.lanCandidates());
       }
+      void PushBridge.syncToGateway(this.api);
     } catch (e) {
       // 网络暂不可达时忽略，下次交互重试
     }
@@ -179,7 +202,7 @@ struct Index {
       return;
     }
     this.presenceBusy = true;
-    this.api.presence(true).catch(() => {
+    this.api.presence(true, this.openSession).catch(() => {
     }).finally(() => {
       this.presenceBusy = false;
     });
@@ -221,16 +244,26 @@ struct Index {
     AppCtx.clearWindow();
   }
 
+  private closeBigImg(): void {
+    if (Motion.isVivid(this.motionMode) && this.bigImgGeoId !== '') {
+      this.getUIContext().animateTo(Motion.moveOpts(this.motionMode), () => {
+        this.bigImg = '';
+      });
+    } else {
+      this.bigImg = '';
+    }
+  }
+
   /**
    * 系统返回键：优先关闭全屏看图和合规文档浮层，再退回设置二级页。
    */
   onBackPress(): boolean {
     if (this.bigImg !== '') {
-      this.bigImg = '';
+      this.closeBigImg();
       return true;
     }
-    if (this.legalKind !== '') {
-      this.legalKind = '';
+    if (this.legalOpen) {
+      this.legalOpen = false;
       return true;
     }
     const sub = AppStorage.get<string>('settingsSub');
@@ -264,10 +297,12 @@ struct Index {
       const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
       const pa = await p.get('privacyAccepted', '0') as string;
       this.privacyAccepted = pa === '1';
-      const wmc = await p.get('wcMobileCompat', '0') as string;
+      const wmc = await p.get('wcMobileCompat', '1') as string;
       const wmp = await p.get('wcAutoDismissPromo', '0') as string;
-      AppStorage.setOrCreate('wcMobileCompat', wmc === '1');
+      const mm = await p.get('motionMode', MOTION_VIVID) as string;
+      AppStorage.setOrCreate('wcMobileCompat', wmc !== '0');
       AppStorage.setOrCreate('wcAutoDismissPromo', wmp === '1');
+      AppStorage.setOrCreate('motionMode', Motion.normalize(mm));
 
       let b = await p.get('base', DEFAULT_BASE) as string;
       const tOldBase: string = b;
@@ -291,9 +326,10 @@ struct Index {
       const al = await p.get('autoLan', '') as string;
       const hp = await p.get('haptics', '1') as string;
       const hd = await p.get('hdsOn', '1') as string;
-      const ic = await p.get('appIconStyle', ICON_LIGHT) as string;
+      const ic = await p.get('appIconStyle', ICON_DARK) as string;
       const nd = await p.get('notifyDone', '1') as string;
       const nb = await p.get('notifyBgOnly', '1') as string;
+      const nst = await p.get('notifyShowTitle', '1') as string;
       const es = await p.get('enterSend', '1') as string;
       const ch = await p.get('compactHistory', '0') as string;
       const ts = await p.get('textScale', '1') as string;
@@ -301,6 +337,7 @@ struct Index {
       void AppIcon.init();
       AppStorage.setOrCreate('notifyDone', nd !== '0');
       AppStorage.setOrCreate('notifyBgOnly', nb !== '0');
+      AppStorage.setOrCreate('notifyShowTitle', nst !== '0');
       AppStorage.setOrCreate('enterSend', es !== '0');
       AppStorage.setOrCreate('compactHistory', ch === '1');
       const tsN: number = Number(ts);
@@ -361,11 +398,13 @@ struct Index {
           curE2eePub
         );
         this.applyNetMode();
+        PushBridge.bindApi(this.api);
         this.machineName = Machines.displayName();
         Unread.refresh();
         console.info('DSH_CFG loaded base=' + b + ' netMode=' + this.netMode + ' lan=' + (lanSaved !== '' ? lanSaved : '-'));
         if (this.privacyAccepted) {
           void this.syncHostMeta();
+          void PushBridge.syncToGateway(this.api);
         }
       }
       if (th !== this.themeMode) {
@@ -374,10 +413,13 @@ struct Index {
       }
       if (this.privacyAccepted) {
         Net.start();
+        PushBridge.activateAfterPrivacy();
         if (this.token !== '' && this.wanBase !== '') {
           this.startPresence();
         }
       }
+      LinkLog.record('APP', 'cfgLoaded motion=' + Motion.normalize(mm) + ' hds=' + (this.hdsOn ? '1' : '0') +
+        ' netMode=' + this.netMode + ' hosts=' + String(Machines.list().length));
     } catch (e) {
       console.error('DSH_CFG load failed :: ' + (e as Error).message);
     } finally {
@@ -389,6 +431,7 @@ struct Index {
     Haptics.soft();
     this.privacyAccepted = true;
     Net.start();
+    PushBridge.activateAfterPrivacy();
     try {
       const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
       await p.put('privacyAccepted', '1');
@@ -461,6 +504,7 @@ struct Index {
     Unread.refresh();
     AppStorage.setOrCreate('listDirty', Date.now());
     this.applyNetMode();
+    PushBridge.bindApi(this.api);
     try {
       const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
       await p.put('base', saved.wan);
@@ -474,11 +518,13 @@ struct Index {
     if (this.privacyAccepted) {
       this.startPresence();
       void this.syncHostMeta();
+      void PushBridge.syncToGateway(this.api, true);
     }
   }
 
   /** 清空当前活跃配对并停止网络活动。 */
   private async clearActivePairing(): Promise<void> {
+    void PushBridge.unregisterGateway(this.api);
     this.stopPresence(false);
     this.wanBase = '';
     this.token = '';
@@ -538,6 +584,7 @@ struct Index {
     this.bumpMachineEpoch();
     Unread.refresh();
     this.applyNetMode();
+    PushBridge.bindApi(this.api);
     try {
       const p = await preferences.getPreferences(AppCtx.ability(), PREF_STORE);
       await p.put('base', m.wan);
@@ -553,6 +600,7 @@ struct Index {
     if (this.privacyAccepted) {
       this.startPresence();
       void this.syncHostMeta();
+      void PushBridge.syncToGateway(this.api, true);
     }
   }
 
@@ -643,7 +691,7 @@ struct Index {
     Haptics.enabled = v;
     const seq: number = ++this.hapticsSeq;
     if (v) {
-      Haptics.soft();
+      Haptics.toggle(true);
     }
     console.info('DSH_HAP enabled=' + v + ' seq=' + seq);
     try {
@@ -663,7 +711,7 @@ struct Index {
     this.hdsOn = v;
     AppStorage.setOrCreate('hdsOn', v);
     if (v) {
-      Haptics.soft();
+      Haptics.toggle(true);
     }
     console.info('DSH_HDS switch=' + v);
     try {
@@ -682,7 +730,7 @@ struct Index {
         .width(84)
         .height(84)
         .objectFit(ImageFit.Contain)
-      Text('Agent Mobile')
+      Text('Agent远程控制台')
         .fontSize(20)
         .fontWeight(FontWeight.Bold)
         .fontColor(Tokens.fg)
@@ -706,11 +754,11 @@ struct Index {
             .height(64)
             .borderRadius(16)
             .border({ width: 0.5, color: Tokens.line })
-          Text('欢迎使用 Agent Mobile')
+          Text('欢迎使用 Agent远程控制台')
             .fontSize(21)
             .fontWeight(FontWeight.Bold)
             .fontColor(Tokens.fg)
-          Text('Agent Mobile 是一款智能体远程控制与对话客户端，仅在你主动配对后连接你自己的电脑网关服务。我们不会收集你的聊天记录或上传无关个人数据。')
+          Text('Agent远程控制台是一款智能体远程控制与对话客户端，仅在你主动配对后连接你自己的电脑网关服务。我们不会收集你的聊天记录或上传无关个人数据。')
             .fontSize(Tokens.fsBody)
             .fontColor(Tokens.dim)
             .lineHeight(21)
@@ -733,6 +781,7 @@ struct Index {
               .onClick(() => {
                 Haptics.tap();
                 this.legalKind = 'privacy';
+                this.legalOpen = true;
               })
             Text('《用户协议》')
               .fontSize(Tokens.fsCaption)
@@ -741,6 +790,7 @@ struct Index {
               .onClick(() => {
                 Haptics.tap();
                 this.legalKind = 'terms';
+                this.legalOpen = true;
               })
           }
           .width('100%')
@@ -788,19 +838,24 @@ struct Index {
       .width('100%')
       .padding({ left: 20, right: 20 })
       .alignItems(HorizontalAlign.Center)
-
-      if (this.legalKind !== '') {
-        LegalSheet({
-          kind: this.legalKind as LegalDocKind,
-          onClose: () => {
-            this.legalKind = '';
-          }
-        })
-      }
     }
     .width('100%')
     .height('100%')
     .backgroundColor(this.themeBg)
+    .bindSheet($$this.legalOpen, this.legalSheetView(),
+      Mat.sheetOpts(this.hdsOn, '74%', () => {
+        this.legalOpen = false;
+      }))
+  }
+
+  @Builder
+  legalSheetView() {
+    LegalSheet({
+      kind: this.legalKind,
+      onClose: () => {
+        this.legalOpen = false;
+      }
+    })
   }
 
   @Builder
@@ -809,6 +864,29 @@ struct Index {
       ChatPage({ api: this.api, param: param })
     } else if (name === 'presets') {
       PresetsPage({ api: this.api, param: param })
+    } else if (name === 'pair_prepare' || name === 'pair_connect') {
+      HdsNavDestination() {
+        PairPage({
+          api: this.api,
+          defaultBase: '',
+          mode: name === 'pair_prepare' ? 'prepare' : 'connect',
+          hasBack: true,
+          popHeader: true,
+          onExit: () => {
+            this.stack.pop();
+          },
+          onGoOtherStep: () => {
+            this.stack.pop();
+          },
+          onPaired: (b: string, t: string, host: string, lan: string[], hostId?: string, e2eePub?: string) => {
+            this.stack.clear(false);
+            void this.saveCfg(b, t, lan, host, hostId !== undefined ? hostId : '', e2eePub !== undefined ? e2eePub : '');
+          }
+        })
+      }
+      .hideTitleBar(true)
+      .hideBackButton(true)
+      .backgroundColor(this.themeBg)
     }
   }
 
@@ -879,8 +957,13 @@ struct Index {
               PairPage({
                 api: this.api,
                 defaultBase: '',
+                mode: 'connect',
                 hasBack: false,
+                popHeader: false,
                 onExit: () => {
+                },
+                onGoOtherStep: () => {
+                  this.stack.pushPathByName('pair_prepare', null);
                 },
                 onPaired: (b: string, t: string, host: string, lan: string[], hostId?: string, e2eePub?: string) => {
                   void this.saveCfg(b, t, lan, host, hostId !== undefined ? hostId : '', e2eePub !== undefined ? e2eePub : '');
@@ -900,23 +983,32 @@ struct Index {
         .height('100%')
       }
 
-      // 全屏看图：挂在 Navigation 外面，才能盖住状态栏和标题栏
+      // 旗舰液态玻璃弹簧 Toast 顶层宿主（外层声明 HitTestMode.None 彻底透传全部触控）
+      Row() {
+        GlassToastHost()
+      }
+      .width('100%')
+      .height('100%')
+      .hitTestBehavior(HitTestMode.None)
+
+      // 全屏看图：挂在 Navigation 外面，才能盖住状态栏和标题栏；灵动档启用 geometryTransition 一镜到底
       if (this.bigImg !== '') {
         Stack({ alignContent: Alignment.Center }) {
           Row()
             .width('100%')
             .height('100%')
             .backgroundColor('#F2000000')
+            .transition(TransitionEffect.OPACITY.animation({ duration: Motion.fade, curve: Motion.std }))
           Image(this.bigImg)
             .width('100%')
             .objectFit(ImageFit.Contain)
+            .geometryTransition(Motion.geoId(this.bigImgGeoId, this.motionMode), { follow: false })
         }
         .width('100%')
         .height('100%')
         .onClick(() => {
-          this.bigImg = '';
+          this.closeBigImg();
         })
-        .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
       }
     }
     .width('100%')

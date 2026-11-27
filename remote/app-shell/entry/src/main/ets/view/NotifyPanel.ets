@@ -1,9 +1,13 @@
 import notificationManager from '@ohos.notificationManager';
 import { Want } from '@kit.AbilityKit';
+import { Api } from '../common/Api';
+import { PushStatusResp, PushTestResp } from '../common/ApiTypes';
 import { AppCtx } from '../common/AppCtx';
 import { Haptics } from '../common/Haptics';
 import { Mat } from '../common/Mat';
+import { Motion, MOTION_VIVID } from '../common/Motion';
 import { Notifier } from '../common/Notifier';
+import { PushBridge } from '../common/PushBridge';
 import { Toast } from '../common/Toast';
 import { Tokens } from '../common/Tokens';
 import { Unread } from '../common/Unread';
@@ -11,14 +15,17 @@ import { HintLabel, RowSwitch } from '../common/Widgets';
 
 /**
  * 「通知」面板：
- * 顶部展示系统通知权限卡片，紧随提醒偏好（主开关关闭时禁用仅后台提醒）与测试/未读清理操作。
+ * 顶部展示系统通知权限卡片，紧随提醒偏好、Push Kit 后台通道状态与测试/未读清理操作。
  */
 @Component
 export struct NotifyPanel {
+  api: Api = new Api('', '');
   @Prop done: boolean = true;
   @Prop bgOnly: boolean = true;
+  @Prop showTitle: boolean = true;
   onDone: (v: boolean) => void = () => {};
   onBgOnly: (v: boolean) => void = () => {};
+  onShowTitle: (v: boolean) => void = () => {};
   onClearUnread?: () => void;
 
   @State private allowed: boolean = false;
@@ -26,17 +33,45 @@ export struct NotifyPanel {
   @StorageLink('unreadCount') unreadCount: number = 0;
   @StorageLink('hdsOn') hdsOn: boolean = true;
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
+  @StorageLink('pushState') pushState: string = 'idle';
+  @StorageLink('pushBindState') pushBindState: string = 'idle';
+  @StorageLink('pushTokenPreview') pushTokenPreview: string = '';
+  @StorageLink('pushErrMsg') pushErrMsg: string = '';
+  @StorageLink('pushSynced') pushSynced: boolean = false;
+  @State private relayLoading: boolean = false;
+  @State private relayOk: boolean = false;
+  @State private relayConfigured: boolean = false;
+  @State private relayErr: string = '';
+  @State private testPushBusy: boolean = false;
+  @State private rotateBusy: boolean = false;
+  @State private entered: boolean = true;
   private pollTimer: number = -1;
+  private enterTimer: number = -1;
 
   aboutToAppear(): void {
+    if (Motion.isFlagship(this.motionMode)) {
+      this.entered = false;
+      this.enterTimer = setTimeout(() => {
+        this.enterTimer = -1;
+        this.entered = true;
+      }, 16);
+    } else {
+      this.entered = true;
+    }
     Unread.count();
     void this.refreshPermission();
+    void this.refreshPushChannel(false);
   }
 
   aboutToDisappear(): void {
     if (this.pollTimer >= 0) {
       clearInterval(this.pollTimer);
       this.pollTimer = -1;
+    }
+    if (this.enterTimer >= 0) {
+      clearTimeout(this.enterTimer);
+      this.enterTimer = -1;
     }
   }
 
@@ -112,9 +147,136 @@ export struct NotifyPanel {
     return this.unreadCount > 0 ? ('当前 ' + String(this.unreadCount) + ' 条未读') : '暂无未读';
   }
 
+  private async refreshPushChannel(retryToken: boolean): Promise<void> {
+    if (this.relayLoading) {
+      return;
+    }
+    this.relayLoading = true;
+    try {
+      if (retryToken) {
+        await PushBridge.refreshToken();
+      }
+      if (this.api.currentBase() === '') {
+        this.relayOk = false;
+        this.relayConfigured = false;
+        this.relayErr = '未连接电脑网关，无法同步 Push Token';
+        return;
+      }
+      if (PushBridge.hasToken()) {
+        await PushBridge.syncToGateway(this.api, retryToken);
+      }
+      const st: PushStatusResp | null = await PushBridge.fetchGatewayStatus(this.api);
+      if (st === null) {
+        this.relayOk = false;
+        this.relayConfigured = false;
+        this.relayErr = '无法读取电脑网关推送状态（请确认网关已更新并保持在线）';
+        return;
+      }
+      this.relayOk = st.relayOk === true;
+      this.relayConfigured = st.relayConfigured === true;
+      this.relayErr = st.relayError !== undefined ? st.relayError : '';
+    } finally {
+      this.relayLoading = false;
+    }
+  }
+
+  private pushBadgeText(): string {
+    if (this.pushState === 'ready' && this.relayConfigured) {
+      return '通道就绪';
+    }
+    if (this.pushState === 'ready') {
+      return '待配中继';
+    }
+    if (this.pushState === 'loading' || this.relayLoading) {
+      return '检测中';
+    }
+    return '暂不可用';
+  }
+
+  private pushBadgeReady(): boolean {
+    return this.pushState === 'ready' && this.relayConfigured;
+  }
+
+  private pushDetailText(): string {
+    if (this.pushState === 'ready') {
+      const tokPart: string = this.pushTokenPreview !== '' ? ('设备令牌 ' + this.pushTokenPreview) : '已获取设备令牌';
+      if (this.pushBindState === 'relay_pending_deploy') {
+        return tokPart + ' · 云端中继待部署 /v1/push/bind 后即可完成防刷绑定';
+      }
+      if (this.relayConfigured) {
+        if (this.pushBindState === 'bound' && this.pushSynced) {
+          return tokPart + ' · 已绑定防刷凭据并同步至电脑网关与云端中继';
+        }
+        if (this.pushBindState === 'bound') {
+          return tokPart + ' · 已领取防刷凭据，待同步至电脑网关';
+        }
+        return tokPart + (this.pushSynced ? ' · 已同步至电脑网关，点击刷新状态完成防刷绑定' : ' · 待绑定防刷凭据');
+      }
+      if (this.api.currentBase() === '') {
+        return tokPart + ' · 请先连接电脑端网关';
+      }
+      if (this.relayOk) {
+        return tokPart + ' · 云端中继已在线，但尚未填入华为 AGC 服务账号密钥';
+      }
+      return tokPart + (this.relayErr !== '' ? (' · ' + this.relayErr) : ' · 云端推送中继暂未配置');
+    }
+    if (this.pushErrMsg !== '') {
+      return this.pushErrMsg;
+    }
+    return '正在探测华为 Push Kit 通道状态…';
+  }
+
+  private async runRotateBinding(): Promise<void> {
+    if (this.rotateBusy) {
+      return;
+    }
+    if (this.api.currentBase() === '') {
+      Haptics.warn();
+      Toast.err('请先连接电脑端网关');
+      return;
+    }
+    this.rotateBusy = true;
+    try {
+      const ok: boolean = await PushBridge.rotateBinding(this.api);
+      if (ok) {
+        Haptics.success();
+        Toast.ok('已重置并同步防刷推送凭据');
+      } else {
+        Haptics.warn();
+        Toast.err('凭据重置未完成，请确认云端中继已部署并重试');
+      }
+    } finally {
+      this.rotateBusy = false;
+    }
+  }
+
+  private async runTestPush(): Promise<void> {
+    if (this.testPushBusy) {
+      return;
+    }
+    if (this.api.currentBase() === '') {
+      Haptics.warn();
+      Toast.err('请先连接电脑端网关');
+      return;
+    }
+    this.testPushBusy = true;
+    try {
+      const res: PushTestResp = await PushBridge.testPush(this.api);
+      if (res.ok === true) {
+        Haptics.success();
+        Toast.ok(res.message !== undefined && res.message !== '' ? res.message : '已发送后台测试推送');
+      } else {
+        Haptics.warn();
+        Toast.err(res.message !== undefined && res.message !== '' ? res.message : '后台测试推送未就绪');
+      }
+    } finally {
+      this.testPushBusy = false;
+    }
+  }
+
   build() {
     Column() {
-      // 1. 顶部系统权限状态卡
+      // 0. 顶部系统权限状态卡
       Column() {
         Row({ space: 10 }) {
           Column({ space: 3 }) {
@@ -158,52 +320,248 @@ export struct NotifyPanel {
       .padding({ left: 16, right: 16, top: 14, bottom: 14 })
       .backgroundColor(Mat.cardBg(this.hdsOn))
       .border(Mat.cardBorder(this.hdsOn))
-      .shadow(Mat.cardShadow(this.hdsOn))
-      .borderRadius(Tokens.rGroup)
+      .shadow(Mat.rowShadow(this.hdsOn))
+      .borderRadius(Tokens.rRow)
+      .clip(true)
       .margin({ top: 6 })
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(0, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(0, this.motionMode))
 
       Text('提醒偏好')
         .fontSize(Tokens.fsCaption)
         .fontColor(Tokens.dim2)
         .letterSpacing(1.4)
-        .margin({ left: 6, top: 18, bottom: 8 })
-
-      Column() {
-        RowSwitch({
-          title: '回合结束提醒',
-          hint: '一轮回答完成或有提问待确认时发送本地通知',
-          value: this.done,
-          onChanged: (v: boolean) => {
-            this.onDone(v);
-          }
+        .margin({ left: 6, top: 16, bottom: 8 })
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomHeaderOpacityAnim(1, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          centerX: '0%',
+          centerY: '50%'
         })
+        .animation(Motion.bloomHeaderScaleAnim(1, this.motionMode))
 
-        Divider().color(Tokens.lineSoft).margin({ left: 16 })
-
-        RowSwitch({
-          title: '仅在后台提醒',
-          hint: this.done ? '在前台查看对话时不打扰，切换后台后推送通知' : '需先开启上方的「回合结束提醒」',
-          value: this.bgOnly,
-          switchEnabled: this.done,
-          onChanged: (v: boolean) => {
-            this.onBgOnly(v);
-          }
+      Column({ space: 9 }) {
+        // 1. 回合结束提醒
+        Column() {
+          RowSwitch({
+            title: '回合结束提醒',
+            hint: '一轮回答完成或有提问待确认时发送本地通知',
+            value: this.done,
+            onChanged: (v: boolean) => {
+              this.onDone(v);
+            }
+          })
+        }
+        .width('100%')
+        .backgroundColor(Mat.cardBg(this.hdsOn))
+        .border(Mat.cardBorder(this.hdsOn))
+        .shadow(Mat.rowShadow(this.hdsOn))
+        .borderRadius(Tokens.rRow)
+        .clip(true)
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomOpacityAnim(1, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          centerX: '50%',
+          centerY: '50%'
         })
+        .animation(Motion.bloomScaleAnim(1, this.motionMode))
+
+        // 2. 仅在后台提醒
+        Column() {
+          RowSwitch({
+            title: '仅在后台提醒',
+            hint: this.done ? '开启时前台查看其他页面或会话不弹本地横幅，退后台后由系统推送接管' : '需先开启上方的「回合结束提醒」',
+            value: this.bgOnly,
+            switchEnabled: this.done,
+            onChanged: (v: boolean) => {
+              this.onBgOnly(v);
+            }
+          })
+        }
+        .width('100%')
+        .backgroundColor(Mat.cardBg(this.hdsOn))
+        .border(Mat.cardBorder(this.hdsOn))
+        .shadow(Mat.rowShadow(this.hdsOn))
+        .borderRadius(Tokens.rRow)
+        .clip(true)
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomOpacityAnim(2, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          centerX: '50%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomScaleAnim(2, this.motionMode))
+
+        // 3. 推送显示会话标题
+        Column() {
+          RowSwitch({
+            title: '推送显示会话标题',
+            hint: this.done ? '关闭后后台系统推送仅提示通用消息，不经云端中继发送会话标题' : '需先开启上方的「回合结束提醒」',
+            value: this.showTitle,
+            switchEnabled: this.done,
+            onChanged: (v: boolean) => {
+              this.onShowTitle(v);
+            }
+          })
+        }
+        .width('100%')
+        .backgroundColor(Mat.cardBg(this.hdsOn))
+        .border(Mat.cardBorder(this.hdsOn))
+        .shadow(Mat.rowShadow(this.hdsOn))
+        .borderRadius(Tokens.rRow)
+        .clip(true)
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomOpacityAnim(3, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          centerX: '50%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomScaleAnim(3, this.motionMode))
       }
       .width('100%')
+
+      Text('后台系统推送（Push Kit）')
+        .fontSize(Tokens.fsCaption)
+        .fontColor(Tokens.dim2)
+        .letterSpacing(1.4)
+        .margin({ left: 6, top: 16, bottom: 8 })
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomHeaderOpacityAnim(4, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          centerX: '0%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomHeaderScaleAnim(4, this.motionMode))
+
+      // 4. 华为系统推送通道（多行状态与操作复合卡）
+      Column({ space: 10 }) {
+        Row({ space: 8 }) {
+          Text('华为系统推送通道')
+            .fontSize(Tokens.fsBodyLg)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.fg)
+          Text(this.pushBadgeText())
+            .fontSize(Tokens.fsCaption)
+            .fontColor(this.pushBadgeReady() ? Tokens.doneInk : Tokens.askInk)
+            .backgroundColor(this.pushBadgeReady() ? Tokens.doneBg : Tokens.askBg)
+            .borderRadius(Tokens.rPill)
+            .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+          Blank()
+        }
+        .width('100%')
+
+        Text(this.pushDetailText())
+          .fontSize(Tokens.fsFoot)
+          .fontColor(Tokens.dim2)
+          .lineHeight(18)
+          .width('100%')
+
+        Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center }) {
+          Text(this.relayLoading ? '刷新中…' : '刷新状态')
+            .fontSize(Tokens.fsFoot)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.fg)
+            .backgroundColor(Tokens.surface2)
+            .borderRadius(Tokens.rPill)
+            .padding({ left: 12, right: 12, top: 7, bottom: 7 })
+            .margin({ right: 8, top: 2 })
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+            .onClick(() => {
+              Haptics.tap();
+              void this.refreshPushChannel(true);
+            })
+
+          Text(this.testPushBusy ? '发送中…' : '测试后台推送')
+            .fontSize(Tokens.fsFoot)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Tokens.accent)
+            .backgroundColor(Tokens.accentSoft)
+            .borderRadius(Tokens.rPill)
+            .padding({ left: 12, right: 12, top: 7, bottom: 7 })
+            .margin({ right: 8, top: 2 })
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+            .onClick(() => {
+              Haptics.tap();
+              void this.runTestPush();
+            })
+
+          if (this.pushState === 'ready') {
+            Text(this.rotateBusy ? '重置中…' : '重置凭据')
+              .fontSize(Tokens.fsFoot)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Tokens.dim)
+              .backgroundColor(Tokens.surface2)
+              .borderRadius(Tokens.rPill)
+              .padding({ left: 12, right: 12, top: 7, bottom: 7 })
+              .margin({ top: 2 })
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+              .onClick(() => {
+                Haptics.tap();
+                void this.runRotateBinding();
+              })
+          }
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 14, bottom: 14 })
       .backgroundColor(Mat.cardBg(this.hdsOn))
       .border(Mat.cardBorder(this.hdsOn))
-      .shadow(Mat.cardShadow(this.hdsOn))
-      .borderRadius(Tokens.rGroup)
-      .clip(true)
+      .shadow(Mat.rowShadow(this.hdsOn))
+      .borderRadius(Tokens.rCard)
+      .alignItems(HorizontalAlign.Start)
+      .animation(null)
+      .opacity(this.entered ? 1 : 0)
+      .animation(Motion.bloomOpacityAnim(4, this.motionMode))
+      .scale({
+        x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+        centerX: '50%',
+        centerY: '50%'
+      })
+      .animation(Motion.bloomScaleAnim(4, this.motionMode))
 
       Text('调试与未读')
         .fontSize(Tokens.fsCaption)
         .fontColor(Tokens.dim2)
         .letterSpacing(1.4)
-        .margin({ left: 6, top: 18, bottom: 8 })
+        .margin({ left: 6, top: 16, bottom: 8 })
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomHeaderOpacityAnim(5, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          centerX: '0%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomHeaderScaleAnim(5, this.motionMode))
 
-      Column() {
+      Column({ space: 9 }) {
+        // 5. 测试本地通知
         Row() {
           Column({ space: 2 }) {
             Text('测试本地通知')
@@ -233,9 +591,23 @@ export struct NotifyPanel {
         .width('100%')
         .padding({ left: 16, right: 16, top: 13, bottom: 13 })
         .alignItems(VerticalAlign.Center)
+        .backgroundColor(Mat.cardBg(this.hdsOn))
+        .border(Mat.cardBorder(this.hdsOn))
+        .shadow(Mat.rowShadow(this.hdsOn))
+        .borderRadius(Tokens.rRow)
+        .clip(true)
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomOpacityAnim(5, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          centerX: '50%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomScaleAnim(5, this.motionMode))
 
-        Divider().color(Tokens.lineSoft).margin({ left: 16 })
-
+        // 6. 清除未读与桌面角标
         Row() {
           Column() {
             Row() {
@@ -273,20 +645,40 @@ export struct NotifyPanel {
         .width('100%')
         .padding({ left: 16, right: 16, top: 13, bottom: 13 })
         .alignItems(VerticalAlign.Center)
+        .backgroundColor(Mat.cardBg(this.hdsOn))
+        .border(Mat.cardBorder(this.hdsOn))
+        .shadow(Mat.rowShadow(this.hdsOn))
+        .borderRadius(Tokens.rRow)
+        .clip(true)
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomOpacityAnim(6, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+          centerX: '50%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomScaleAnim(6, this.motionMode))
       }
       .width('100%')
-      .backgroundColor(Mat.cardBg(this.hdsOn))
-      .border(Mat.cardBorder(this.hdsOn))
-      .shadow(Mat.cardShadow(this.hdsOn))
-      .borderRadius(Tokens.rGroup)
-      .clip(true)
 
-      Text('应用在前台及切回前台时会自动巡检会话变化，并将结果同步至未读角标与系统通知栏。')
+      Text('前台由应用轮询同步状态并在非当前会话时按偏好提醒；退后台或锁屏后，电脑网关通过 Push Kit 云端中继推送系统通知。')
         .fontSize(Tokens.fsFoot)
         .fontColor(Tokens.dim2)
         .lineHeight(18)
         .width('100%')
         .margin({ top: 12, left: 4, right: 4 })
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomHeaderOpacityAnim(7, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          centerX: '0%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomHeaderScaleAnim(7, this.motionMode))
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)

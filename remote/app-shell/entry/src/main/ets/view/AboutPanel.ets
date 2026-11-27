@@ -4,6 +4,7 @@ import { Haptics } from '../common/Haptics';
 import { LegalDocKind } from '../common/LegalDocs';
 import { LinkLog } from '../common/LinkLog';
 import { Mat } from '../common/Mat';
+import { Motion, MOTION_VIVID } from '../common/Motion';
 import { Saver } from '../common/Saver';
 import { Toast } from '../common/Toast';
 import { Tokens } from '../common/Tokens';
@@ -16,7 +17,7 @@ export interface AboutRow {
 }
 
 /**
- * 「关于与协议」：版本/环境概况 + 连接诊断日志导出 + 隐私政策/用户协议/开源许可 + 条件反馈入口。
+ * 「关于与协议」：版本/环境概况 + 运行诊断日志导出 + 隐私政策/用户协议/开源许可 + 条件反馈入口。
  */
 @Component
 export struct AboutPanel {
@@ -27,11 +28,30 @@ export struct AboutPanel {
 
   @State private logCount: number = 0;
   @State private exporting: boolean = false;
+  @State private entered: boolean = true;
   @StorageLink('hdsOn') hdsOn: boolean = true;
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
+  private enterTimer: number = -1;
 
   aboutToAppear(): void {
     this.logCount = LinkLog.count();
+    if (Motion.isFlagship(this.motionMode)) {
+      this.entered = false;
+      this.enterTimer = setTimeout(() => {
+        this.enterTimer = -1;
+        this.entered = true;
+      }, 16);
+    } else {
+      this.entered = true;
+    }
+  }
+
+  aboutToDisappear(): void {
+    if (this.enterTimer >= 0) {
+      clearTimeout(this.enterTimer);
+      this.enterTimer = -1;
+    }
   }
 
   private async exportDiagLog(): Promise<void> {
@@ -43,10 +63,11 @@ export struct AboutPanel {
     try {
       const ctx = AppCtx.ability();
       const content: string = LinkLog.exportContent(this.verText);
-      const saved: boolean = await Saver.saveText(ctx, content, 'agent-mobile-link-log.txt');
+      const saved: boolean = await Saver.saveText(ctx, content, 'agent-mobile-diag-log.txt');
       this.logCount = LinkLog.count();
       if (saved) {
-        Toast.ok('已导出脱敏诊断日志');
+        Haptics.success();
+        Toast.ok('已导出脱敏运行诊断日志');
       }
     } catch (e) {
       Toast.err('导出失败：' + (e as Error).message);
@@ -55,8 +76,16 @@ export struct AboutPanel {
     }
   }
 
+  private diagBaseIdx(): number {
+    return this.rows.length;
+  }
+
+  private legalStartIdx(): number {
+    return this.rows.length + (isFeedbackEnabled() ? 2 : 1);
+  }
+
   @Builder
-  actionRow(title: string, hint: string, onTap: () => void) {
+  actionCard(title: string, hint: string, idx: number, onTap: () => void) {
     Row() {
       Column() {
         Text(title)
@@ -72,14 +101,35 @@ export struct AboutPanel {
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
 
-      Text('›')
-        .fontSize(17)
-        .fontColor(Tokens.dim2)
+      if (Motion.isFlagship(this.motionMode)) {
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(14)
+          .fontColor([Tokens.dim2])
+      } else {
+        Text('›')
+          .fontSize(17)
+          .fontColor(Tokens.dim2)
+      }
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 13, bottom: 13 })
     .alignItems(VerticalAlign.Center)
-    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.98 })
+    .backgroundColor(Mat.cardBg(this.hdsOn))
+    .border(Mat.cardBorder(this.hdsOn))
+    .shadow(Mat.rowShadow(this.hdsOn))
+    .borderRadius(Tokens.rRow)
+    .clip(true)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+    .animation(null)
+    .opacity(this.entered ? 1 : 0)
+    .animation(Motion.bloomOpacityAnim(idx, this.motionMode))
+    .scale({
+      x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+      y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+      centerX: '50%',
+      centerY: '50%'
+    })
+    .animation(Motion.bloomScaleAnim(idx, this.motionMode))
     .onClick(() => {
       Haptics.tap();
       onTap();
@@ -93,8 +143,18 @@ export struct AboutPanel {
         .fontColor(Tokens.dim2)
         .letterSpacing(1.4)
         .margin({ left: 6, top: 6, bottom: 8 })
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomHeaderOpacityAnim(0, this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          centerX: '0%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomHeaderScaleAnim(0, this.motionMode))
 
-      Column() {
+      Column({ space: 9 }) {
         ForEach(this.rows, (r: AboutRow, i: number) => {
           Row() {
             Text(r.k)
@@ -113,61 +173,70 @@ export struct AboutPanel {
           .width('100%')
           .padding({ left: 16, right: 16, top: 13, bottom: 13 })
           .alignItems(VerticalAlign.Center)
-          if (i < this.rows.length - 1) {
-            Divider().color(Tokens.lineSoft).margin({ left: 16 })
-          }
+          .backgroundColor(Mat.cardBg(this.hdsOn))
+          .border(Mat.cardBorder(this.hdsOn))
+          .shadow(Mat.rowShadow(this.hdsOn))
+          .borderRadius(Tokens.rRow)
+          .clip(true)
+          .animation(null)
+          .opacity(this.entered ? 1 : 0)
+          .animation(Motion.bloomOpacityAnim(i, this.motionMode))
+          .scale({
+            x: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+            y: this.entered ? 1 : Motion.BLOOM_SCALE_START,
+            centerX: '50%',
+            centerY: '50%'
+          })
+          .animation(Motion.bloomScaleAnim(i, this.motionMode))
         }, (r: AboutRow) => r.k + ':' + r.v)
       }
       .width('100%')
-      .backgroundColor(Mat.cardBg(this.hdsOn))
-      .border(Mat.cardBorder(this.hdsOn))
-      .shadow(Mat.cardShadow(this.hdsOn))
-      .borderRadius(Tokens.rGroup)
-      .clip(true)
 
       Text('诊断与协议')
         .fontSize(Tokens.fsCaption)
         .fontColor(Tokens.dim2)
         .letterSpacing(1.4)
-        .margin({ left: 6, top: 18, bottom: 8 })
+        .margin({ left: 6, top: 16, bottom: 8 })
+        .animation(null)
+        .opacity(this.entered ? 1 : 0)
+        .animation(Motion.bloomHeaderOpacityAnim(this.diagBaseIdx(), this.motionMode))
+        .scale({
+          x: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          y: this.entered ? 1 : Motion.BLOOM_HEADER_SCALE_START,
+          centerX: '0%',
+          centerY: '50%'
+        })
+        .animation(Motion.bloomHeaderScaleAnim(this.diagBaseIdx(), this.motionMode))
 
-      Column() {
-        this.actionRow(
-          this.exporting ? '正在导出诊断日志…' : '导出连接诊断日志',
-          String(this.logCount) + ' 条脱敏记录 · 自动剥离令牌与正文',
+      Column({ space: 9 }) {
+        this.actionCard(
+          this.exporting ? '正在导出运行诊断日志…' : '导出运行诊断日志',
+          String(this.logCount) + ' 条脱敏记录 · 网络/引擎/运行状态，不含令牌与正文',
+          this.diagBaseIdx(),
           () => {
             void this.exportDiagLog();
           }
         )
 
         if (isFeedbackEnabled()) {
-          Divider().color(Tokens.lineSoft).margin({ left: 16 })
-          this.actionRow('反馈与支持', '提交问题、功能建议与查看进度', () => {
+          this.actionCard('反馈与支持', '提交问题、功能建议与查看进度', this.diagBaseIdx() + 1, () => {
             this.onFeedback();
           })
         }
 
-        Divider().color(Tokens.lineSoft).margin({ left: 16 })
-        this.actionRow('隐私政策', '说明本地存储、权限范围与加密机制', () => {
+        this.actionCard('隐私政策', '说明本地存储、权限范围与加密机制', this.legalStartIdx(), () => {
           this.onLegal('privacy');
         })
 
-        Divider().color(Tokens.lineSoft).margin({ left: 16 })
-        this.actionRow('用户协议', '使用约定与免责说明', () => {
+        this.actionCard('用户协议', '使用约定与免责说明', this.legalStartIdx() + 1, () => {
           this.onLegal('terms');
         })
 
-        Divider().color(Tokens.lineSoft).margin({ left: 16 })
-        this.actionRow('开源许可', '查看第三方组件与标准协议声明', () => {
+        this.actionCard('开源许可', '查看第三方组件与标准协议声明', this.legalStartIdx() + 2, () => {
           this.onLegal('licenses');
         })
       }
       .width('100%')
-      .backgroundColor(Mat.cardBg(this.hdsOn))
-      .border(Mat.cardBorder(this.hdsOn))
-      .shadow(Mat.cardShadow(this.hdsOn))
-      .borderRadius(Tokens.rGroup)
-      .clip(true)
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)

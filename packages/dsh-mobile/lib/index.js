@@ -721,7 +721,7 @@ const send = (res, status, body) => {
 /**
 * 插件持久化状态、路径解析、原子落盘、日志轮转与配对码防爆破管理。
 */
-const VERSION = "3.0.0";
+const VERSION = "3.1.0";
 const PAIR_TTL_MS = 900 * 1e3;
 const PAIR_LOCK_MS = 300 * 1e3;
 const PRESENCE_TTL_MS = 15 * 1e3;
@@ -973,6 +973,54 @@ function setDeviceRevoked(deviceId, revoked) {
 		ok: true,
 		devices: list
 	};
+}
+const MAX_PUSH_TARGETS = 16;
+/** 读取已注册的手机推送目标列表（按更新时间倒序）。 */
+function pushTargets() {
+	const raw = readState().pushTargets;
+	if (!Array.isArray(raw)) return [];
+	const out = [];
+	for (const item of raw) {
+		if (!item || typeof item !== "object") continue;
+		const r = item;
+		const pushToken = typeof r.pushToken === "string" ? r.pushToken.trim() : "";
+		if (pushToken.length < 16) continue;
+		out.push({
+			deviceId: typeof r.deviceId === "string" && r.deviceId.trim() !== "" ? r.deviceId.trim() : pushToken.slice(0, 16),
+			pushToken,
+			relayUrl: typeof r.relayUrl === "string" && r.relayUrl.trim() !== "" ? r.relayUrl.trim() : "https://feedback.juo.de5.net",
+			relaySecret: typeof r.relaySecret === "string" ? r.relaySecret.trim() : "",
+			enabled: r.enabled !== false,
+			bgOnly: r.bgOnly !== false,
+			showTitle: r.showTitle !== false,
+			updatedAt: Number(r.updatedAt) || 0
+		});
+	}
+	out.sort((a, b) => b.updatedAt - a.updatedAt);
+	return out;
+}
+/** 写入或更新手机 Push Token 与推送偏好（按 deviceId 或 pushToken 去重，保留已有 relaySecret，上限 16 条）。 */
+function upsertPushTarget(reg) {
+	const current = pushTargets();
+	const matched = current.find((t) => t.deviceId === reg.deviceId || t.pushToken === reg.pushToken);
+	const keptSecret = reg.relaySecret.trim() !== "" ? reg.relaySecret.trim() : matched?.relaySecret ?? "";
+	const list = current.filter((t) => t.deviceId !== reg.deviceId && t.pushToken !== reg.pushToken);
+	list.unshift({
+		...reg,
+		relaySecret: keptSecret,
+		updatedAt: Date.now()
+	});
+	const bounded = list.slice(0, MAX_PUSH_TARGETS);
+	writeState({ pushTargets: bounded });
+	return bounded;
+}
+/** 按 deviceId 或 pushToken 移除失效的手机推送目标。 */
+function removePushTarget(deviceIdOrToken) {
+	const clean = deviceIdOrToken.trim();
+	if (clean === "") return pushTargets();
+	const next = pushTargets().filter((t) => t.deviceId !== clean && t.pushToken !== clean);
+	writeState({ pushTargets: next });
+	return next;
 }
 /** 生成 6 位密码学随机数字码。 */
 function freshPairCode() {
@@ -1561,7 +1609,7 @@ function createWorkspaceFlags(service) {
 * 宿主 `user-questions/request` 拦截桥接：
 * 在 `phone` 模式下挂起提问交由手机作答；切回 `desktop` 或插件卸载时同步将所有挂起提问交还桌面。
 */
-function createAskBridge(ctx, logFile) {
+function createAskBridge(ctx, logFile, onNewAsk) {
 	const liveAsks = /* @__PURE__ */ new Map();
 	let syntheticSeq = 0;
 	try {
@@ -1626,6 +1674,9 @@ function createAskBridge(ctx, logFile) {
 					delegate: () => handOver("ask delegate")
 				};
 				liveAsks.set(callId, entry);
+				if (onNewAsk !== void 0 && askSessionId !== "*") try {
+					onNewAsk(askSessionId, callId);
+				} catch {}
 			});
 		}, { prepend: true });
 		record(logFile, "ask hook registered (prepend)");
@@ -2273,6 +2324,22 @@ var AcpSessionBackend = class {
 	cachedModels = [];
 	inflightList = null;
 	inflightModels = null;
+	notifyHook = null;
+	setNotifyHook(fn) {
+		this.notifyHook = fn;
+	}
+	emitNotify(rawId, kind, status) {
+		if (!this.notifyHook) return;
+		const title = this.sessions.get(rawId)?.title || this.defaultSessionTitle(false);
+		try {
+			this.notifyHook({
+				sessionId: formatSessionId(this.id, rawId),
+				title,
+				kind,
+				status
+			});
+		} catch {}
+	}
 	autoInitForList() {
 		return false;
 	}
@@ -2312,6 +2379,7 @@ var AcpSessionBackend = class {
 							type: "done",
 							running: false
 						});
+						this.emitNotify(s.rawId, "done", "interrupted");
 					}
 					if (s.pendingAsk) {
 						s.pendingAsk = null;
@@ -2545,6 +2613,7 @@ var AcpSessionBackend = class {
 			asking: true,
 			ask
 		});
+		this.emitNotify(sid, "asking");
 	}
 	async probe(force = false) {
 		const spec = this.ensureSpec(force);
@@ -2807,6 +2876,7 @@ var AcpSessionBackend = class {
 				type: "done",
 				running: false
 			});
+			this.emitNotify(rawId, "done", "completed");
 		}).catch((err) => {
 			cache.running = false;
 			const msg = err instanceof Error ? err.message : String(err);
@@ -2824,6 +2894,7 @@ var AcpSessionBackend = class {
 				type: "done",
 				running: false
 			});
+			this.emitNotify(rawId, "done", "error");
 		});
 		return {
 			ok: true,
@@ -2850,6 +2921,7 @@ var AcpSessionBackend = class {
 				type: "done",
 				running: false
 			});
+			this.emitNotify(rawId, "done", "interrupted");
 		}
 		return true;
 	}
@@ -3227,6 +3299,22 @@ var ClaudeBackend = class {
 	cli = null;
 	runtime = /* @__PURE__ */ new Map();
 	listeners = /* @__PURE__ */ new Map();
+	notifyHook = null;
+	setNotifyHook(fn) {
+		this.notifyHook = fn;
+	}
+	emitNotify(rawId, kind, status) {
+		if (!this.notifyHook) return;
+		const title = this.runtime.get(rawId)?.title || "Claude 会话";
+		try {
+			this.notifyHook({
+				sessionId: formatSessionId(this.id, rawId),
+				title,
+				kind,
+				status
+			});
+		} catch {}
+	}
 	ensureCli(force = false) {
 		if (!force && this.cli) return this.cli;
 		this.cli = resolveCliCommand("claude", force);
@@ -3602,7 +3690,8 @@ var ClaudeBackend = class {
 			rt.updatedAt = Date.now();
 			const fp = this.locateSessionFile(rawId);
 			if (fp) rt.filePath = fp;
-			if (code !== 0 && code !== null && !accText) {
+			const hadErr = code !== 0 && code !== null && !accText;
+			if (hadErr) {
 				const hint = stderrText.trim().slice(0, 260) || `Claude Code 退出码 ${String(code)}`;
 				this.emit(rawId, {
 					type: "error",
@@ -3614,6 +3703,7 @@ var ClaudeBackend = class {
 				type: "done",
 				running: false
 			});
+			this.emitNotify(rawId, "done", hadErr ? "error" : "completed");
 		});
 		child.on("error", (err) => {
 			rt.running = false;
@@ -3627,6 +3717,7 @@ var ClaudeBackend = class {
 				type: "done",
 				running: false
 			});
+			this.emitNotify(rawId, "done", "error");
 		});
 		return {
 			ok: true,
@@ -3646,6 +3737,7 @@ var ClaudeBackend = class {
 				type: "done",
 				running: false
 			});
+			this.emitNotify(rawId, "done", "interrupted");
 		}
 		return true;
 	}
@@ -3825,6 +3917,22 @@ var CodexBackend = class {
 	runtime = /* @__PURE__ */ new Map();
 	listeners = /* @__PURE__ */ new Map();
 	modelsCache = null;
+	notifyHook = null;
+	setNotifyHook(fn) {
+		this.notifyHook = fn;
+	}
+	emitNotify(rawId, kind, status) {
+		if (!this.notifyHook) return;
+		const title = this.runtime.get(rawId)?.title || "Codex 会话";
+		try {
+			this.notifyHook({
+				sessionId: formatSessionId(this.id, rawId),
+				title,
+				kind,
+				status
+			});
+		} catch {}
+	}
 	ensureCli(force = false) {
 		if (!force && this.cli) return this.cli;
 		this.cli = resolveCliCommand("codex", force);
@@ -3891,6 +3999,7 @@ var CodexBackend = class {
 						type: "done",
 						running: false
 					});
+					this.emitNotify(s.rawId, "done", "interrupted");
 				}
 				if (s.pendingAsk) {
 					s.pendingAsk = null;
@@ -4051,6 +4160,7 @@ var CodexBackend = class {
 					asking: true,
 					ask
 				});
+				this.emitNotify(threadId, "asking");
 				return;
 			}
 			try {
@@ -4133,15 +4243,17 @@ var CodexBackend = class {
 			s.activeTurnId = "";
 			s.updatedAt = Date.now();
 			const errObj = params.turn?.error;
-			if (errObj && typeof errObj.message === "string" && errObj.message.trim() !== "") this.emit(threadId, {
+			const hasErr = Boolean(errObj && typeof errObj.message === "string" && errObj.message.trim() !== "");
+			if (hasErr) this.emit(threadId, {
 				type: "error",
-				error: errObj.message,
+				error: String(errObj.message),
 				running: false
 			});
 			this.emit(threadId, {
 				type: "done",
 				running: false
 			});
+			this.emitNotify(threadId, "done", hasErr ? "error" : "completed");
 			return;
 		}
 		if (msg.method === "error") {
@@ -4340,6 +4452,7 @@ var CodexBackend = class {
 				type: "done",
 				running: false
 			});
+			this.emitNotify(rawId, "done", "interrupted");
 		}
 		return true;
 	}
@@ -4532,6 +4645,9 @@ var BackendRegistry = class {
 		this.backends.set(opencode.id, opencode);
 		this.backends.set(antigravity.id, antigravity);
 	}
+	setNotifyListener(fn) {
+		for (const driver of this.backends.values()) driver.setNotifyHook?.(fn);
+	}
 	getExternal(id) {
 		if (id === "dsh") return null;
 		return this.backends.get(id) ?? null;
@@ -4624,6 +4740,1168 @@ var BackendRegistry = class {
 	}
 };
 //#endregion
+//#region src/transcript.ts
+/**
+* 会话 Zstd 事件日志解析、增量解压 + LRU 缓存（上限 16）、路径索引缓存、
+* 思考链与工具调用轨迹提取、精简模式裁剪以及 AgentTeams 视图复用。
+*/
+const zstdDecompressSync = zlib.zstdDecompressSync;
+const ZSTD_MAGIC = Buffer.from([
+	40,
+	181,
+	47,
+	253
+]);
+const MAX_SESSION_BYTES = 160 * 1024 * 1024;
+const HISTORY_CACHE_CAP = 16;
+const PATH_CACHE_CAP = 512;
+const HEAD_HASH_BYTES = 4096;
+const MAX_THINKING_CHARS = 4e3;
+const COMPACT_THINKING_CHARS = 160;
+/** `sessionId -> filePath` 映射缓存（LRU 上限 512），未命中或文件消失时才遍历磁盘目录。 */
+const sessionFileCache = /* @__PURE__ */ new Map();
+/** 定位某个会话的 `session.v4.jsonl.zstd` 文件。 */
+function findSessionFile(id) {
+	const home = dshHome();
+	const hit = sessionFileCache.get(id);
+	if (hit !== void 0 && hit.home === home) {
+		if (existsSync(hit.file)) {
+			sessionFileCache.delete(id);
+			sessionFileCache.set(id, hit);
+			return hit.file;
+		}
+		sessionFileCache.delete(id);
+	}
+	const root = join(home, "sessions");
+	let projects;
+	try {
+		projects = readdirSync(root);
+	} catch {
+		return null;
+	}
+	const candidates = id.startsWith("session-") ? [id, id.slice(8)] : [id, `session-${id}`];
+	for (const project of projects) for (const name of candidates) {
+		const file = join(root, project, name, "session.v4.jsonl.zstd");
+		try {
+			if (statSync(file).isFile()) {
+				sessionFileCache.delete(id);
+				sessionFileCache.set(id, {
+					home,
+					file
+				});
+				while (sessionFileCache.size > PATH_CACHE_CAP) {
+					const oldest = sessionFileCache.keys().next().value;
+					if (oldest === void 0) break;
+					sessionFileCache.delete(oldest);
+				}
+				return file;
+			}
+		} catch {}
+	}
+	return null;
+}
+/** 读取文件区间字节。 */
+function readRange(fd, offset, length) {
+	if (length <= 0) return Buffer.alloc(0);
+	const buf = Buffer.allocUnsafe(length);
+	let readTotal = 0;
+	while (readTotal < length) {
+		const n = readSync(fd, buf, readTotal, length - readTotal, offset + readTotal);
+		if (n <= 0) break;
+		readTotal += n;
+	}
+	return readTotal === length ? buf : buf.subarray(0, readTotal);
+}
+/** 计算头部块哈希，判断日志文件是否被截断重写。 */
+function hashBuffer(buf) {
+	return createHash("sha256").update(buf).digest("hex").slice(0, 32);
+}
+/**
+* 解压一段字节中的完整 Zstd 帧序列。
+* 返回成功解码的事件行列表，以及已消费的精确字节偏移 `consumedBytes`：
+* 若末尾帧尚未写完（半帧），`consumedBytes` 停在该半帧起始位置，留待下次增量继续读取。
+*/
+function decodeZstdFrames(raw) {
+	if (zstdDecompressSync === void 0) throw new Error("this Node build has no zstd support");
+	if (raw.length === 0) return {
+		lines: [],
+		consumedBytes: 0
+	};
+	const starts = [];
+	let cursor = 0;
+	while ((cursor = raw.indexOf(ZSTD_MAGIC, cursor)) !== -1) {
+		starts.push(cursor);
+		cursor += 4;
+	}
+	if (starts.length === 0) return {
+		lines: [],
+		consumedBytes: 0
+	};
+	const parts = [];
+	let consumedBytes = 0;
+	let index = 0;
+	while (index < starts.length) {
+		const from = starts[index];
+		let decoded = null;
+		let nextIndex = index + 1;
+		while (nextIndex <= starts.length) {
+			const to = nextIndex < starts.length ? starts[nextIndex] : raw.length;
+			try {
+				decoded = zstdDecompressSync(raw.subarray(from, to));
+				break;
+			} catch {
+				if (nextIndex === starts.length) break;
+				nextIndex += 1;
+			}
+		}
+		if (decoded !== null) {
+			parts.push(decoded);
+			consumedBytes = nextIndex < starts.length ? starts[nextIndex] : raw.length;
+			index = nextIndex;
+		} else {
+			if (index === starts.length - 1) break;
+			consumedBytes = starts[index + 1];
+			index += 1;
+		}
+	}
+	if (parts.length === 0) return {
+		lines: [],
+		consumedBytes
+	};
+	return {
+		lines: Buffer.concat(parts).toString("utf8").split("\n").filter((line) => line.length > 0),
+		consumedBytes
+	};
+}
+/** 提取正文文本块。 */
+function textOf(content) {
+	if (!Array.isArray(content)) return "";
+	const out = [];
+	for (const part of content) {
+		if (part === null || typeof part !== "object") continue;
+		const p = part;
+		if (p.type === "text" && typeof p.text === "string") out.push(p.text);
+	}
+	return out.join("").trim();
+}
+/** 提取 assistant 内容块中的 `reasoning` / `thinking` 思考链文本。 */
+function thinkingOf(content) {
+	if (!Array.isArray(content)) return "";
+	const out = [];
+	for (const part of content) {
+		if (part === null || typeof part !== "object") continue;
+		const p = part;
+		if (p.type === "reasoning" || p.type === "thinking") {
+			const trimmed = (typeof p.text === "string" ? p.text : typeof p.thinking === "string" ? p.thinking : typeof p.reasoning === "string" ? p.reasoning : "").trim();
+			if (trimmed.length > 0) out.push(trimmed);
+		}
+	}
+	return out.join("\n\n");
+}
+/** 裁剪思考链文本至最多 4000 字符。 */
+function capThinking(raw) {
+	if (raw.length <= MAX_THINKING_CHARS) return raw;
+	return `${raw.slice(0, MAX_THINKING_CHARS - 1)}⋯`;
+}
+/** 从工具调用参数中提炼简明单行目标摘要（绝不混入大段文件内容或结果原文）。 */
+function summarizeToolArgs(name, rawArgs) {
+	let parsed = rawArgs;
+	if (typeof rawArgs === "string") {
+		const trimmed = rawArgs.trim();
+		if (trimmed === "") return "";
+		try {
+			parsed = JSON.parse(trimmed);
+		} catch {
+			return trimmed.split(/\r?\n/)[0]?.replace(/\s+/g, " ").trim().slice(0, 100) ?? "";
+		}
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return "";
+	const bag = parsed;
+	const firstLine = (v, max = 100) => {
+		if (typeof v !== "string") return "";
+		const line = v.trim().split(/\r?\n/)[0]?.replace(/\s+/g, " ").trim() ?? "";
+		return line.length > max ? `${line.slice(0, max - 1)}⋯` : line;
+	};
+	const lower = name.toLowerCase();
+	if (lower === "pwsh" || lower === "bash" || lower === "shell" || lower.includes("terminal") || lower === "run_command") {
+		const cmd = firstLine(bag.command ?? bag.cmd ?? bag.script ?? bag.CommandLine, 100);
+		if (cmd !== "") return cmd;
+	}
+	if (lower === "grep" || lower === "glob") {
+		const pat = firstLine(bag.pattern, 60);
+		const scope = firstLine(bag.path ?? bag.include, 50);
+		if (pat !== "") return scope !== "" ? `${pat} · ${scope}` : pat;
+	}
+	for (const key of [
+		"file_path",
+		"path",
+		"filePath",
+		"target_file",
+		"command",
+		"cmd",
+		"pattern",
+		"query",
+		"url",
+		"skill",
+		"label",
+		"subject",
+		"objective",
+		"task_id",
+		"agent_id",
+		"job_id",
+		"to",
+		"name",
+		"action",
+		"description",
+		"prompt"
+	]) {
+		const val = bag[key];
+		if (typeof val === "string" && val.trim() !== "") return firstLine(val, 100);
+		if (typeof val === "number" || typeof val === "boolean") return `${key}=${String(val)}`;
+	}
+	for (const [k, v] of Object.entries(bag)) {
+		if (k === "content" || k === "new_string" || k === "old_string" || k === "data") continue;
+		if (typeof v === "string" && v.trim() !== "") return firstLine(v, 90);
+		if (typeof v === "number" || typeof v === "boolean") return `${k}=${String(v)}`;
+	}
+	return "";
+}
+/** 提取 assistant 内容块中内嵌的 tool-call 列表。 */
+function embeddedToolsOf(content) {
+	if (!Array.isArray(content)) return [];
+	const out = [];
+	for (const part of content) {
+		if (part === null || typeof part !== "object") continue;
+		const p = part;
+		if (p.type === "tool-call" || p.type === "tool_use") {
+			const id = String(p.id ?? p.callId ?? "");
+			const name = String(p.name ?? "");
+			if (id !== "" && name !== "") out.push({
+				id,
+				name,
+				args: p.arguments ?? p.input
+			});
+		}
+	}
+	return out;
+}
+/** 提取消息中的图片附件摘要。 */
+function imagesOf(content) {
+	if (!Array.isArray(content)) return [];
+	const out = [];
+	for (const part of content) {
+		if (part === null || typeof part !== "object") continue;
+		const p = part;
+		if (p.type !== "image") continue;
+		const a = p.attachment ?? {};
+		const raw = String(a.attachmentId ?? "");
+		const id = raw.startsWith("sha256:") ? raw.slice(7) : raw;
+		if (!/^[0-9a-f]{8,128}$/i.test(id)) continue;
+		const width = Number(a.width ?? 0);
+		const height = Number(a.height ?? 0);
+		out.push({
+			id: id.toLowerCase(),
+			mediaType: String(a.mediaType ?? "image/png"),
+			width: Number.isFinite(width) && width > 0 ? width : 0,
+			height: Number.isFinite(height) && height > 0 ? height : 0,
+			name: String(a.name ?? "")
+		});
+	}
+	return out;
+}
+/** 累加单次模型调用的 Token 计数。 */
+function accumulateTokens(total, data) {
+	if (data === null || typeof data !== "object") return;
+	const usage = data.usage ?? data;
+	const num = (v) => {
+		const n = Number(v ?? 0);
+		return Number.isFinite(n) && n > 0 ? n : 0;
+	};
+	total.uncachedInputTokens += num(usage.inputTokens ?? usage.uncachedInputTokens);
+	total.outputTokens += num(usage.outputTokens);
+	total.cacheReadTokens += num(usage.cacheReadTokens ?? usage.cachedInputTokens);
+	total.cacheWriteTokens += num(usage.cacheWriteTokens);
+}
+/** 将 Markdown 文本压平为单行会话预览。 */
+function plainPreview(text) {
+	return text.replace(/```[\s\S]*?```/g, " ").replace(/`([^`]*)`/g, "$1").replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/^#{1,6}\s*/gm, "").replace(/^>\s?/gm, "").replace(/^\s*[-*+]\s+/gm, "").replace(/\*\*([^*]*)\*\*/g, "$1").replace(/\|/g, " ").replace(/\s+/g, " ").trim().slice(0, 90);
+}
+const historyCache = /* @__PURE__ */ new Map();
+function createEmptyFoldEntry(size, mtimeMs, headLen, firstChunkHash) {
+	return {
+		size,
+		mtimeMs,
+		headLen,
+		firstChunkHash,
+		byteOffset: 0,
+		messages: [],
+		stats: {
+			turns: 0,
+			steps: 0,
+			toolCalls: 0,
+			tokens: {
+				uncachedInputTokens: 0,
+				outputTokens: 0,
+				cacheReadTokens: 0,
+				cacheWriteTokens: 0
+			}
+		},
+		lastTurn: "",
+		lastErr: null,
+		stepAt: /* @__PURE__ */ new Map(),
+		stepThinking: /* @__PURE__ */ new Map(),
+		stepTools: /* @__PURE__ */ new Map(),
+		turnStart: 0,
+		turnIn: 0,
+		turnOut: 0,
+		turnReplyAt: -1,
+		carryThinking: [],
+		carryTools: [],
+		currentStepKey: "",
+		toolById: /* @__PURE__ */ new Map(),
+		teamEnabled: false,
+		teamSawMode: false,
+		teamMembers: /* @__PURE__ */ new Map(),
+		teamTasks: /* @__PURE__ */ new Map()
+	};
+}
+/** 注册或更新一条工具调用轨迹，并挂到所属 step 或待合并队列上。 */
+function registerToolTrace(entry, stepKey, callId, name, rawArgs) {
+	const existing = entry.toolById.get(callId);
+	if (existing !== void 0) {
+		if (existing.summary === "" && rawArgs !== void 0) existing.summary = summarizeToolArgs(name, rawArgs);
+		return existing;
+	}
+	const trace = {
+		id: callId,
+		name,
+		summary: summarizeToolArgs(name, rawArgs),
+		status: "run"
+	};
+	entry.toolById.set(callId, trace);
+	const msgIdx = entry.stepAt.get(stepKey);
+	if (msgIdx !== void 0) {
+		const row = entry.messages[msgIdx];
+		if (row !== void 0) {
+			if (row.tools === void 0) row.tools = [];
+			row.tools.push(trace);
+			return trace;
+		}
+	}
+	const list = entry.stepTools.get(stepKey) ?? [];
+	list.push(trace);
+	entry.stepTools.set(stepKey, list);
+	return trace;
+}
+/** 将未发言 step 累积的思考与工具轨迹刷入指定回复气泡。 */
+function flushCarryIntoRow(entry, row, stepKey) {
+	const ownThinking = entry.stepThinking.get(stepKey) ?? "";
+	const allThinking = [...entry.carryThinking, ...ownThinking !== "" ? [ownThinking] : []].join("\n\n").trim();
+	entry.carryThinking = [];
+	if (allThinking !== "") row.thinking = capThinking(allThinking);
+	const ownTools = entry.stepTools.get(stepKey) ?? [];
+	const mergedTools = [];
+	const seen = /* @__PURE__ */ new Set();
+	for (const t of [
+		...entry.carryTools,
+		...row.tools ?? [],
+		...ownTools
+	]) if (!seen.has(t.id)) {
+		seen.add(t.id);
+		mergedTools.push(t);
+	}
+	entry.carryTools = [];
+	entry.stepTools.delete(stepKey);
+	if (mergedTools.length > 0) row.tools = mergedTools;
+}
+/** 把上一个无文本 step 的思考与工具移入本轮 carry 池，等待本轮下一条有文本的回复承接。 */
+function stashSilentStep(entry, stepKey) {
+	if (stepKey === "" || entry.stepAt.has(stepKey)) return;
+	const t = entry.stepThinking.get(stepKey);
+	if (t !== void 0 && t !== "") {
+		entry.carryThinking.push(t);
+		entry.stepThinking.delete(stepKey);
+	}
+	const tools = entry.stepTools.get(stepKey);
+	if (tools !== void 0 && tools.length > 0) {
+		for (const item of tools) if (!entry.carryTools.some((x) => x.id === item.id)) entry.carryTools.push(item);
+		entry.stepTools.delete(stepKey);
+	}
+}
+/** 向增量状态喂入单行事件 JSON。 */
+function foldEventLine(entry, line) {
+	let event;
+	try {
+		event = JSON.parse(line);
+	} catch {
+		return;
+	}
+	if (event === null || typeof event !== "object") return;
+	const ev = event;
+	const type = String(ev.type ?? "");
+	if (type === "team/mode") {
+		entry.teamSawMode = true;
+		entry.teamEnabled = ev.data?.enabled === true;
+		return;
+	}
+	if (type === "team/member") {
+		const member = ev.data?.member;
+		if (member !== null && typeof member === "object") {
+			const id = String(member.id ?? "");
+			entry.teamMembers.set(id, {
+				id,
+				name: String(member.name ?? ""),
+				description: String(member.description ?? ""),
+				phase: String(member.phase ?? ""),
+				error: String(member.error ?? "")
+			});
+		}
+		return;
+	}
+	if (type === "team/task") {
+		const task = ev.data?.task;
+		if (task !== null && typeof task === "object") {
+			const id = String(task.id ?? "");
+			const seen = entry.teamTasks.get(id);
+			const revision = Number(task.revision ?? 0);
+			if (seen === void 0 || Number(seen.revision ?? -1) <= revision) entry.teamTasks.set(id, {
+				id,
+				revision,
+				subject: String(task.subject ?? ""),
+				description: String(task.description ?? ""),
+				status: String(task.status ?? "pending"),
+				ownerName: String(task.ownerName ?? ""),
+				ownerId: String(task.ownerId ?? "")
+			});
+		}
+		return;
+	}
+	if (type === "turn/start") {
+		stashSilentStep(entry, entry.currentStepKey);
+		entry.stats.turns += 1;
+		entry.turnStart = Number(ev.time ?? 0);
+		entry.turnIn = 0;
+		entry.turnOut = 0;
+		entry.turnReplyAt = -1;
+		entry.carryThinking = [];
+		entry.carryTools = [];
+		entry.currentStepKey = "";
+		entry.toolById.clear();
+		return;
+	}
+	if (type === "step/start") {
+		stashSilentStep(entry, entry.currentStepKey);
+		entry.stats.steps += 1;
+		entry.currentStepKey = `${String(ev.data?.turn ?? "")}:${String(ev.data?.step ?? "")}`;
+		return;
+	}
+	if (type === "turn/end") {
+		stashSilentStep(entry, entry.currentStepKey);
+		entry.currentStepKey = "";
+		entry.lastTurn = String(ev.data?.reason?.kind ?? "");
+		const rawErr = ev.data?.reason?.error;
+		let errCode = "";
+		let errText = "";
+		if (rawErr !== null && typeof rawErr === "object") {
+			errCode = String(rawErr.code ?? "");
+			errText = String(rawErr.message ?? "");
+		} else if (typeof rawErr === "string") errText = rawErr;
+		if (errText !== "") entry.lastErr = {
+			code: errCode,
+			text: errText,
+			time: Number(ev.time ?? 0)
+		};
+		else entry.lastErr = null;
+		const row = entry.turnReplyAt >= 0 ? entry.messages[entry.turnReplyAt] : void 0;
+		if (row !== void 0) {
+			if (entry.carryThinking.length > 0) {
+				row.thinking = capThinking([row.thinking ?? "", ...entry.carryThinking].filter(Boolean).join("\n\n"));
+				entry.carryThinking = [];
+			}
+			if (entry.carryTools.length > 0) {
+				const existing = row.tools ?? [];
+				const seen = new Set(existing.map((t) => t.id));
+				for (const t of entry.carryTools) if (!seen.has(t.id)) {
+					seen.add(t.id);
+					existing.push(t);
+				}
+				row.tools = existing;
+				entry.carryTools = [];
+			}
+			const endAt = Number(ev.time ?? 0);
+			row.turn = {
+				status: entry.lastTurn,
+				ms: endAt > entry.turnStart && entry.turnStart > 0 ? endAt - entry.turnStart : 0,
+				tokensIn: entry.turnIn,
+				tokensOut: entry.turnOut,
+				atSeq: Number(ev.seq ?? 0),
+				finishedAt: endAt > 0 ? endAt : Date.now()
+			};
+			if (errText !== "") {
+				row.turn.errCode = errCode;
+				row.turn.errText = errText;
+			}
+		}
+		return;
+	}
+	if (type === "tool/call") {
+		entry.stats.toolCalls += 1;
+		const callId = String(ev.data?.callId ?? ev.data?.id ?? "");
+		const name = String(ev.data?.name ?? "");
+		const stepKey = `${String(ev.data?.turn ?? "")}:${String(ev.data?.step ?? "")}`;
+		if (callId !== "" && name !== "") registerToolTrace(entry, stepKey, callId, name, ev.data?.arguments ?? ev.data?.args ?? ev.data?.input);
+		return;
+	}
+	if (type === "tool/result") {
+		const msg = ev.data?.message;
+		const parts = Array.isArray(msg?.content) ? msg.content : [];
+		const callId = String(ev.data?.callId ?? ev.data?.toolCallId ?? msg?.source?.callId ?? parts[0]?.toolCallId ?? "");
+		if (callId !== "") {
+			const trace = entry.toolById.get(callId);
+			if (trace !== void 0) trace.status = ev.data?.isError === true || parts.some((p) => p?.isError === true) ? "err" : "ok";
+		}
+		return;
+	}
+	if (type === "assistant/attempt") {
+		accumulateTokens(entry.stats.tokens, ev.data);
+		return;
+	}
+	if (type === "user/message") {
+		const source = ev.data?.source;
+		if (source !== void 0 && source !== null && String(source.kind ?? "user") !== "user") return;
+		const text = textOf(ev.data?.content);
+		if (text.length === 0 || text.startsWith("<system-reminder>")) return;
+		const images = imagesOf(ev.data?.content);
+		const row = {
+			role: "user",
+			text,
+			time: Number(ev.time ?? 0),
+			seq: Number(ev.seq ?? 0)
+		};
+		if (images.length > 0) row.images = images;
+		entry.messages.push(row);
+		return;
+	}
+	if (type === "assistant/message") {
+		const content = ev.data?.message?.content;
+		const text = textOf(content);
+		const thinking = thinkingOf(content);
+		const embedded = embeddedToolsOf(content);
+		const stepKey = `${String(ev.data?.turn ?? "")}:${String(ev.data?.step ?? "")}`;
+		if (entry.currentStepKey !== "" && entry.currentStepKey !== stepKey) stashSilentStep(entry, entry.currentStepKey);
+		entry.currentStepKey = stepKey;
+		const usage = ev.data?.usage;
+		if (usage !== null && typeof usage === "object") {
+			entry.turnIn = (Number(usage.inputTokens ?? 0) || 0) + (Number(usage.cacheReadTokens ?? usage.cachedInputTokens ?? 0) || 0);
+			entry.turnOut += Number(usage.outputTokens ?? 0) || 0;
+		}
+		if (thinking !== "") entry.stepThinking.set(stepKey, thinking);
+		for (const tool of embedded) registerToolTrace(entry, stepKey, tool.id, tool.name, tool.args);
+		if (text.length === 0) return;
+		const prevIdx = entry.stepAt.get(stepKey);
+		const prevRow = prevIdx !== void 0 ? entry.messages[prevIdx] : void 0;
+		const row = {
+			role: "assistant",
+			text,
+			time: Number(ev.time ?? 0),
+			seq: Number(ev.seq ?? 0)
+		};
+		if (prevRow?.thinking !== void 0) row.thinking = prevRow.thinking;
+		if (prevRow?.tools !== void 0) row.tools = prevRow.tools;
+		flushCarryIntoRow(entry, row, stepKey);
+		if (thinking !== "" && row.thinking === void 0) row.thinking = capThinking(thinking);
+		if (prevIdx !== void 0) {
+			entry.messages[prevIdx] = row;
+			entry.turnReplyAt = prevIdx;
+		} else {
+			const idx = entry.messages.length;
+			entry.stepAt.set(stepKey, idx);
+			entry.turnReplyAt = idx;
+			entry.messages.push(row);
+		}
+	}
+}
+/** 维护 `historyCache` 的 LRU 顺序并裁剪到最多 16 个会话。 */
+function touchHistoryCache(file, entry) {
+	historyCache.delete(file);
+	historyCache.set(file, entry);
+	while (historyCache.size > HISTORY_CACHE_CAP) {
+		const oldest = historyCache.keys().next().value;
+		if (oldest === void 0) break;
+		historyCache.delete(oldest);
+	}
+}
+/**
+* 确保指定会话日志文件在 `historyCache` 中已解码到最新字节：
+* - 文件未变：直接命中返回；
+* - 文件追加增长且头部块哈希未变：仅读取 `[cached.byteOffset, stat.size)` 增量解压合并；
+* - 首次读取、文件缩小或头部重写：全量读取重算。
+*/
+function ensureDecoded(file) {
+	if (zstdDecompressSync === void 0) throw new Error("this Node build has no zstd support");
+	const st = statSync(file);
+	if (st.size > MAX_SESSION_BYTES) throw new Error(`session log is ${String(st.size)} bytes, over the safety cap`);
+	const cached = historyCache.get(file);
+	if (cached !== void 0 && cached.size === st.size && cached.mtimeMs === st.mtimeMs) {
+		touchHistoryCache(file, cached);
+		return cached;
+	}
+	let fd;
+	try {
+		fd = openSync(file, "r");
+		if (cached !== void 0 && st.size >= cached.byteOffset && cached.headLen > 0 && st.size >= cached.headLen) {
+			if (hashBuffer(readRange(fd, 0, cached.headLen)) === cached.firstChunkHash) {
+				if (st.size === cached.byteOffset) {
+					cached.size = st.size;
+					cached.mtimeMs = st.mtimeMs;
+					touchHistoryCache(file, cached);
+					return cached;
+				}
+				const { lines, consumedBytes } = decodeZstdFrames(readRange(fd, cached.byteOffset, st.size - cached.byteOffset));
+				for (const line of lines) foldEventLine(cached, line);
+				cached.byteOffset += consumedBytes;
+				cached.size = st.size;
+				cached.mtimeMs = st.mtimeMs;
+				touchHistoryCache(file, cached);
+				return cached;
+			}
+		}
+		const raw = readRange(fd, 0, st.size);
+		const headLen = Math.min(raw.length, HEAD_HASH_BYTES);
+		const firstChunkHash = headLen > 0 ? hashBuffer(raw.subarray(0, headLen)) : "";
+		const entry = createEmptyFoldEntry(st.size, st.mtimeMs, headLen, firstChunkHash);
+		const { lines, consumedBytes } = decodeZstdFrames(raw);
+		for (const line of lines) foldEventLine(entry, line);
+		entry.byteOffset = consumedBytes;
+		touchHistoryCache(file, entry);
+		return entry;
+	} finally {
+		if (fd !== void 0) try {
+			closeSync(fd);
+		} catch {}
+	}
+}
+/** 读取会话完整消息轨迹与统计（自动走增量 Zstd 缓存）。 */
+function historyOf(file) {
+	const entry = ensureDecoded(file);
+	return {
+		messages: entry.messages,
+		stats: entry.stats,
+		lastTurn: entry.lastTurn,
+		lastErr: entry.lastErr,
+		byteOffset: entry.byteOffset
+	};
+}
+/** 复用 `historyCache` 增量解压结果构造 AgentTeams 团队状态快照。 */
+function teamOf(file) {
+	const entry = ensureDecoded(file);
+	const taskRows = Array.from(entry.teamTasks.values()).filter((task) => task.status !== "deleted").sort((a, b) => {
+		const rank = (s) => s === "in_progress" ? 0 : s === "pending" ? 1 : s === "completed" ? 2 : 3;
+		const delta = rank(a.status) - rank(b.status);
+		return delta !== 0 ? delta : String(a.subject).localeCompare(String(b.subject));
+	});
+	return {
+		enabled: entry.teamEnabled,
+		sawMode: entry.teamSawMode,
+		members: Array.from(entry.teamMembers.values()),
+		tasks: taskRows
+	};
+}
+/** 折叠单条历史消息中的超长 Markdown 代码块（保持围栏闭合）。 */
+function foldLongCodeBlocks(text) {
+	return text.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (full, lang, body) => {
+		const lines = body.split("\n");
+		if (lines.length <= 8 && body.length <= 360) return full;
+		const head = lines.slice(0, 4).join("\n");
+		const omitted = Math.max(1, lines.length - 4);
+		return `\`\`\`${lang}\n${head}\n⋯ (已折叠 ${String(omitted)} 行代码)\n\`\`\``;
+	});
+}
+/**
+* R4 会话精简模式（`?compact=1`）：
+* 对早于最后 6 条的历史消息裁剪 `thinking`（最多 160 字）并折叠超长代码块，不改动缓存原对象。
+*/
+function applyCompactMode(all, page) {
+	const keepFullFromSeq = all.length > 6 ? all[all.length - 6]?.seq ?? 0 : 0;
+	return page.map((msg) => {
+		if (msg.seq >= keepFullFromSeq) return msg;
+		const nextText = msg.text.includes("```") ? foldLongCodeBlocks(msg.text) : msg.text;
+		const nextThinking = msg.thinking !== void 0 && msg.thinking.length > COMPACT_THINKING_CHARS ? `${msg.thinking.slice(0, COMPACT_THINKING_CHARS - 1)}⋯` : msg.thinking;
+		if (nextText === msg.text && nextThinking === msg.thinking) return msg;
+		const copy = {
+			...msg,
+			text: nextText
+		};
+		if (nextThinking !== void 0) copy.thinking = nextThinking;
+		return copy;
+	});
+}
+/** 读取日志尾部 96 KB 窗口提取最后一条消息单行预览（无需全量解压）。 */
+function previewOf(file) {
+	const cached = historyCache.get(file);
+	if (cached !== void 0 && cached.messages.length > 0) {
+		const last = cached.messages[cached.messages.length - 1];
+		return {
+			preview: plainPreview(last?.text ?? ""),
+			count: cached.messages.length
+		};
+	}
+	if (zstdDecompressSync === void 0) return {
+		preview: "",
+		count: 0
+	};
+	let size = 0;
+	try {
+		size = statSync(file).size;
+	} catch {
+		return {
+			preview: "",
+			count: 0
+		};
+	}
+	const window = Math.min(size, 96 * 1024);
+	if (window < 16) return {
+		preview: "",
+		count: 0
+	};
+	let fd;
+	let buf;
+	try {
+		fd = openSync(file, "r");
+		buf = readRange(fd, size - window, window);
+	} catch {
+		return {
+			preview: "",
+			count: 0
+		};
+	} finally {
+		if (fd !== void 0) try {
+			closeSync(fd);
+		} catch {}
+	}
+	const starts = [];
+	let cursor = 0;
+	while ((cursor = buf.indexOf(ZSTD_MAGIC, cursor)) !== -1) {
+		starts.push(cursor);
+		cursor += 4;
+	}
+	const startIdx = size > window ? 1 : 0;
+	if (starts.length <= startIdx) return {
+		preview: "",
+		count: 0
+	};
+	const texts = [];
+	let count = 0;
+	for (let index = startIdx; index < starts.length; index += 1) {
+		const from = starts[index];
+		const to = index + 1 < starts.length ? starts[index + 1] : buf.length;
+		let decoded = "";
+		try {
+			decoded = zstdDecompressSync(buf.subarray(from, to)).toString("utf8");
+		} catch {
+			continue;
+		}
+		for (const raw of decoded.split("\n")) {
+			if (raw.length === 0) continue;
+			let ev;
+			try {
+				ev = JSON.parse(raw);
+			} catch {
+				continue;
+			}
+			const kind = String(ev.type ?? "");
+			if (kind !== "user/message" && kind !== "assistant/message") continue;
+			count += 1;
+			const text = textOf(kind === "user/message" ? ev.data?.content : ev.data?.message?.content);
+			if (text === "" || text.startsWith("<system-reminder>")) continue;
+			texts.push(text);
+		}
+	}
+	return {
+		preview: plainPreview(texts.length > 0 ? texts[texts.length - 1] : ""),
+		count
+	};
+}
+/** 读取完整会话日志的原始 JSONL 文本（用于 ZIP 导出）。 */
+function rawSessionJsonl(file) {
+	if (zstdDecompressSync === void 0) throw new Error("this Node build has no zstd support");
+	const st = statSync(file);
+	if (st.size > MAX_SESSION_BYTES) throw new Error(`session log is ${String(st.size)} bytes, over the safety cap`);
+	let fd;
+	try {
+		fd = openSync(file, "r");
+		const { lines } = decodeZstdFrames(readRange(fd, 0, st.size));
+		return lines.length > 0 ? `${lines.join("\n")}\n` : "";
+	} finally {
+		if (fd !== void 0) try {
+			closeSync(fd);
+		} catch {}
+	}
+}
+//#endregion
+//#region src/notify-monitor.ts
+const DEFAULT_PUSH_RELAY = "https://feedback.juo.de5.net";
+const POLL_MS = 3500;
+const MAX_DEDUPE = 512;
+const MAX_TRACKED = 1024;
+/** 计算与客户端 `Notifier.noteId` 一致的单会话稳定通知 ID。 */
+function notifyIdOf(sessionId) {
+	if (sessionId === "") return 1e3;
+	let h = 0;
+	for (let i = 0; i < sessionId.length; i++) h = (h * 31 + sessionId.charCodeAt(i)) % 1e5;
+	return 1e3 + h;
+}
+function sanitizeRelayUrl(raw) {
+	const s = (raw ?? "").trim();
+	if (s === "") return DEFAULT_PUSH_RELAY;
+	try {
+		const u = new URL(s);
+		if (u.protocol !== "https:" && u.protocol !== "http:") return DEFAULT_PUSH_RELAY;
+		return u.toString().replace(/\/+$/, "");
+	} catch {
+		return DEFAULT_PUSH_RELAY;
+	}
+}
+var NotifyMonitor = class {
+	deps;
+	tracked = /* @__PURE__ */ new Map();
+	dedupe = /* @__PURE__ */ new Map();
+	gatewayStartedAt = Date.now();
+	baselined = false;
+	polling = false;
+	timer = null;
+	initTimer = null;
+	presence = {
+		online: false,
+		activeSessionId: "",
+		updatedAt: 0
+	};
+	constructor(deps) {
+		this.deps = deps;
+	}
+	start() {
+		this.deps.backendRegistry.setNotifyListener((ev) => this.onExternalEvent(ev));
+		this.initTimer = setTimeout(() => {
+			this.initTimer = null;
+			this.pollOnce(true);
+		}, 1500);
+		this.timer = setInterval(() => {
+			this.pollOnce(false);
+		}, POLL_MS);
+	}
+	dispose() {
+		if (this.initTimer !== null) {
+			clearTimeout(this.initTimer);
+			this.initTimer = null;
+		}
+		if (this.timer !== null) {
+			clearInterval(this.timer);
+			this.timer = null;
+		}
+		this.deps.backendRegistry.setNotifyListener(null);
+		this.tracked.clear();
+		this.dedupe.clear();
+	}
+	updatePresence(online, activeSessionId) {
+		this.presence = {
+			online,
+			activeSessionId: online ? activeSessionId.trim() : "",
+			updatedAt: online ? Date.now() : 0
+		};
+	}
+	hasAnyRunning() {
+		for (const s of this.tracked.values()) if (s.running) return true;
+		return false;
+	}
+	setTracked(id, entry) {
+		this.tracked.delete(id);
+		this.tracked.set(id, entry);
+		while (this.tracked.size > MAX_TRACKED) {
+			const oldest = this.tracked.keys().next().value;
+			if (oldest === void 0) break;
+			this.tracked.delete(oldest);
+		}
+	}
+	markDedupe(key) {
+		const now = Date.now();
+		const prev = this.dedupe.get(key);
+		if (prev !== void 0 && now - prev < 6e4) return false;
+		this.dedupe.delete(key);
+		this.dedupe.set(key, now);
+		while (this.dedupe.size > MAX_DEDUPE) {
+			const oldest = this.dedupe.keys().next().value;
+			if (oldest === void 0) break;
+			this.dedupe.delete(oldest);
+		}
+		return true;
+	}
+	inspectDshTurn(sessionId) {
+		const file = findSessionFile(sessionId);
+		if (file === null) return null;
+		try {
+			const hist = historyOf(file);
+			const tail = hist.messages.length > 0 ? hist.messages[hist.messages.length - 1] : void 0;
+			const status = hist.lastTurn || tail?.turn?.status || "";
+			const finishedAt = tail?.turn?.finishedAt || tail?.time || 0;
+			const seq = tail?.seq ?? 0;
+			if (status === "" && seq === 0) return null;
+			return {
+				turnKey: `${status || "done"}:${String(seq)}:${String(finishedAt)}`,
+				status: status || "completed",
+				finishedAt
+			};
+		} catch {
+			return null;
+		}
+	}
+	observeRows(rows, allowDispatch) {
+		if (!this.baselined) {
+			this.baselined = true;
+			for (const row of rows) this.setTracked(row.id, {
+				running: row.running === true,
+				asking: row.asking === true,
+				updatedAt: row.updatedAt,
+				title: row.title,
+				lastTurnId: row.lastTurnId ?? "",
+				lastTurnStatus: row.lastTurnStatus ?? "",
+				lastDoneAt: row.lastDoneAt ?? 0
+			});
+			return;
+		}
+		for (const row of rows) {
+			const prev = this.tracked.get(row.id);
+			const isExternal = row.backend !== void 0 && row.backend !== "" && row.backend !== "dsh";
+			const nowRunning = row.running === true;
+			const nowAsking = row.asking === true;
+			let lastTurnId = prev?.lastTurnId ?? "";
+			let lastTurnStatus = prev?.lastTurnStatus ?? "";
+			let lastDoneAt = prev?.lastDoneAt ?? 0;
+			if (!isExternal) {
+				const stoppedRunning = prev !== void 0 && prev.running && !nowRunning;
+				const fastTurnUpdated = prev !== void 0 && !prev.running && !nowRunning && row.updatedAt > prev.updatedAt;
+				if (stoppedRunning || fastTurnUpdated) {
+					const info = this.inspectDshTurn(row.id);
+					if (info !== null) {
+						if (stoppedRunning || info.turnKey !== lastTurnId && info.finishedAt >= this.gatewayStartedAt) {
+							lastTurnId = info.turnKey;
+							lastTurnStatus = info.status;
+							lastDoneAt = Date.now();
+							if (allowDispatch) this.dispatchPush("done", row.id, row.title, info.turnKey, info.status);
+						} else if (lastTurnId === "") {
+							lastTurnId = info.turnKey;
+							lastTurnStatus = info.status;
+						}
+					} else if (stoppedRunning) {
+						const fallbackKey = `idle:${String(row.updatedAt || Date.now())}`;
+						lastTurnId = fallbackKey;
+						lastTurnStatus = "completed";
+						lastDoneAt = Date.now();
+						if (allowDispatch) this.dispatchPush("done", row.id, row.title, fallbackKey, "completed");
+					}
+				}
+			}
+			if (nowAsking && !prev?.asking) {
+				if (allowDispatch) this.dispatchPush("asking", row.id, row.title, `ask:${String(Math.floor(Date.now() / 15e3))}`);
+			}
+			this.setTracked(row.id, {
+				running: nowRunning,
+				asking: nowAsking,
+				updatedAt: row.updatedAt,
+				title: row.title,
+				lastTurnId,
+				lastTurnStatus,
+				lastDoneAt
+			});
+		}
+	}
+	onExternalEvent(ev) {
+		const prev = this.tracked.get(ev.sessionId);
+		const title = ev.title || prev?.title || "会话";
+		if (ev.kind === "done") {
+			const status = ev.status || "completed";
+			const turnKey = `ext:${status}:${String(Date.now())}`;
+			this.setTracked(ev.sessionId, {
+				running: false,
+				asking: prev?.asking ?? false,
+				updatedAt: Date.now(),
+				title,
+				lastTurnId: turnKey,
+				lastTurnStatus: status,
+				lastDoneAt: Date.now()
+			});
+			this.dispatchPush("done", ev.sessionId, title, turnKey, status);
+			return;
+		}
+		this.setTracked(ev.sessionId, {
+			running: prev?.running ?? true,
+			asking: true,
+			updatedAt: Date.now(),
+			title,
+			lastTurnId: prev?.lastTurnId ?? "",
+			lastTurnStatus: prev?.lastTurnStatus ?? "",
+			lastDoneAt: prev?.lastDoneAt ?? 0
+		});
+		this.dispatchPush("asking", ev.sessionId, title, `ask:${String(Math.floor(Date.now() / 15e3))}`);
+	}
+	onDshAsk(sessionId, callId) {
+		const tracked = this.tracked.get(sessionId);
+		const title = tracked?.title || "会话";
+		if (tracked !== void 0) tracked.asking = true;
+		this.dispatchPush("asking", sessionId, title, callId);
+	}
+	enrichRows(rows) {
+		return rows.map((row) => {
+			const s = this.tracked.get(row.id);
+			if (s === void 0 || s.lastTurnId === "") return row;
+			return {
+				...row,
+				lastTurnId: s.lastTurnId,
+				lastTurnStatus: s.lastTurnStatus || void 0,
+				lastDoneAt: s.lastDoneAt > 0 ? s.lastDoneAt : void 0
+			};
+		});
+	}
+	async pollOnce(initial) {
+		if (this.polling) return;
+		const targets = pushTargets().filter((t) => t.enabled);
+		if (!initial && targets.length === 0 && !this.hasAnyRunning()) return;
+		const ctl = this.deps.controller();
+		if (!ctl || typeof ctl.list !== "function") return;
+		this.polling = true;
+		try {
+			const listed = await Promise.resolve(ctl.list({}, AbortSignal.timeout(8e3)));
+			const rows = this.deps.markPinned(this.deps.markArchived(projectSessions(listed, this.deps.askBridge.liveAsking()))).map((row) => ({
+				...row,
+				backend: "dsh"
+			}));
+			this.observeRows(rows, !initial);
+		} catch {} finally {
+			this.polling = false;
+		}
+	}
+	async dispatchPush(event, sessionId, title, dedupeKey, status) {
+		if (!this.markDedupe(`${event}:${sessionId}:${dedupeKey}`)) return;
+		const targets = pushTargets().filter((t) => t.enabled);
+		if (targets.length === 0) return;
+		const phoneOnline = this.presence.online && Date.now() - this.presence.updatedAt < 15e3;
+		if (phoneOnline && this.presence.activeSessionId === sessionId) return;
+		const safeTitle = (title.trim() || "会话").slice(0, 32);
+		for (const target of targets) {
+			if (phoneOnline && target.bgOnly) continue;
+			const pushTitle = event === "asking" ? "等你回答" : status === "error" || status === "interrupted" ? "回合已结束" : "任务完成";
+			const pushBody = event === "asking" ? target.showTitle ? `「${safeTitle}」有一个问题需要你确认` : "智能体有一个问题需要你确认，点开查看" : target.showTitle ? `「${safeTitle}」已经回复，点开看看` : "有一条智能体回复已完成，点开查看";
+			await this.postToRelay(target.relayUrl, target.relaySecret, {
+				pushToken: target.pushToken,
+				event,
+				sessionId,
+				notifyId: notifyIdOf(sessionId),
+				title: pushTitle,
+				body: pushBody,
+				foregroundShow: false,
+				badgeAdd: 1
+			});
+		}
+	}
+	async postToRelay(relayUrl, relaySecret, payload) {
+		const cleanSecret = relaySecret.trim();
+		if (cleanSecret.length < 32) return {
+			ok: false,
+			code: "missing_relay_secret",
+			message: "尚未同步推送凭据，请在手机「通知」页点击刷新状态"
+		};
+		const base = sanitizeRelayUrl(relayUrl);
+		try {
+			const res = await fetch(`${base}/v1/push/send`, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					authorization: `Bearer ${cleanSecret}`
+				},
+				body: JSON.stringify(payload),
+				signal: AbortSignal.timeout(8e3)
+			});
+			const data = await res.json().catch(() => null);
+			const code = String(data?.code ?? "");
+			const hwCode = data?.hwCode !== void 0 ? String(data.hwCode) : void 0;
+			const msg = String(data?.message ?? (res.ok ? "ok" : `HTTP ${String(res.status)}`));
+			if (res.ok && data?.ok === true) {
+				record(this.deps.logFile, `push sent event=${String(payload.event)} id=${String(payload.notifyId)}`);
+				return {
+					ok: true,
+					code,
+					hwCode,
+					requestId: data.requestId ? String(data.requestId) : void 0,
+					message: "已发送后台测试推送"
+				};
+			}
+			if (code === "invalid_token" && typeof payload.pushToken === "string") {
+				removePushTarget(payload.pushToken);
+				record(this.deps.logFile, "push removed invalid_token");
+			} else record(this.deps.logFile, `push relay failed code=${code} hw=${hwCode ?? "-"} msg=${msg}`);
+			return {
+				ok: false,
+				code,
+				hwCode,
+				message: msg
+			};
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			record(this.deps.logFile, `push relay error: ${msg}`);
+			return {
+				ok: false,
+				code: "network_error",
+				message: msg
+			};
+		}
+	}
+	async relayStatus(relayUrl) {
+		const base = sanitizeRelayUrl(relayUrl ?? pushTargets()[0]?.relayUrl);
+		try {
+			const res = await fetch(`${base}/v1/push/status`, {
+				method: "GET",
+				signal: AbortSignal.timeout(5e3)
+			});
+			const data = await res.json().catch(() => null);
+			if (!res.ok || data === null) return {
+				ok: false,
+				configured: false,
+				error: `HTTP ${String(res.status)}`
+			};
+			return {
+				ok: data.ok === true,
+				configured: data.configured === true,
+				category: typeof data.category === "string" ? data.category : "WORK",
+				testMode: data.testMode === true
+			};
+		} catch (err) {
+			return {
+				ok: false,
+				configured: false,
+				error: err instanceof Error ? err.message : String(err)
+			};
+		}
+	}
+	async sendTestPush(deviceIdOrToken, relayUrl) {
+		const all = pushTargets();
+		const key = (deviceIdOrToken ?? "").trim();
+		const target = key !== "" ? all.find((t) => t.deviceId === key || t.pushToken === key) ?? all[0] : all[0];
+		if (target === void 0) return {
+			ok: false,
+			code: "no_push_token",
+			message: "尚未收到手机上传的 Push Token"
+		};
+		return await this.postToRelay(relayUrl || target.relayUrl, target.relaySecret, {
+			pushToken: target.pushToken,
+			event: "test",
+			notifyId: 990002,
+			title: "Agent Mobile 后台推送测试",
+			body: target.showTitle ? "若能收到此通知，说明 Push Kit 与云端中继通道已打通" : "收到一条后台推送测试消息",
+			foregroundShow: true,
+			badgeAdd: 0
+		});
+	}
+};
+//#endregion
 //#region src/panel.ts
 /**
 * DSH 设置面板同源路由：配对状态、二维码、连接与安全权限开关，以及本机管理员可见的反馈工单。
@@ -4673,7 +5951,7 @@ const panelBody = async (request) => {
 		};
 	}
 };
-const FEEDBACK_BASE = (process.env.AGENT_MOBILE_FEEDBACK_URL ?? "").trim();
+const FEEDBACK_BASE = (process.env.AGENT_MOBILE_FEEDBACK_URL ?? "https://feedback.juo.de5.net").trim();
 const feedbackKey = () => {
 	if (FEEDBACK_BASE === "") return "";
 	try {
@@ -7462,805 +8740,6 @@ function createIdempotencyStore() {
 	};
 }
 //#endregion
-//#region src/transcript.ts
-/**
-* 会话 Zstd 事件日志解析、增量解压 + LRU 缓存（上限 16）、路径索引缓存、
-* 思考链与工具调用轨迹提取、精简模式裁剪以及 AgentTeams 视图复用。
-*/
-const zstdDecompressSync = zlib.zstdDecompressSync;
-const ZSTD_MAGIC = Buffer.from([
-	40,
-	181,
-	47,
-	253
-]);
-const MAX_SESSION_BYTES = 160 * 1024 * 1024;
-const HISTORY_CACHE_CAP = 16;
-const PATH_CACHE_CAP = 512;
-const HEAD_HASH_BYTES = 4096;
-const MAX_THINKING_CHARS = 4e3;
-const COMPACT_THINKING_CHARS = 160;
-/** `sessionId -> filePath` 映射缓存（LRU 上限 512），未命中或文件消失时才遍历磁盘目录。 */
-const sessionFileCache = /* @__PURE__ */ new Map();
-/** 定位某个会话的 `session.v4.jsonl.zstd` 文件。 */
-function findSessionFile(id) {
-	const home = dshHome();
-	const hit = sessionFileCache.get(id);
-	if (hit !== void 0 && hit.home === home) {
-		if (existsSync(hit.file)) {
-			sessionFileCache.delete(id);
-			sessionFileCache.set(id, hit);
-			return hit.file;
-		}
-		sessionFileCache.delete(id);
-	}
-	const root = join(home, "sessions");
-	let projects;
-	try {
-		projects = readdirSync(root);
-	} catch {
-		return null;
-	}
-	const candidates = id.startsWith("session-") ? [id, id.slice(8)] : [id, `session-${id}`];
-	for (const project of projects) for (const name of candidates) {
-		const file = join(root, project, name, "session.v4.jsonl.zstd");
-		try {
-			if (statSync(file).isFile()) {
-				sessionFileCache.delete(id);
-				sessionFileCache.set(id, {
-					home,
-					file
-				});
-				while (sessionFileCache.size > PATH_CACHE_CAP) {
-					const oldest = sessionFileCache.keys().next().value;
-					if (oldest === void 0) break;
-					sessionFileCache.delete(oldest);
-				}
-				return file;
-			}
-		} catch {}
-	}
-	return null;
-}
-/** 读取文件区间字节。 */
-function readRange(fd, offset, length) {
-	if (length <= 0) return Buffer.alloc(0);
-	const buf = Buffer.allocUnsafe(length);
-	let readTotal = 0;
-	while (readTotal < length) {
-		const n = readSync(fd, buf, readTotal, length - readTotal, offset + readTotal);
-		if (n <= 0) break;
-		readTotal += n;
-	}
-	return readTotal === length ? buf : buf.subarray(0, readTotal);
-}
-/** 计算头部块哈希，判断日志文件是否被截断重写。 */
-function hashBuffer(buf) {
-	return createHash("sha256").update(buf).digest("hex").slice(0, 32);
-}
-/**
-* 解压一段字节中的完整 Zstd 帧序列。
-* 返回成功解码的事件行列表，以及已消费的精确字节偏移 `consumedBytes`：
-* 若末尾帧尚未写完（半帧），`consumedBytes` 停在该半帧起始位置，留待下次增量继续读取。
-*/
-function decodeZstdFrames(raw) {
-	if (zstdDecompressSync === void 0) throw new Error("this Node build has no zstd support");
-	if (raw.length === 0) return {
-		lines: [],
-		consumedBytes: 0
-	};
-	const starts = [];
-	let cursor = 0;
-	while ((cursor = raw.indexOf(ZSTD_MAGIC, cursor)) !== -1) {
-		starts.push(cursor);
-		cursor += 4;
-	}
-	if (starts.length === 0) return {
-		lines: [],
-		consumedBytes: 0
-	};
-	const parts = [];
-	let consumedBytes = 0;
-	let index = 0;
-	while (index < starts.length) {
-		const from = starts[index];
-		let decoded = null;
-		let nextIndex = index + 1;
-		while (nextIndex <= starts.length) {
-			const to = nextIndex < starts.length ? starts[nextIndex] : raw.length;
-			try {
-				decoded = zstdDecompressSync(raw.subarray(from, to));
-				break;
-			} catch {
-				if (nextIndex === starts.length) break;
-				nextIndex += 1;
-			}
-		}
-		if (decoded !== null) {
-			parts.push(decoded);
-			consumedBytes = nextIndex < starts.length ? starts[nextIndex] : raw.length;
-			index = nextIndex;
-		} else {
-			if (index === starts.length - 1) break;
-			consumedBytes = starts[index + 1];
-			index += 1;
-		}
-	}
-	if (parts.length === 0) return {
-		lines: [],
-		consumedBytes
-	};
-	return {
-		lines: Buffer.concat(parts).toString("utf8").split("\n").filter((line) => line.length > 0),
-		consumedBytes
-	};
-}
-/** 提取正文文本块。 */
-function textOf(content) {
-	if (!Array.isArray(content)) return "";
-	const out = [];
-	for (const part of content) {
-		if (part === null || typeof part !== "object") continue;
-		const p = part;
-		if (p.type === "text" && typeof p.text === "string") out.push(p.text);
-	}
-	return out.join("").trim();
-}
-/** 提取 assistant 内容块中的 `reasoning` / `thinking` 思考链文本。 */
-function thinkingOf(content) {
-	if (!Array.isArray(content)) return "";
-	const out = [];
-	for (const part of content) {
-		if (part === null || typeof part !== "object") continue;
-		const p = part;
-		if (p.type === "reasoning" || p.type === "thinking") {
-			const trimmed = (typeof p.text === "string" ? p.text : typeof p.thinking === "string" ? p.thinking : typeof p.reasoning === "string" ? p.reasoning : "").trim();
-			if (trimmed.length > 0) out.push(trimmed);
-		}
-	}
-	return out.join("\n\n");
-}
-/** 裁剪思考链文本至最多 4000 字符。 */
-function capThinking(raw) {
-	if (raw.length <= MAX_THINKING_CHARS) return raw;
-	return `${raw.slice(0, MAX_THINKING_CHARS - 1)}⋯`;
-}
-/** 从工具调用参数中提炼简明单行目标摘要（绝不混入大段文件内容或结果原文）。 */
-function summarizeToolArgs(name, rawArgs) {
-	let parsed = rawArgs;
-	if (typeof rawArgs === "string") {
-		const trimmed = rawArgs.trim();
-		if (trimmed === "") return "";
-		try {
-			parsed = JSON.parse(trimmed);
-		} catch {
-			return trimmed.split(/\r?\n/)[0]?.replace(/\s+/g, " ").trim().slice(0, 100) ?? "";
-		}
-	}
-	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return "";
-	const bag = parsed;
-	const firstLine = (v, max = 100) => {
-		if (typeof v !== "string") return "";
-		const line = v.trim().split(/\r?\n/)[0]?.replace(/\s+/g, " ").trim() ?? "";
-		return line.length > max ? `${line.slice(0, max - 1)}⋯` : line;
-	};
-	const lower = name.toLowerCase();
-	if (lower === "pwsh" || lower === "bash" || lower === "shell" || lower.includes("terminal") || lower === "run_command") {
-		const cmd = firstLine(bag.command ?? bag.cmd ?? bag.script ?? bag.CommandLine, 100);
-		if (cmd !== "") return cmd;
-	}
-	if (lower === "grep" || lower === "glob") {
-		const pat = firstLine(bag.pattern, 60);
-		const scope = firstLine(bag.path ?? bag.include, 50);
-		if (pat !== "") return scope !== "" ? `${pat} · ${scope}` : pat;
-	}
-	for (const key of [
-		"file_path",
-		"path",
-		"filePath",
-		"target_file",
-		"command",
-		"cmd",
-		"pattern",
-		"query",
-		"url",
-		"skill",
-		"label",
-		"subject",
-		"objective",
-		"task_id",
-		"agent_id",
-		"job_id",
-		"to",
-		"name",
-		"action",
-		"description",
-		"prompt"
-	]) {
-		const val = bag[key];
-		if (typeof val === "string" && val.trim() !== "") return firstLine(val, 100);
-		if (typeof val === "number" || typeof val === "boolean") return `${key}=${String(val)}`;
-	}
-	for (const [k, v] of Object.entries(bag)) {
-		if (k === "content" || k === "new_string" || k === "old_string" || k === "data") continue;
-		if (typeof v === "string" && v.trim() !== "") return firstLine(v, 90);
-		if (typeof v === "number" || typeof v === "boolean") return `${k}=${String(v)}`;
-	}
-	return "";
-}
-/** 提取 assistant 内容块中内嵌的 tool-call 列表。 */
-function embeddedToolsOf(content) {
-	if (!Array.isArray(content)) return [];
-	const out = [];
-	for (const part of content) {
-		if (part === null || typeof part !== "object") continue;
-		const p = part;
-		if (p.type === "tool-call" || p.type === "tool_use") {
-			const id = String(p.id ?? p.callId ?? "");
-			const name = String(p.name ?? "");
-			if (id !== "" && name !== "") out.push({
-				id,
-				name,
-				args: p.arguments ?? p.input
-			});
-		}
-	}
-	return out;
-}
-/** 提取消息中的图片附件摘要。 */
-function imagesOf(content) {
-	if (!Array.isArray(content)) return [];
-	const out = [];
-	for (const part of content) {
-		if (part === null || typeof part !== "object") continue;
-		const p = part;
-		if (p.type !== "image") continue;
-		const a = p.attachment ?? {};
-		const raw = String(a.attachmentId ?? "");
-		const id = raw.startsWith("sha256:") ? raw.slice(7) : raw;
-		if (!/^[0-9a-f]{8,128}$/i.test(id)) continue;
-		const width = Number(a.width ?? 0);
-		const height = Number(a.height ?? 0);
-		out.push({
-			id: id.toLowerCase(),
-			mediaType: String(a.mediaType ?? "image/png"),
-			width: Number.isFinite(width) && width > 0 ? width : 0,
-			height: Number.isFinite(height) && height > 0 ? height : 0,
-			name: String(a.name ?? "")
-		});
-	}
-	return out;
-}
-/** 累加单次模型调用的 Token 计数。 */
-function accumulateTokens(total, data) {
-	if (data === null || typeof data !== "object") return;
-	const usage = data.usage ?? data;
-	const num = (v) => {
-		const n = Number(v ?? 0);
-		return Number.isFinite(n) && n > 0 ? n : 0;
-	};
-	total.uncachedInputTokens += num(usage.inputTokens ?? usage.uncachedInputTokens);
-	total.outputTokens += num(usage.outputTokens);
-	total.cacheReadTokens += num(usage.cacheReadTokens ?? usage.cachedInputTokens);
-	total.cacheWriteTokens += num(usage.cacheWriteTokens);
-}
-/** 将 Markdown 文本压平为单行会话预览。 */
-function plainPreview(text) {
-	return text.replace(/```[\s\S]*?```/g, " ").replace(/`([^`]*)`/g, "$1").replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/^#{1,6}\s*/gm, "").replace(/^>\s?/gm, "").replace(/^\s*[-*+]\s+/gm, "").replace(/\*\*([^*]*)\*\*/g, "$1").replace(/\|/g, " ").replace(/\s+/g, " ").trim().slice(0, 90);
-}
-const historyCache = /* @__PURE__ */ new Map();
-function createEmptyFoldEntry(size, mtimeMs, headLen, firstChunkHash) {
-	return {
-		size,
-		mtimeMs,
-		headLen,
-		firstChunkHash,
-		byteOffset: 0,
-		messages: [],
-		stats: {
-			turns: 0,
-			steps: 0,
-			toolCalls: 0,
-			tokens: {
-				uncachedInputTokens: 0,
-				outputTokens: 0,
-				cacheReadTokens: 0,
-				cacheWriteTokens: 0
-			}
-		},
-		lastTurn: "",
-		lastErr: null,
-		stepAt: /* @__PURE__ */ new Map(),
-		stepThinking: /* @__PURE__ */ new Map(),
-		stepTools: /* @__PURE__ */ new Map(),
-		turnStart: 0,
-		turnIn: 0,
-		turnOut: 0,
-		turnReplyAt: -1,
-		carryThinking: [],
-		carryTools: [],
-		currentStepKey: "",
-		toolById: /* @__PURE__ */ new Map(),
-		teamEnabled: false,
-		teamSawMode: false,
-		teamMembers: /* @__PURE__ */ new Map(),
-		teamTasks: /* @__PURE__ */ new Map()
-	};
-}
-/** 注册或更新一条工具调用轨迹，并挂到所属 step 或待合并队列上。 */
-function registerToolTrace(entry, stepKey, callId, name, rawArgs) {
-	const existing = entry.toolById.get(callId);
-	if (existing !== void 0) {
-		if (existing.summary === "" && rawArgs !== void 0) existing.summary = summarizeToolArgs(name, rawArgs);
-		return existing;
-	}
-	const trace = {
-		id: callId,
-		name,
-		summary: summarizeToolArgs(name, rawArgs),
-		status: "run"
-	};
-	entry.toolById.set(callId, trace);
-	const msgIdx = entry.stepAt.get(stepKey);
-	if (msgIdx !== void 0) {
-		const row = entry.messages[msgIdx];
-		if (row !== void 0) {
-			if (row.tools === void 0) row.tools = [];
-			row.tools.push(trace);
-			return trace;
-		}
-	}
-	const list = entry.stepTools.get(stepKey) ?? [];
-	list.push(trace);
-	entry.stepTools.set(stepKey, list);
-	return trace;
-}
-/** 将未发言 step 累积的思考与工具轨迹刷入指定回复气泡。 */
-function flushCarryIntoRow(entry, row, stepKey) {
-	const ownThinking = entry.stepThinking.get(stepKey) ?? "";
-	const allThinking = [...entry.carryThinking, ...ownThinking !== "" ? [ownThinking] : []].join("\n\n").trim();
-	entry.carryThinking = [];
-	if (allThinking !== "") row.thinking = capThinking(allThinking);
-	const ownTools = entry.stepTools.get(stepKey) ?? [];
-	const mergedTools = [];
-	const seen = /* @__PURE__ */ new Set();
-	for (const t of [
-		...entry.carryTools,
-		...row.tools ?? [],
-		...ownTools
-	]) if (!seen.has(t.id)) {
-		seen.add(t.id);
-		mergedTools.push(t);
-	}
-	entry.carryTools = [];
-	entry.stepTools.delete(stepKey);
-	if (mergedTools.length > 0) row.tools = mergedTools;
-}
-/** 把上一个无文本 step 的思考与工具移入本轮 carry 池，等待本轮下一条有文本的回复承接。 */
-function stashSilentStep(entry, stepKey) {
-	if (stepKey === "" || entry.stepAt.has(stepKey)) return;
-	const t = entry.stepThinking.get(stepKey);
-	if (t !== void 0 && t !== "") {
-		entry.carryThinking.push(t);
-		entry.stepThinking.delete(stepKey);
-	}
-	const tools = entry.stepTools.get(stepKey);
-	if (tools !== void 0 && tools.length > 0) {
-		for (const item of tools) if (!entry.carryTools.some((x) => x.id === item.id)) entry.carryTools.push(item);
-		entry.stepTools.delete(stepKey);
-	}
-}
-/** 向增量状态喂入单行事件 JSON。 */
-function foldEventLine(entry, line) {
-	let event;
-	try {
-		event = JSON.parse(line);
-	} catch {
-		return;
-	}
-	if (event === null || typeof event !== "object") return;
-	const ev = event;
-	const type = String(ev.type ?? "");
-	if (type === "team/mode") {
-		entry.teamSawMode = true;
-		entry.teamEnabled = ev.data?.enabled === true;
-		return;
-	}
-	if (type === "team/member") {
-		const member = ev.data?.member;
-		if (member !== null && typeof member === "object") {
-			const id = String(member.id ?? "");
-			entry.teamMembers.set(id, {
-				id,
-				name: String(member.name ?? ""),
-				description: String(member.description ?? ""),
-				phase: String(member.phase ?? ""),
-				error: String(member.error ?? "")
-			});
-		}
-		return;
-	}
-	if (type === "team/task") {
-		const task = ev.data?.task;
-		if (task !== null && typeof task === "object") {
-			const id = String(task.id ?? "");
-			const seen = entry.teamTasks.get(id);
-			const revision = Number(task.revision ?? 0);
-			if (seen === void 0 || Number(seen.revision ?? -1) <= revision) entry.teamTasks.set(id, {
-				id,
-				revision,
-				subject: String(task.subject ?? ""),
-				description: String(task.description ?? ""),
-				status: String(task.status ?? "pending"),
-				ownerName: String(task.ownerName ?? ""),
-				ownerId: String(task.ownerId ?? "")
-			});
-		}
-		return;
-	}
-	if (type === "turn/start") {
-		stashSilentStep(entry, entry.currentStepKey);
-		entry.stats.turns += 1;
-		entry.turnStart = Number(ev.time ?? 0);
-		entry.turnIn = 0;
-		entry.turnOut = 0;
-		entry.turnReplyAt = -1;
-		entry.carryThinking = [];
-		entry.carryTools = [];
-		entry.currentStepKey = "";
-		entry.toolById.clear();
-		return;
-	}
-	if (type === "step/start") {
-		stashSilentStep(entry, entry.currentStepKey);
-		entry.stats.steps += 1;
-		entry.currentStepKey = `${String(ev.data?.turn ?? "")}:${String(ev.data?.step ?? "")}`;
-		return;
-	}
-	if (type === "turn/end") {
-		stashSilentStep(entry, entry.currentStepKey);
-		entry.currentStepKey = "";
-		entry.lastTurn = String(ev.data?.reason?.kind ?? "");
-		const rawErr = ev.data?.reason?.error;
-		let errCode = "";
-		let errText = "";
-		if (rawErr !== null && typeof rawErr === "object") {
-			errCode = String(rawErr.code ?? "");
-			errText = String(rawErr.message ?? "");
-		} else if (typeof rawErr === "string") errText = rawErr;
-		if (errText !== "") entry.lastErr = {
-			code: errCode,
-			text: errText,
-			time: Number(ev.time ?? 0)
-		};
-		else entry.lastErr = null;
-		const row = entry.turnReplyAt >= 0 ? entry.messages[entry.turnReplyAt] : void 0;
-		if (row !== void 0) {
-			if (entry.carryThinking.length > 0) {
-				row.thinking = capThinking([row.thinking ?? "", ...entry.carryThinking].filter(Boolean).join("\n\n"));
-				entry.carryThinking = [];
-			}
-			if (entry.carryTools.length > 0) {
-				const existing = row.tools ?? [];
-				const seen = new Set(existing.map((t) => t.id));
-				for (const t of entry.carryTools) if (!seen.has(t.id)) {
-					seen.add(t.id);
-					existing.push(t);
-				}
-				row.tools = existing;
-				entry.carryTools = [];
-			}
-			const endAt = Number(ev.time ?? 0);
-			row.turn = {
-				status: entry.lastTurn,
-				ms: endAt > entry.turnStart && entry.turnStart > 0 ? endAt - entry.turnStart : 0,
-				tokensIn: entry.turnIn,
-				tokensOut: entry.turnOut,
-				atSeq: Number(ev.seq ?? 0),
-				finishedAt: endAt > 0 ? endAt : Date.now()
-			};
-			if (errText !== "") {
-				row.turn.errCode = errCode;
-				row.turn.errText = errText;
-			}
-		}
-		return;
-	}
-	if (type === "tool/call") {
-		entry.stats.toolCalls += 1;
-		const callId = String(ev.data?.callId ?? ev.data?.id ?? "");
-		const name = String(ev.data?.name ?? "");
-		const stepKey = `${String(ev.data?.turn ?? "")}:${String(ev.data?.step ?? "")}`;
-		if (callId !== "" && name !== "") registerToolTrace(entry, stepKey, callId, name, ev.data?.arguments ?? ev.data?.args ?? ev.data?.input);
-		return;
-	}
-	if (type === "tool/result") {
-		const msg = ev.data?.message;
-		const parts = Array.isArray(msg?.content) ? msg.content : [];
-		const callId = String(ev.data?.callId ?? ev.data?.toolCallId ?? msg?.source?.callId ?? parts[0]?.toolCallId ?? "");
-		if (callId !== "") {
-			const trace = entry.toolById.get(callId);
-			if (trace !== void 0) trace.status = ev.data?.isError === true || parts.some((p) => p?.isError === true) ? "err" : "ok";
-		}
-		return;
-	}
-	if (type === "assistant/attempt") {
-		accumulateTokens(entry.stats.tokens, ev.data);
-		return;
-	}
-	if (type === "user/message") {
-		const source = ev.data?.source;
-		if (source !== void 0 && source !== null && String(source.kind ?? "user") !== "user") return;
-		const text = textOf(ev.data?.content);
-		if (text.length === 0 || text.startsWith("<system-reminder>")) return;
-		const images = imagesOf(ev.data?.content);
-		const row = {
-			role: "user",
-			text,
-			time: Number(ev.time ?? 0),
-			seq: Number(ev.seq ?? 0)
-		};
-		if (images.length > 0) row.images = images;
-		entry.messages.push(row);
-		return;
-	}
-	if (type === "assistant/message") {
-		const content = ev.data?.message?.content;
-		const text = textOf(content);
-		const thinking = thinkingOf(content);
-		const embedded = embeddedToolsOf(content);
-		const stepKey = `${String(ev.data?.turn ?? "")}:${String(ev.data?.step ?? "")}`;
-		if (entry.currentStepKey !== "" && entry.currentStepKey !== stepKey) stashSilentStep(entry, entry.currentStepKey);
-		entry.currentStepKey = stepKey;
-		const usage = ev.data?.usage;
-		if (usage !== null && typeof usage === "object") {
-			entry.turnIn = (Number(usage.inputTokens ?? 0) || 0) + (Number(usage.cacheReadTokens ?? usage.cachedInputTokens ?? 0) || 0);
-			entry.turnOut += Number(usage.outputTokens ?? 0) || 0;
-		}
-		if (thinking !== "") entry.stepThinking.set(stepKey, thinking);
-		for (const tool of embedded) registerToolTrace(entry, stepKey, tool.id, tool.name, tool.args);
-		if (text.length === 0) return;
-		const prevIdx = entry.stepAt.get(stepKey);
-		const prevRow = prevIdx !== void 0 ? entry.messages[prevIdx] : void 0;
-		const row = {
-			role: "assistant",
-			text,
-			time: Number(ev.time ?? 0),
-			seq: Number(ev.seq ?? 0)
-		};
-		if (prevRow?.thinking !== void 0) row.thinking = prevRow.thinking;
-		if (prevRow?.tools !== void 0) row.tools = prevRow.tools;
-		flushCarryIntoRow(entry, row, stepKey);
-		if (thinking !== "" && row.thinking === void 0) row.thinking = capThinking(thinking);
-		if (prevIdx !== void 0) {
-			entry.messages[prevIdx] = row;
-			entry.turnReplyAt = prevIdx;
-		} else {
-			const idx = entry.messages.length;
-			entry.stepAt.set(stepKey, idx);
-			entry.turnReplyAt = idx;
-			entry.messages.push(row);
-		}
-	}
-}
-/** 维护 `historyCache` 的 LRU 顺序并裁剪到最多 16 个会话。 */
-function touchHistoryCache(file, entry) {
-	historyCache.delete(file);
-	historyCache.set(file, entry);
-	while (historyCache.size > HISTORY_CACHE_CAP) {
-		const oldest = historyCache.keys().next().value;
-		if (oldest === void 0) break;
-		historyCache.delete(oldest);
-	}
-}
-/**
-* 确保指定会话日志文件在 `historyCache` 中已解码到最新字节：
-* - 文件未变：直接命中返回；
-* - 文件追加增长且头部块哈希未变：仅读取 `[cached.byteOffset, stat.size)` 增量解压合并；
-* - 首次读取、文件缩小或头部重写：全量读取重算。
-*/
-function ensureDecoded(file) {
-	if (zstdDecompressSync === void 0) throw new Error("this Node build has no zstd support");
-	const st = statSync(file);
-	if (st.size > MAX_SESSION_BYTES) throw new Error(`session log is ${String(st.size)} bytes, over the safety cap`);
-	const cached = historyCache.get(file);
-	if (cached !== void 0 && cached.size === st.size && cached.mtimeMs === st.mtimeMs) {
-		touchHistoryCache(file, cached);
-		return cached;
-	}
-	let fd;
-	try {
-		fd = openSync(file, "r");
-		if (cached !== void 0 && st.size >= cached.byteOffset && cached.headLen > 0 && st.size >= cached.headLen) {
-			if (hashBuffer(readRange(fd, 0, cached.headLen)) === cached.firstChunkHash) {
-				if (st.size === cached.byteOffset) {
-					cached.size = st.size;
-					cached.mtimeMs = st.mtimeMs;
-					touchHistoryCache(file, cached);
-					return cached;
-				}
-				const { lines, consumedBytes } = decodeZstdFrames(readRange(fd, cached.byteOffset, st.size - cached.byteOffset));
-				for (const line of lines) foldEventLine(cached, line);
-				cached.byteOffset += consumedBytes;
-				cached.size = st.size;
-				cached.mtimeMs = st.mtimeMs;
-				touchHistoryCache(file, cached);
-				return cached;
-			}
-		}
-		const raw = readRange(fd, 0, st.size);
-		const headLen = Math.min(raw.length, HEAD_HASH_BYTES);
-		const firstChunkHash = headLen > 0 ? hashBuffer(raw.subarray(0, headLen)) : "";
-		const entry = createEmptyFoldEntry(st.size, st.mtimeMs, headLen, firstChunkHash);
-		const { lines, consumedBytes } = decodeZstdFrames(raw);
-		for (const line of lines) foldEventLine(entry, line);
-		entry.byteOffset = consumedBytes;
-		touchHistoryCache(file, entry);
-		return entry;
-	} finally {
-		if (fd !== void 0) try {
-			closeSync(fd);
-		} catch {}
-	}
-}
-/** 读取会话完整消息轨迹与统计（自动走增量 Zstd 缓存）。 */
-function historyOf(file) {
-	const entry = ensureDecoded(file);
-	return {
-		messages: entry.messages,
-		stats: entry.stats,
-		lastTurn: entry.lastTurn,
-		lastErr: entry.lastErr,
-		byteOffset: entry.byteOffset
-	};
-}
-/** 复用 `historyCache` 增量解压结果构造 AgentTeams 团队状态快照。 */
-function teamOf(file) {
-	const entry = ensureDecoded(file);
-	const taskRows = Array.from(entry.teamTasks.values()).filter((task) => task.status !== "deleted").sort((a, b) => {
-		const rank = (s) => s === "in_progress" ? 0 : s === "pending" ? 1 : s === "completed" ? 2 : 3;
-		const delta = rank(a.status) - rank(b.status);
-		return delta !== 0 ? delta : String(a.subject).localeCompare(String(b.subject));
-	});
-	return {
-		enabled: entry.teamEnabled,
-		sawMode: entry.teamSawMode,
-		members: Array.from(entry.teamMembers.values()),
-		tasks: taskRows
-	};
-}
-/** 折叠单条历史消息中的超长 Markdown 代码块（保持围栏闭合）。 */
-function foldLongCodeBlocks(text) {
-	return text.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (full, lang, body) => {
-		const lines = body.split("\n");
-		if (lines.length <= 8 && body.length <= 360) return full;
-		const head = lines.slice(0, 4).join("\n");
-		const omitted = Math.max(1, lines.length - 4);
-		return `\`\`\`${lang}\n${head}\n⋯ (已折叠 ${String(omitted)} 行代码)\n\`\`\``;
-	});
-}
-/**
-* R4 会话精简模式（`?compact=1`）：
-* 对早于最后 6 条的历史消息裁剪 `thinking`（最多 160 字）并折叠超长代码块，不改动缓存原对象。
-*/
-function applyCompactMode(all, page) {
-	const keepFullFromSeq = all.length > 6 ? all[all.length - 6]?.seq ?? 0 : 0;
-	return page.map((msg) => {
-		if (msg.seq >= keepFullFromSeq) return msg;
-		const nextText = msg.text.includes("```") ? foldLongCodeBlocks(msg.text) : msg.text;
-		const nextThinking = msg.thinking !== void 0 && msg.thinking.length > COMPACT_THINKING_CHARS ? `${msg.thinking.slice(0, COMPACT_THINKING_CHARS - 1)}⋯` : msg.thinking;
-		if (nextText === msg.text && nextThinking === msg.thinking) return msg;
-		const copy = {
-			...msg,
-			text: nextText
-		};
-		if (nextThinking !== void 0) copy.thinking = nextThinking;
-		return copy;
-	});
-}
-/** 读取日志尾部 96 KB 窗口提取最后一条消息单行预览（无需全量解压）。 */
-function previewOf(file) {
-	const cached = historyCache.get(file);
-	if (cached !== void 0 && cached.messages.length > 0) {
-		const last = cached.messages[cached.messages.length - 1];
-		return {
-			preview: plainPreview(last?.text ?? ""),
-			count: cached.messages.length
-		};
-	}
-	if (zstdDecompressSync === void 0) return {
-		preview: "",
-		count: 0
-	};
-	let size = 0;
-	try {
-		size = statSync(file).size;
-	} catch {
-		return {
-			preview: "",
-			count: 0
-		};
-	}
-	const window = Math.min(size, 96 * 1024);
-	if (window < 16) return {
-		preview: "",
-		count: 0
-	};
-	let fd;
-	let buf;
-	try {
-		fd = openSync(file, "r");
-		buf = readRange(fd, size - window, window);
-	} catch {
-		return {
-			preview: "",
-			count: 0
-		};
-	} finally {
-		if (fd !== void 0) try {
-			closeSync(fd);
-		} catch {}
-	}
-	const starts = [];
-	let cursor = 0;
-	while ((cursor = buf.indexOf(ZSTD_MAGIC, cursor)) !== -1) {
-		starts.push(cursor);
-		cursor += 4;
-	}
-	const startIdx = size > window ? 1 : 0;
-	if (starts.length <= startIdx) return {
-		preview: "",
-		count: 0
-	};
-	const texts = [];
-	let count = 0;
-	for (let index = startIdx; index < starts.length; index += 1) {
-		const from = starts[index];
-		const to = index + 1 < starts.length ? starts[index + 1] : buf.length;
-		let decoded = "";
-		try {
-			decoded = zstdDecompressSync(buf.subarray(from, to)).toString("utf8");
-		} catch {
-			continue;
-		}
-		for (const raw of decoded.split("\n")) {
-			if (raw.length === 0) continue;
-			let ev;
-			try {
-				ev = JSON.parse(raw);
-			} catch {
-				continue;
-			}
-			const kind = String(ev.type ?? "");
-			if (kind !== "user/message" && kind !== "assistant/message") continue;
-			count += 1;
-			const text = textOf(kind === "user/message" ? ev.data?.content : ev.data?.message?.content);
-			if (text === "" || text.startsWith("<system-reminder>")) continue;
-			texts.push(text);
-		}
-	}
-	return {
-		preview: plainPreview(texts.length > 0 ? texts[texts.length - 1] : ""),
-		count
-	};
-}
-/** 读取完整会话日志的原始 JSONL 文本（用于 ZIP 导出）。 */
-function rawSessionJsonl(file) {
-	if (zstdDecompressSync === void 0) throw new Error("this Node build has no zstd support");
-	const st = statSync(file);
-	if (st.size > MAX_SESSION_BYTES) throw new Error(`session log is ${String(st.size)} bytes, over the safety cap`);
-	let fd;
-	try {
-		fd = openSync(file, "r");
-		const { lines } = decodeZstdFrames(readRange(fd, 0, st.size));
-		return lines.length > 0 ? `${lines.join("\n")}\n` : "";
-	} finally {
-		if (fd !== void 0) try {
-			closeSync(fd);
-		} catch {}
-	}
-}
-//#endregion
 //#region src/routes/sessions.ts
 const ADD_SECTION_COMMANDS = /* @__PURE__ */ new Set([
 	"file",
@@ -8616,9 +9095,10 @@ function createSessionRoutes(deps) {
 				}
 			}
 			const extSessions = deps.backendRegistry ? await deps.backendRegistry.listExternalSessions(wantBackend, 30) : [];
+			const rawSessions = [...dshSessions, ...extSessions].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
 			send(res, 200, {
 				ok: true,
-				sessions: [...dshSessions, ...extSessions].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+				sessions: deps.onSessionsListed ? deps.onSessionsListed(rawSessions) : rawSessions
 			});
 			return true;
 		}
@@ -11461,8 +11941,11 @@ function apply(ctx, rawConfig) {
 			return null;
 		}
 	};
+	let notifyMonitor = null;
 	const pairing = new PairingRuntime(port, logFile);
-	const askBridge = createAskBridge(ctx, logFile);
+	const askBridge = createAskBridge(ctx, logFile, (sid, callId) => {
+		notifyMonitor?.onDshAsk(sid, callId);
+	});
 	const deepContext = createDeepContextReader(service, logFile);
 	const flags = createWorkspaceFlags(service);
 	const fsRoutes = createWorkspaceFsRoutes({
@@ -11479,6 +11962,15 @@ function apply(ctx, rawConfig) {
 		setEnabled: (id, on) => setBackendEnabled(id, on),
 		dshVersion: VERSION
 	});
+	notifyMonitor = new NotifyMonitor({
+		controller,
+		askBridge,
+		backendRegistry,
+		markArchived: flags.markArchived,
+		markPinned: flags.markPinned,
+		logFile
+	});
+	notifyMonitor.start();
 	const backendRoutes = createBackendRoutes({
 		registry: backendRegistry,
 		sigOf,
@@ -11496,7 +11988,12 @@ function apply(ctx, rawConfig) {
 		sigOf,
 		sigTtlSec: SIG_TTL_SEC,
 		logFile,
-		backendRegistry
+		backendRegistry,
+		onSessionsListed: (rows) => {
+			if (!notifyMonitor) return rows;
+			notifyMonitor.observeRows(rows, true);
+			return notifyMonitor.enrichRows(rows);
+		}
 	});
 	const hostExtras = createHostExtrasRoutes({
 		service,
@@ -11830,25 +12327,94 @@ function apply(ctx, rawConfig) {
 					plan: true,
 					commands: true,
 					webConsole: webConsoleRoutes.isReady(),
-					loopback: previewPorts().length > 0
+					loopback: previewPorts().length > 0,
+					push: true
 				});
 				return;
 			}
 			if (path === "/api/presence") {
 				let online = true;
+				let sessionId = String(url.searchParams.get("sessionId") ?? "").trim();
 				if (method === "POST") {
 					const body = await readJson(req).catch(() => void 0);
 					if (body !== void 0 && typeof body === "object" && body !== null) {
-						if (body.online === false) online = false;
+						const b = body;
+						if (b.online === false) online = false;
+						if (typeof b.sessionId === "string" && b.sessionId.trim() !== "") sessionId = b.sessionId.trim();
 					}
 				}
 				pairing.phoneSeenAt = online ? Date.now() : 0;
+				notifyMonitor?.updatePresence(online, sessionId);
 				send(res, 200, {
 					ok: true,
 					online,
 					ttlMs: PRESENCE_TTL_MS,
-					sessionId: String(url.searchParams.get("sessionId") ?? "")
+					sessionId
 				});
+				return;
+			}
+			if (path === "/api/push/register" && method === "POST") {
+				const body = await readJson(req);
+				const pushToken = String(body.pushToken ?? "").trim();
+				if (pushToken.length < 16 || pushToken.length > 512) {
+					send(res, 400, {
+						ok: false,
+						error: "invalid pushToken"
+					});
+					return;
+				}
+				const deviceId = String(body.deviceId ?? "").trim() || pushToken.slice(0, 16);
+				const relayUrl = sanitizeRelayUrl(typeof body.relayUrl === "string" ? body.relayUrl : DEFAULT_PUSH_RELAY);
+				const relaySecret = typeof body.relaySecret === "string" ? body.relaySecret.trim() : "";
+				const enabled = body.enabled !== false;
+				const bgOnly = body.bgOnly !== false;
+				const list = upsertPushTarget({
+					deviceId,
+					pushToken,
+					relayUrl,
+					relaySecret,
+					enabled,
+					bgOnly,
+					showTitle: body.showTitle !== false,
+					updatedAt: Date.now()
+				});
+				await record(logFile, `200 PUSH register device=${deviceId} enabled=${String(enabled)} bgOnly=${String(bgOnly)} bound=${relaySecret.length >= 32 ? "1" : "0"}`);
+				send(res, 200, {
+					ok: true,
+					count: list.length
+				});
+				return;
+			}
+			if (path === "/api/push/unregister" && method === "POST" || path === "/api/push/register" && method === "DELETE") {
+				const body = method === "POST" ? await readJson(req).catch(() => ({})) : {};
+				send(res, 200, {
+					ok: true,
+					count: removePushTarget(String(body.deviceId ?? body.pushToken ?? url.searchParams.get("deviceId") ?? "")).length
+				});
+				return;
+			}
+			if (path === "/api/push/status" && method === "GET") {
+				const targets = pushTargets();
+				const relay = await notifyMonitor.relayStatus(url.searchParams.get("relayUrl") ?? void 0);
+				send(res, 200, {
+					ok: true,
+					registeredCount: targets.length,
+					enabledCount: targets.filter((t) => t.enabled).length,
+					boundCount: targets.filter((t) => t.relaySecret.length >= 32).length,
+					relayOk: relay.ok,
+					relayConfigured: relay.configured,
+					category: relay.category ?? "WORK",
+					testMode: relay.testMode === true,
+					relayError: relay.error ?? ""
+				});
+				return;
+			}
+			if (path === "/api/push/test" && method === "POST") {
+				const body = await readJson(req).catch(() => ({}));
+				const deviceId = String(body.deviceId ?? body.pushToken ?? "");
+				const relayUrl = typeof body.relayUrl === "string" ? body.relayUrl : void 0;
+				const result = await notifyMonitor.sendTestPush(deviceId, relayUrl);
+				send(res, result.ok ? 200 : 200, result);
 				return;
 			}
 			if (path === "/api/answer-mode" && method === "GET") {
@@ -12088,6 +12654,7 @@ function apply(ctx, rawConfig) {
 		yield () => {
 			record(logFile, "disposing; releasing live asks, streams, terminals, e2ee, web-console and listener");
 			askBridge.delegateAll("plugin-dispose");
+			notifyMonitor?.dispose();
 			backendRoutes.disposeStreams();
 			backendRegistry.dispose();
 			sessionRoutes.disposeStreams();

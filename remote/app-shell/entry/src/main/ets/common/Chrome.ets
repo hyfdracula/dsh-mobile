@@ -10,6 +10,7 @@ import {
 import { Tokens } from './Tokens';
 import { Haptics } from './Haptics';
 import { Mat } from './Mat';
+import { Motion, MOTION_VIVID } from './Motion';
 
 /**
  * 统一页面头部、透明 HDS 顶栏与顶部渐隐。
@@ -19,7 +20,7 @@ export struct GlassIconButton {
   icon: Resource = $r('app.media.ic_back');
   glyph: string = '';
   label: string = '';
-  btnSize: number = 40;
+  btnSize: number = 46;
   /** 仅当所在容器为 HdsNavigation / HdsNavDestination 的 titleBar 时传 true 以启用系统沉浸光感 */
   @Prop immersive: boolean = false;
   onTap: () => void = () => {};
@@ -38,8 +39,8 @@ export struct GlassIconButton {
           .fontColor(Tokens.fg)
       } else {
         Image(this.icon)
-          .width(20)
-          .height(20)
+          .width(this.label === '返回' ? 21 : 20)
+          .height(this.label === '返回' ? 21 : 20)
           .fillColor(Tokens.fg)
           .objectFit(ImageFit.Contain)
       }
@@ -60,7 +61,11 @@ export struct GlassIconButton {
     .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
     .accessibilityText(this.label)
     .onClick(() => {
-      Haptics.tap();
+      if (this.label === '返回') {
+        Haptics.soft();
+      } else {
+        Haptics.tap();
+      }
       this.onTap();
     })
   }
@@ -76,8 +81,15 @@ export struct PageHeader {
   padTop: boolean = false;
   /** 位于 HDS titleBar 中时传 true，按钮随全局沉浸光感开关切换 */
   @Prop immersive: boolean = false;
+  /** 是否在页面推入时展示顶部按钮轻弹弹出与标题滑入 */
+  @Prop popIn: boolean = true;
+  /** 页面层级深度：1=一级页进二级页，2+=二级页进更深层子页面 */
+  @Prop subPageDepth: number = 1;
   @StorageLink('topInset') topInset: number = 44;
   @StorageLink('themeDark') themeDark: boolean = true;
+  @StorageLink('motionMode') motionMode: string = MOTION_VIVID;
+  @State private hdrEntered: boolean = true;
+  private hdrTimer: number = -1;
   /** none | glyph | icon | label */
   rightKind: string = 'none';
   rightGlyph: string = '\u21bb';
@@ -90,6 +102,45 @@ export struct PageHeader {
   onRight: () => void = () => {};
   onRight2: () => void = () => {};
 
+  aboutToAppear(): void {
+    if (this.popIn && Motion.isFlagship(this.motionMode)) {
+      this.hdrEntered = false;
+      this.hdrTimer = setTimeout(() => {
+        this.hdrTimer = -1;
+        this.hdrEntered = true;
+      }, 24);
+    } else {
+      this.hdrEntered = true;
+    }
+  }
+
+  aboutToDisappear(): void {
+    if (this.hdrTimer >= 0) {
+      clearTimeout(this.hdrTimer);
+      this.hdrTimer = -1;
+    }
+  }
+
+  private titleDelayMs(): number {
+    return this.subPageDepth >= 2 ? Motion.HEADER_DELAY_SUB_TITLE : Motion.HEADER_DELAY_TITLE;
+  }
+
+  private titleStartX(): number {
+    return this.subPageDepth >= 2 ? Motion.HEADER_SLIDE_SUB_TITLE_X : Motion.HEADER_SLIDE_TITLE_X;
+  }
+
+  private titleFadeMs(): number {
+    return this.subPageDepth >= 2 ? 240 : 200;
+  }
+
+  private right1DelayMs(): number {
+    return this.hasRight2 ? Motion.HEADER_DELAY_RIGHT_INNER : Motion.HEADER_DELAY_RIGHT_OUTER;
+  }
+
+  private right1StartX(): number {
+    return this.hasRight2 ? Motion.HEADER_SLIDE_RIGHT_INNER_X : Motion.HEADER_SLIDE_RIGHT_OUTER_X;
+  }
+
   build() {
     Row() {
       if (this.hasBack) {
@@ -101,6 +152,11 @@ export struct PageHeader {
             this.onBack();
           }
         })
+        .animation(null)
+        .opacity(this.hdrEntered ? 1 : 0)
+        .animation(Motion.headerPopOpacityAnim(Motion.HEADER_DELAY_BACK, this.motionMode, 180))
+        .translate({ x: this.hdrEntered ? 0 : Motion.HEADER_SLIDE_BACK_X })
+        .animation(Motion.headerPopScaleAnim(Motion.HEADER_DELAY_BACK, this.motionMode))
       }
       Column() {
         Text(this.title)
@@ -123,6 +179,11 @@ export struct PageHeader {
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
       .margin({ left: this.hasBack ? 12 : 0 })
+      .animation(null)
+      .opacity(this.hdrEntered ? 1 : 0)
+      .animation(Motion.headerPopOpacityAnim(this.titleDelayMs(), this.motionMode, this.titleFadeMs()))
+      .translate({ x: this.hdrEntered ? 0 : this.titleStartX() })
+      .animation(Motion.headerTitleSlideAnim(this.titleDelayMs(), this.motionMode))
       if (this.rightKind === 'glyph') {
         GlassIconButton({
           glyph: this.rightGlyph,
@@ -132,6 +193,11 @@ export struct PageHeader {
             this.onRight();
           }
         })
+        .animation(null)
+        .opacity(this.hdrEntered ? 1 : 0)
+        .animation(Motion.headerPopOpacityAnim(this.right1DelayMs(), this.motionMode, 220))
+        .translate({ x: this.hdrEntered ? 0 : this.right1StartX() })
+        .animation(Motion.headerPopScaleAnim(this.right1DelayMs(), this.motionMode))
       } else if (this.rightKind === 'icon') {
         GlassIconButton({
           icon: this.rightIcon,
@@ -141,6 +207,11 @@ export struct PageHeader {
             this.onRight();
           }
         })
+        .animation(null)
+        .opacity(this.hdrEntered ? 1 : 0)
+        .animation(Motion.headerPopOpacityAnim(this.right1DelayMs(), this.motionMode, 220))
+        .translate({ x: this.hdrEntered ? 0 : this.right1StartX() })
+        .animation(Motion.headerPopScaleAnim(this.right1DelayMs(), this.motionMode))
       } else if (this.rightKind === 'label') {
         Text(this.rightLabel)
           .fontSize(Tokens.fsBody)
@@ -153,6 +224,11 @@ export struct PageHeader {
             Haptics.tap();
             this.onRight();
           })
+          .animation(null)
+          .opacity(this.hdrEntered ? 1 : 0)
+          .animation(Motion.headerPopOpacityAnim(this.right1DelayMs(), this.motionMode, 220))
+          .translate({ x: this.hdrEntered ? 0 : this.right1StartX() })
+          .animation(Motion.headerPopScaleAnim(this.right1DelayMs(), this.motionMode))
       }
       if (this.hasRight2) {
         GlassIconButton({
@@ -164,6 +240,11 @@ export struct PageHeader {
           }
         })
         .margin({ left: 8 })
+        .animation(null)
+        .opacity(this.hdrEntered ? 1 : 0)
+        .animation(Motion.headerPopOpacityAnim(Motion.HEADER_DELAY_RIGHT_OUTER, this.motionMode, 220))
+        .translate({ x: this.hdrEntered ? 0 : Motion.HEADER_SLIDE_RIGHT_OUTER_X })
+        .animation(Motion.headerPopScaleAnim(Motion.HEADER_DELAY_RIGHT_OUTER, this.motionMode))
       }
     }
     .width('100%')
